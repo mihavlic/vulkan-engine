@@ -1,0 +1,122 @@
+use std::io::Write;
+
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+enum State {
+    Newline,
+    Start,
+    Ansi,
+}
+
+// a state machine that does some simple formatting on text that is written to it
+pub struct FormatWriter<W> {
+    inner: W,
+    max_width: u16,
+    width: u16,
+    padding: &'static str,
+    padding_width: u16,
+    state: State,
+    deffered: State,
+}
+
+impl<W: Write> FormatWriter<W> {
+    pub fn new(writer: W, padding: &'static str) -> Self {
+        let padding_width = display_width(padding).try_into().unwrap();
+        let max_width = termsize::get().map(|s| s.cols).unwrap_or(80);
+        assert!(max_width > padding_width);
+
+        Self {
+            inner: writer,
+            max_width,
+            width: 0,
+            padding,
+            padding_width,
+            state: State::Start,
+            deffered: State::Start,
+        }
+    }
+}
+
+const CSI: (char, char) = ('\x1b', '[');
+
+impl<W: Write> std::io::Write for FormatWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut iter = std::str::from_utf8(buf)
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "FormatWriter received non-utf8 bytes!",
+                )
+            })?
+            .chars();
+
+        while let Some(next) = iter.next() {
+            match next {
+                '\x40'..='\x7e' if self.state == State::Ansi => {
+                    self.state = self.deffered;
+                }
+                '\n' => {
+                    self.state = State::Newline;
+                    self.width = 0;
+                }
+                _ => {
+                    if self.state == State::Newline {
+                        self.width = self.padding_width;
+                        self.inner.write_all(self.padding.as_bytes())?;
+                    }
+                    self.state = State::Start;
+                }
+            }
+
+            if next == CSI.0 && iter.clone().next() == Some(CSI.1) {
+                self.deffered = self.state;
+                self.state = State::Ansi;
+                iter.next();
+                self.inner.write_all(b"\x1b[")?;
+                continue;
+            }
+
+            let tmp = &mut [0u8; 8];
+            let str = next.encode_utf8(tmp);
+            self.inner.write_all(str.as_bytes())?;
+
+            if self.state != State::Ansi {
+                self.width += 1;
+                if self.width == self.max_width {
+                    self.inner.write_all(b"\n")?;
+                    self.state = State::Newline;
+                    self.width = 0;
+                }
+            }
+        }
+
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<W: Write> std::fmt::Write for FormatWriter<W> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.write(s.as_bytes())
+            .map(|_| {})
+            .map_err(|_| std::fmt::Error)
+    }
+}
+
+pub fn display_width(str: &str) -> usize {
+    let mut i = 0;
+    let mut chars = str.chars();
+    'outer: while let Some(next) = chars.next() {
+        if next == CSI.0 && chars.clone().next() == Some(CSI.1) {
+            chars.next();
+            while let Some(next) = chars.next() {
+                if let '\x40'..='\x7e' = next {
+                    continue 'outer;
+                }
+            }
+        }
+        i += 1;
+    }
+    i
+}

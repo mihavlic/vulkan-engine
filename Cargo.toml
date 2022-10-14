@@ -6,4 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-slag = {path = "../slag", features = ["wrappers"]}
+pumice = {path = "../pumice", features = ["wrappers"]}
+pumice-vma = {path = "../pumice-vma"}
+smallvec = {version = "1.10.0", features = ["union"]}
+
+tracing = "0.1"
+tracing-subscriber = {version = "0.3.15", features = ["env-filter"]}
+termsize = "0.1.6"
+owo-colors = "3.4.0"

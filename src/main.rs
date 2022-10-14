@@ -1,145 +1,90 @@
 #![allow(unused)]
 
-use std::{marker::PhantomData, mem::ManuallyDrop, ptr::NonNull, sync::atomic::AtomicUsize};
+pub mod inner_context;
+pub mod object;
+pub mod util;
 
-use slag::{
+use std::{
+    alloc::Layout,
+    cell::RefCell,
+    marker::PhantomData,
+    mem::ManuallyDrop,
+    ptr::{self, NonNull},
+    sync::{atomic::AtomicUsize, Arc},
+};
+
+use inner_context::InnerContext;
+use object::{
+    image::ImageInfo,
+    storage::{ArcHeader, NoStore, ObjectHeader, ObjectStorage},
+};
+use pumice::{
     deep_copy::{DeepCopy, DeepCopyBox},
     dumb_hash::DumbHash,
     util::result::VulkanResult,
     vk,
 };
+use tracing_subscriber::{
+    prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt, EnvFilter,
+};
+use util::format_writer::FormatWriter;
 
-pub struct InnerContext {
-    device: slag::DeviceWrapper,
-}
+use crate::object::storage::ContextGetStorage;
 
-#[repr(C)]
-pub struct ObjectHeader<T: Object, S: ObjectStorage<T>> {
-    refcount: AtomicUsize,
-    handle: T::Handle,
-    ctx: NonNull<InnerContext>,
-    storage_data: S::StorageData,
-    info: DeepCopyBox<T::CreateInfo>,
-}
-
-pub struct ArcHandle<T: Object, S: ObjectStorage<T>>(NonNull<ObjectHeader<T, S>>);
-
-impl<T: Object, S: ObjectStorage<T>> Clone for ArcHandle<T, S> {
-    fn clone(&self) -> Self {
-        unsafe {
-            let header = self.0;
-            let prev = (*header.as_ptr())
-                .refcount
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            debug_assert!(prev > 0);
-            ArcHandle(header)
-        }
-    }
-}
-
-impl<T: Object, S: ObjectStorage<T>> Drop for ArcHandle<T, S> {
-    fn drop(&mut self) {
-        unsafe {
-            let header = self.0;
-            let prev = (*header.as_ptr())
-                .refcount
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            debug_assert!(prev > 0);
-            if prev == 0 {
-                let storage =
-                    <InnerContext as ContextGetStorage<T, S>>::get_storage((*header.as_ptr()).ctx);
-                S::destroy(header);
-            }
-        }
-    }
-}
-
-impl<T: Object, S: ObjectStorage<T>> ContextGetStorage<T, S> for InnerContext {
-    fn get_storage(ctx: NonNull<InnerContext>) -> NonNull<S> {
-        todo!()
-    }
-}
-
-pub trait Object: Sized {
-    type CreateInfo: DeepCopy;
-    type Handle;
-    type Storage: ObjectStorage<Self>;
-    fn create(device: &slag::DeviceWrapper, info: &Self::CreateInfo) -> VulkanResult<Self::Handle>;
-    fn destroy(device: &slag::DeviceWrapper, handle: Self::Handle) -> VulkanResult<()>;
-}
-
-pub trait ObjectStorage<T: Object>: Sized {
-    type StorageData;
-    fn get_or_create(
-        ctx: *mut InnerContext,
-        info: &T::CreateInfo,
-    ) -> VulkanResult<ArcHandle<T, Self>>;
-    fn destroy(header: NonNull<ObjectHeader<T, Self>>);
-    fn create_header(
-        ctx: NonNull<InnerContext>,
-        info: &T::CreateInfo,
-        data: Self::StorageData,
-    ) -> VulkanResult<ObjectHeader<T, Self>> {
-        T::create(&(*ctx.as_ptr()).device, info).map(|handle| {
-            let copy = info.deep_copy();
-            ObjectHeader {
-                refcount: AtomicUsize::new(1),
-                handle: handle,
-                ctx: ctx,
-                storage_data: data,
-                info: copy,
-            }
-        })
-    }
-}
-
-pub trait ContextGetStorage<T: Object, S: ObjectStorage<T>> {
-    fn get_storage(ctx: NonNull<InnerContext>) -> NonNull<S>;
-}
-
-macro_rules! arc_handle_impl {
-    ($name:ident: $storage:ident [$object:ident] {
-        create($device:ident, $info:ident : $info_ty:path) $create_code:expr,
-        destroy($device2:ident, $handle:ident : $handle_ty:path) $destroy_code:expr
-    }) => {
-        pub struct $name(ArcHandle);
-        impl VkObject for $name {
-            type CreateInfo = $info_ty;
-            type Handle = $handle_ty;
-            fn create(
-                $device: slag::DeviceWrapper,
-                $info: &Self::CreateInfo,
-            ) -> VulkanResult<Self::Handle> {
-                $create_code
-            }
-            fn destroy($device2: slaf::DeviceWrapper, $handle: Self::Handle) -> VulkanResult<()> {
-                $destroy_code
-            }
-        }
-    };
-}
+// macro_rules! arc_handle_impl {
+//     ($name:ident: $storage:ident {
+//         info = $info_ty:path;
+//         handle = $handle_ty:path;
+//         create($device:ident, $info:ident) $create_code:tt
+//         destroy($device2:ident, $handle:ident) $destroy_code:tt
+//     }) => {
+//         pub struct $name(ArcHandle<$name, $storage>);
+//         impl Object for $name {
+//             type CreateInfo = $info_ty;
+//             type Handle = $handle_ty;
+//             fn create(
+//                 $device: &pumice::DeviceWrapper,
+//                 $info: &Self::CreateInfo,
+//             ) -> VulkanResult<Self::Handle> {
+//                 $create_code
+//             }
+//             fn destroy($device: &pumice::DeviceWrapper, $handle: Self::Handle) -> VulkanResult<()> {
+//                 $destroy_code
+//             }
+//         }
+//     };
+// }
 
 // arc_handle_impl!(
-//     Image:
+//     Image: NoStore {
+//         info = ImageInfo;
+//         handle = vk::Image;
+//         create(device, info) {
+//             let create_info = vk::ImageCreateInfo {
+//                 p_next: ptr::null(),
+//                 flags: info.flags,
+//                 image_type: info.size.as_image_type(),
+//                 format: info.format,
+//                 extent: info.size.as_extent_3d(),
+//                 mip_levels: info.mip_levels,
+//                 array_layers: info.array_layers,
+//                 samples: info.samples,
+//                 tiling: info.tiling,
+//                 usage: info.usage,
+//                 // TODO reconsider
+//                 sharing_mode: vk::SharingMode::EXCLUSIVE,
+//                 queue_family_index_count: 0,
+//                 p_queue_family_indices: ptr::null(),
+//                 initial_layout: info.initial_layout,
+//                 ..Default::default()
+//             };
+//             // device.create_image(create_info, allocator)
+//         }
+//         destroy(device, handle) {
+//             todo!()
+//         }
+//     }
 // );
-
-struct NoStore;
-
-impl<T: Object> ObjectStorage<T> for NoStore {
-    type StorageData = Box<ObjectHeader<T, Self>>;
-    fn get_or_create(
-        ctx: *mut InnerContext,
-        info: &<T as Object>::CreateInfo,
-    ) -> VulkanResult<ArcHandle<T, Self>> {
-        todo!()
-    }
-    fn destroy(header: *mut ObjectHeader<T, Self>) {
-        unsafe {
-            T::destroy(&(*(*header).ctx).device, (*header).handle).unwrap();
-            std::ptr::drop_in_place(header);
-        }
-    }
-}
 
 // struct Context();
 
@@ -202,4 +147,21 @@ impl<T: Object> ObjectStorage<T> for NoStore {
 //     DescriptorLayout
 // );
 
-// fn main() {}
+fn main() {
+    install_tracing_subscriber(None);
+}
+
+pub fn install_tracing_subscriber(filter: Option<EnvFilter>) {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(true)
+                .with_thread_ids(false)
+                .with_target(false)
+                .without_time()
+                .with_writer(|| FormatWriter::new(std::io::stderr(), "      "))
+                .compact(),
+        )
+        .with(filter.unwrap_or_else(|| EnvFilter::from_default_env()))
+        .init();
+}
