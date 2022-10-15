@@ -5,6 +5,8 @@ use std::{
 
 use pumice::vk::{self, DebugUtilsMessageSeverityFlagsEXT};
 
+use crate::tracing::Severity;
+
 pub fn to_version(version: u32) -> (u16, u16, u16, u16) {
     (
         vk::api_version_major(version) as u16,
@@ -14,18 +16,20 @@ pub fn to_version(version: u32) -> (u16, u16, u16, u16) {
     )
 }
 
-pub struct Colored<'a>(tracing::Level, &'a dyn Display);
+pub struct Colored<'a>(Severity, &'a dyn Display);
 
 impl<'a> Display for Colored<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use owo_colors::colors::*;
-        match self.0 {
-            tracing::Level::TRACE => owo_colors::OwoColorize::fg::<Magenta>(&self.1).fmt(f),
-            tracing::Level::INFO => owo_colors::OwoColorize::fg::<Green>(&self.1).fmt(f),
-            tracing::Level::DEBUG => owo_colors::OwoColorize::fg::<Blue>(&self.1).fmt(f),
-            tracing::Level::WARN => owo_colors::OwoColorize::fg::<Yellow>(&self.1).fmt(f),
-            tracing::Level::ERROR => owo_colors::OwoColorize::fg::<Red>(&self.1).fmt(f),
-        }
+        use nu_ansi_term::Color::*;
+        let color = match self.0 {
+            Severity::Trace => Magenta,
+            Severity::Info => Green,
+            Severity::Debug => Blue,
+            Severity::Warn => Yellow,
+            Severity::Error => Red,
+        };
+
+        write!(f, "{}{}{}", color.prefix(), self.1, color.suffix())
     }
 }
 
@@ -36,19 +40,25 @@ pub unsafe extern "system" fn debug_callback(
     _p_user_data: *mut c_void,
 ) -> vk::Bool32 {
     let level = match message_severity {
-        DebugUtilsMessageSeverityFlagsEXT::VERBOSE => tracing::Level::TRACE,
-        DebugUtilsMessageSeverityFlagsEXT::INFO => tracing::Level::INFO,
-        DebugUtilsMessageSeverityFlagsEXT::WARNING => tracing::Level::WARN,
-        DebugUtilsMessageSeverityFlagsEXT::ERROR => tracing::Level::ERROR,
+        DebugUtilsMessageSeverityFlagsEXT::VERBOSE => Severity::Trace,
+        DebugUtilsMessageSeverityFlagsEXT::INFO => Severity::Info,
+        DebugUtilsMessageSeverityFlagsEXT::WARNING => Severity::Warn,
+        DebugUtilsMessageSeverityFlagsEXT::ERROR => Severity::Error,
         _ => unreachable!(),
     };
 
-    let with_level = |args: Arguments| match level {
-        tracing::Level::TRACE => tracing::trace!("{}", args),
-        tracing::Level::INFO => tracing::info!("{}", args),
-        tracing::Level::WARN => tracing::warn!("{}", args),
-        tracing::Level::ERROR => tracing::error!("{}", args),
-        _ => unreachable!(),
+    let with_level = |args: Arguments| {
+        #[cfg(feature = "build-tracing")]
+        match level {
+            Severity::Trace => tracing::trace!("{}", args),
+            Severity::Info => tracing::info!("{}", args),
+            Severity::Warn => tracing::warn!("{}", args),
+            Severity::Error => tracing::error!("{}", args),
+            _ => unreachable!(),
+        };
+
+        #[cfg(not(feature = "build-tracing"))]
+        eprintln!("{args}");
     };
 
     let msg = CStr::from_ptr((*p_callback_data).p_message).to_string_lossy();
@@ -64,7 +74,7 @@ pub unsafe extern "system" fn debug_callback(
             "{}: {}\n{}",
             Colored(level, &"Validation"),
             msg[k + 1..l].trim(),
-            owo_colors::OwoColorize::fg::<owo_colors::colors::css::Gray>(&msg[i + j + 1..].trim())
+            nu_ansi_term::Color::LightGray.paint(msg[i + j + 1..].trim())
         ));
     } else {
         with_level(format_args!("{msg}"));

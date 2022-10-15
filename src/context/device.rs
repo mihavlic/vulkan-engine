@@ -1,30 +1,30 @@
 use std::{
-    borrow::Cow,
     collections::{hash_map::RandomState, HashSet},
-    ffi::{c_char, CStr},
-    fmt::{Display, Write},
-    ops::Deref,
-    str::FromStr,
+    ffi::CStr,
+    fmt::Display,
+    pin::Pin,
+    sync::Mutex,
 };
-
-use pumice::{
-    loader::{
-        tables::{DeviceTable, EntryTable, InstanceTable},
-        InstanceLoader,
-    },
-    vk,
-    vk10::QueueFamilyProperties,
-    DeviceWrapper,
-};
-use tracing_subscriber::EnvFilter;
 
 use crate::{
-    install_tracing_subscriber,
+    object::{self},
+    storage::{nostore::NoStore, GetContextStorage, ObjectStorage},
+    tracing::shim_macros::{info, trace},
     util::{
         self,
         debug_callback::to_version,
         format_utils::{self, Fun, IterDisplay},
     },
+};
+use pumice::{
+    loader::{
+        tables::{DeviceTable, EntryTable, InstanceTable},
+        InstanceLoader,
+    },
+    util::result::VulkanResult,
+    vk,
+    vk10::QueueFamilyProperties,
+    DeviceWrapper,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -39,6 +39,7 @@ pub struct QueueFamilySelection {
     count: u32,
     priority: f32,
     exact: bool,
+    attempt_dedicated: bool,
     coalesce: bool,
 }
 
@@ -52,31 +53,34 @@ pub struct ContextCreateInfo<'a> {
     app_name: &'a CStr,
 }
 
-pub struct InnerContext {
-    loader: pumice::loader::EntryLoader,
-    tables: Box<(EntryTable, InstanceTable, DeviceTable)>,
+pub(crate) struct InnerDevice {
+    pub(crate) device: pumice::DeviceWrapper,
 
-    entry: pumice::EntryWrapper,
-    instance: pumice::InstanceWrapper,
-    device: pumice::DeviceWrapper,
+    pub(crate) physical_device_properties: vk::PhysicalDeviceProperties,
+    pub(crate) physical_device_features: vk::PhysicalDeviceFeatures,
 
-    // physical_device_properties: vk::PhysicalDeviceProperties,
-    allocator: pumice_vma::Allocator,
-    allocation_callbacks: Option<vk::AllocationCallbacks>,
-
-    physical_device_properties: vk::PhysicalDeviceProperties,
-    physical_device_features: vk::PhysicalDeviceFeatures,
-
-    queue_families: Vec<QueueFamilyProperties>,
     // family index, range for the subslice of the requested queues
-    queue_selection_mapping: Vec<(usize, std::ops::Range<usize>)>,
-    queues: Vec<vk::Queue>,
+    pub(crate) queue_selection_mapping: Vec<(usize, std::ops::Range<usize>)>,
+    pub(crate) queues: Vec<vk::Queue>,
+    pub(crate) queue_families: Vec<QueueFamilyProperties>,
 
-    debug_messenger: Option<pumice::extensions::ext_debug_utils::DebugUtilsMessengerEXT>,
-    verbose: bool,
+    pub(crate) debug_messenger: Option<pumice::extensions::ext_debug_utils::DebugUtilsMessengerEXT>,
+    pub(crate) verbose: bool,
+
+    // hanobjectdle storage
+    pub(crate) image_storage: NoStore,
+
+    // allocator
+    pub(crate) allocator: pumice_vma::Allocator,
+    pub(crate) allocation_callbacks: Option<vk::AllocationCallbacks>,
+
+    // at the bottom so that these are dropped last, the loader keeps the vulkan dll loaded
+    pub(crate) device_table: DeviceTable,
 }
 
-impl InnerContext {
+pub struct Device(Pin<Box<InnerDevice>>);
+
+impl Device {
     pub unsafe fn new(info: ContextCreateInfo) -> Self {
         let allocation_callbacks = None;
 
@@ -170,13 +174,13 @@ impl InnerContext {
                 .iter()
                 .map(|l| CStr::from_ptr(l.layer_name.as_ptr()).to_string_lossy());
             let iter = IterDisplay::new(iter, |i, w| i.fmt(w));
-            tracing::info!(
+            info!(
                 "{} instance layers:\n{}",
                 instance_layer_properties.len(),
                 iter
             );
         } else {
-            tracing::info!("{} instance layers", instance_layer_properties.len());
+            info!("{} instance layers", instance_layer_properties.len());
         }
 
         let app_info = pumice::vk::ApplicationInfo {
@@ -256,9 +260,9 @@ impl InnerContext {
                 }
                 Ok(())
             });
-            tracing::info!("{} physical devices:{}", physical_devices.len(), fun);
+            info!("{} physical devices:{}", physical_devices.len(), fun);
         } else {
-            tracing::info!("{} physical devices", physical_devices.len());
+            info!("{} physical devices", physical_devices.len());
         }
 
         // (_, _, overlay over queue_family_selection and their associated queue families)
@@ -362,17 +366,11 @@ impl InnerContext {
             pumice_vma::Allocator::new(create_info).unwrap()
         };
 
-        Self {
-            loader,
-            tables,
-
+        let inner = InnerDevice {
             entry,
             instance,
+
             device,
-
-            allocator,
-            allocation_callbacks,
-
             physical_device_properties,
             physical_device_features,
 
@@ -382,34 +380,76 @@ impl InnerContext {
 
             debug_messenger,
             verbose,
-        }
+
+            image_storage: NoStore::new(),
+
+            allocator,
+            allocation_callbacks,
+
+            loader,
+            device_table: tables,
+        };
+
+        Self(Box::pin(inner))
     }
     pub fn entry(&self) -> &pumice::EntryWrapper {
-        &self.entry
+        &self.0.entry
     }
     pub fn instance(&self) -> &pumice::InstanceWrapper {
-        &self.instance
+        &self.0.instance
     }
     pub fn device(&self) -> &pumice::DeviceWrapper {
-        &self.device
+        &self.0.device
+    }
+    pub fn allocator(&self) -> &pumice_vma::Allocator {
+        &self.0.allocator
     }
     pub fn allocator_callbacks(&self) -> Option<&vk::AllocationCallbacks> {
-        self.allocation_callbacks.as_ref()
+        self.0.allocation_callbacks.as_ref()
     }
     pub fn get_queue(&self, selection_index: usize, offset: usize) -> Option<vk::Queue> {
-        let range = self.queue_selection_mapping.get(selection_index)?.1.clone();
-        self.queues.get(range)?.get(offset).cloned()
+        let range = self
+            .0
+            .queue_selection_mapping
+            .get(selection_index)?
+            .1
+            .clone();
+        self.0.queues.get(range)?.get(offset).cloned()
     }
     pub fn get_queue_family(&self, selection_index: usize, offset: usize) -> Option<u32> {
-        self.queue_selection_mapping
+        self.0
+            .queue_selection_mapping
             .get(selection_index)
             .map(|(family, _)| *family as u32)
     }
+
+    pub unsafe fn create_image(
+        &self,
+        info: object::ImageCreateInfo,
+        allocate: pumice_vma::AllocationCreateInfo,
+    ) -> VulkanResult<object::Image> {
+        self.0
+            .image_storage
+            .get_or_create(info, allocate, &self.0)
+            .map(object::Image)
+    }
+
+    fn inner(&self) -> &InnerDevice {
+        &self.0
+    }
 }
+
+#[cfg(test)]
+use {
+    crate::tracing::tracing_subscriber::install_tracing_subscriber,
+    crate::tracing::Severity,
+    pumice_vma::{AllocationCreateFlags, AllocationCreateInfo},
+    std::str::FromStr,
+};
 
 #[test]
 fn test_context_new() {
-    install_tracing_subscriber(Some(EnvFilter::from_str("TRACE").unwrap()));
+    install_tracing_subscriber(Severity::Trace);
 
     let info = ContextCreateInfo {
         conf: pumice::util::config::ApiLoadConfig::new(vk::API_VERSION_1_0),
@@ -422,33 +462,76 @@ fn test_context_new() {
             count: 1,
             priority: 1.0,
             exact: false,
+            attempt_dedicated: false,
             coalesce: true,
         }],
         app_name: pumice::cstr!("test_context_new"),
     };
 
     unsafe {
-        let context = InnerContext::new(info);
+        let context = Device::new(info);
     }
 }
 
-// impl Deref for InnerContext {
-//     type Target = pumice::DeviceWrapper;
-//     fn deref(&self) -> &Self::Target {
-//         &self.device
-//     }
-// }
+#[test]
+fn test_create_image() {
+    install_tracing_subscriber(Severity::Info);
+
+    let info = ContextCreateInfo {
+        conf: pumice::util::config::ApiLoadConfig::new(vk::API_VERSION_1_0),
+        device_features: Default::default(),
+        validation_layers: &[pumice::cstr!("VK_LAYER_KHRONOS_validation")],
+        enable_debug_callback: true,
+        verbose: false,
+        queue_family_selection: vec![QueueFamilySelection {
+            mask: vk::QueueFlags::GRAPHICS,
+            count: 1,
+            priority: 1.0,
+            exact: false,
+            attempt_dedicated: false,
+            coalesce: true,
+        }],
+        app_name: pumice::cstr!("test_context_new"),
+    };
+
+    unsafe {
+        let context = Device::new(info);
+
+        let info = object::ImageCreateInfo {
+            flags: vk::ImageCreateFlags::empty(),
+            size: object::Extent::D2(1, 1),
+            format: vk::Format::R8G8B8A8_SRGB,
+            samples: vk::SampleCountFlags::C1,
+            mip_levels: 1,
+            array_layers: 1,
+            tiling: vk::ImageTiling::OPTIMAL,
+            usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            initial_layout: vk::ImageLayout::UNDEFINED,
+        };
+        let allocation_info = AllocationCreateInfo::new()
+            .required_flags(vk::MemoryPropertyFlags::HOST_VISIBLE)
+            .preferred_flags(
+                vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_CACHED,
+            )
+            .flags(AllocationCreateFlags::MAPPED);
+        let image = context.create_image(info, allocation_info);
+
+        // explicit drop order due to very messy code
+        drop(image);
+        drop(context);
+    }
+}
 
 unsafe fn select_device(
-    physical_devices: &Vec<pumice::vk10::PhysicalDevice>,
-    physical_device_properties: &Vec<pumice::vk10::PhysicalDeviceProperties>,
+    physical_devices: &Vec<vk::PhysicalDevice>,
+    physical_device_properties: &Vec<vk::PhysicalDeviceProperties>,
     instance: &pumice::InstanceWrapper,
     conf: &pumice::util::config::ApiLoadConfig,
     queue_family_selection: &Vec<QueueFamilySelection>,
 ) -> (
-    pumice::vk10::PhysicalDevice,
-    pumice::vk10::PhysicalDeviceProperties,
-    pumice::vk10::PhysicalDeviceFeatures,
+    vk::PhysicalDevice,
+    vk::PhysicalDeviceProperties,
+    vk::PhysicalDeviceFeatures,
     Vec<QueueFamilyProperties>,
     Vec<usize>,
 ) {
@@ -462,7 +545,7 @@ unsafe fn select_device(
     let device_extensions: HashSet<&CStr, RandomState> =
         HashSet::from_iter(conf.get_device_extensions_iter());
 
-    'devices: for (i, (physical_device, physical_device_properties)) in physical_devices
+    for (i, (physical_device, physical_device_properties)) in physical_devices
         .iter()
         .cloned()
         .zip(physical_device_properties)
@@ -490,8 +573,8 @@ unsafe fn select_device(
                 let iter =
                     format_utils::IterDisplay::new(difference, |i, d| i.to_string_lossy().fmt(d));
 
-                tracing::trace!("Device '{device_name}' is missing extensions:\n{iter}",);
-                tracing::info!("Device '{}' skipped due to missing extensions", device_name);
+                trace!("Device '{device_name}' is missing extensions:\n{iter}");
+                info!("Device '{}' skipped due to missing extensions", device_name);
 
                 continue;
             }
@@ -515,7 +598,21 @@ unsafe fn select_device(
 
                 let family_iter = queue_families.iter().zip(&family_search_scratch);
 
-                // first try to coalesce
+                // try to select some family that does not have queues
+                if selection.attempt_dedicated {
+                    let position = family_iter.clone().position(|(family, selected_count)| {
+                        *selected_count == 0
+                            && is_valid(family.queue_flags, selection.mask)
+                            && *selected_count + selection.count <= family.queue_count
+                    });
+
+                    if let Some(position) = position {
+                        family_search_scratch[position] += selection.count;
+                        selected_queue_families.push(position);
+                        continue;
+                    }
+                }
+                // try to select some family that already has queues
                 if selection.coalesce {
                     let position = family_iter.clone().position(|(family, selected_count)| {
                         *selected_count > 0
@@ -543,10 +640,9 @@ unsafe fn select_device(
                     }
                 }
 
-                tracing::info!(
+                info!(
                     "Device '{}' skipped because it couldn't satisfy queue selection:\n{:?}",
-                    device_name,
-                    selection
+                    device_name, selection
                 );
             }
         }
@@ -562,7 +658,7 @@ unsafe fn select_device(
         //     ...
         // }
 
-        tracing::info!("Selected device '{}'", device_name);
+        info!("Selected device '{}'", device_name);
         chosen_index = Some(i);
         break;
     }
@@ -579,4 +675,10 @@ unsafe fn select_device(
         queue_families,
         selected_queue_families,
     )
+}
+
+impl GetContextStorage<object::Image> for InnerDevice {
+    fn get_storage(ctx: &InnerDevice) -> &<object::Image as object::Object>::Storage {
+        &ctx.image_storage
+    }
 }

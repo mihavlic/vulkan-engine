@@ -3,11 +3,16 @@ use std::ptr;
 use pumice::{util::result::VulkanResult, vk};
 use smallvec::SmallVec;
 
-use crate::inner_context::InnerContext;
+use crate::{
+    context::device::InnerDevice,
+    storage::{nostore::NoStore, GetContextStorage},
+    synchronization::ReaderWriterState,
+    OptionalU32,
+};
 
-use super::{storage::NoStore, ArcHandle, Object};
+use super::{ArcHandle, Object};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Extent {
     D1(u32),
     D2(u32, u32),
@@ -59,7 +64,8 @@ impl Extent {
     }
 }
 
-pub struct ImageInfo {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ImageCreateInfo {
     pub flags: vk::ImageCreateFlags,
     pub size: Extent,
     pub format: vk::Format,
@@ -71,85 +77,87 @@ pub struct ImageInfo {
     pub initial_layout: vk::ImageLayout,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct OptionalU32(u32);
-
-impl OptionalU32 {
-    pub const NONE: Self = Self(u32::MAX);
-
-    pub fn new(value: u32) -> Self {
-        assert!(value != u32::MAX);
-        Self(value)
-    }
-    pub fn new_none() -> Self {
-        Self::NONE
-    }
-    pub fn get(&self) -> Option<u32> {
-        if *self == Self::NONE {
-            None
-        } else {
-            Some(self.0)
+impl ImageCreateInfo {
+    pub fn as_raw(&self) -> vk::ImageCreateInfo {
+        vk::ImageCreateInfo {
+            p_next: ptr::null(),
+            flags: self.flags,
+            image_type: self.size.as_image_type(),
+            format: self.format,
+            extent: self.size.as_extent_3d(),
+            mip_levels: self.mip_levels,
+            array_layers: self.array_layers,
+            samples: self.samples,
+            tiling: self.tiling,
+            usage: self.usage,
+            sharing_mode: vk::SharingMode::EXCLUSIVE,
+            queue_family_index_count: 0,
+            p_queue_family_indices: ptr::null(),
+            initial_layout: self.initial_layout,
+            ..Default::default()
         }
     }
-    pub fn set(&mut self, value: Option<u32>) {
-        if let Some(value) = value {
-            assert!(value != u32::MAX);
-            *self = Self(value);
-        } else {
-            *self = Self::NONE;
-        }
-    }
-}
-
-pub struct CommandBufferSubmission(u32);
-
-pub enum ReaderWriterState {
-    Read(SmallVec<[CommandBufferSubmission; 4]>),
-    Write(CommandBufferSubmission),
 }
 
 pub struct ImageSynchronizationState {
-    owning_family: u32,
+    owning_family: OptionalU32,
     layout: vk::ImageLayout,
     state: ReaderWriterState,
 }
 
-pub struct Image(ArcHandle<Self>);
+impl ImageSynchronizationState {
+    const BLANK: Self = Self {
+        owning_family: OptionalU32::NONE,
+        layout: vk::ImageLayout::UNDEFINED,
+        state: ReaderWriterState::None,
+    };
+    pub fn with_initial_layout(layout: vk::ImageLayout) -> Self {
+        Self {
+            layout,
+            ..Self::BLANK
+        }
+    }
+}
+
+pub struct Image(pub(crate) ArcHandle<Self>);
 impl Object for Image {
-    type CreateInfo = ImageInfo;
+    type CreateInfo = ImageCreateInfo;
+    type SupplementalInfo = pumice_vma::AllocationCreateInfo;
     type Handle = vk::Image;
     type Storage = NoStore;
-    type ImmutableData = ();
-    type MutableData = ImageSynchronizationState;
+    type ObjectData = (pumice_vma::Allocation, ImageSynchronizationState);
 
     unsafe fn create(
-        ctx: &InnerContext,
+        ctx: &InnerDevice,
         info: &Self::CreateInfo,
-    ) -> VulkanResult<(Self::Handle, Self::ImmutableData, Self::MutableData)> {
-        let create_info = vk::ImageCreateInfo {
-            p_next: ptr::null(),
-            flags: info.flags,
-            image_type: info.size.as_image_type(),
-            format: info.format,
-            extent: info.size.as_extent_3d(),
-            mip_levels: info.mip_levels,
-            array_layers: info.array_layers,
-            samples: info.samples,
-            tiling: info.tiling,
-            usage: info.usage,
-            sharing_mode: vk::SharingMode::EXCLUSIVE,
-            queue_family_index_count: 0,
-            p_queue_family_indices: ptr::null(),
-            initial_layout: info.initial_layout,
-            ..Default::default()
-        };
-
-        // ctx.create_image(&create_info, ctx.allocator_callbacks())
-        todo!()
+        allocation_info: &Self::SupplementalInfo,
+    ) -> VulkanResult<(Self::Handle, Self::ObjectData)> {
+        let image_info = info.as_raw();
+        ctx.allocator
+            .create_image(&image_info, allocation_info)
+            .map(|(handle, allocation, _)| {
+                (
+                    handle,
+                    (
+                        allocation,
+                        ImageSynchronizationState::with_initial_layout(info.initial_layout),
+                    ),
+                )
+            })
     }
 
-    unsafe fn destroy(ctx: &InnerContext, handle: Self::Handle) -> VulkanResult<()> {
-        // ctx.destroy_image(image, allocator)
-        todo!()
+    unsafe fn destroy(
+        ctx: &InnerDevice,
+        handle: Self::Handle,
+        &(allocation, _): &Self::ObjectData,
+    ) -> VulkanResult<()> {
+        ctx.allocator.destroy_image(handle, allocation);
+        VulkanResult::new_ok(())
+    }
+}
+
+impl GetContextStorage<Image> for Image {
+    fn get_storage(ctx: &InnerDevice) -> &<Image as Object>::Storage {
+        &ctx.image_storage
     }
 }

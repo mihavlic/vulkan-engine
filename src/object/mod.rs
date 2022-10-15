@@ -1,28 +1,36 @@
-use std::ptr::NonNull;
+mod buffer;
+mod image;
+
+pub use buffer::*;
+pub use image::*;
 
 use pumice::util::result::VulkanResult;
+use std::ptr::NonNull;
 
-use crate::{inner_context::InnerContext, object::storage::ContextGetStorage};
+use crate::{
+    context::device::InnerDevice,
+    storage::{ArcHeader, GetContextStorage, ObjectHeader, ObjectStorage},
+};
 
-use self::storage::{ArcHeader, ObjectHeader, ObjectStorage};
-
-pub mod image;
-pub mod storage;
-
-pub trait Object: Sized {
+pub(crate) trait Object: Sized + GetContextStorage<Self> {
     type CreateInfo;
+    type SupplementalInfo;
     type Handle;
-    type Storage: ObjectStorage<Self>;
-    type ImmutableData;
-    type MutableData;
+    type Storage: ObjectStorage<Self> + Sync;
+    type ObjectData;
     unsafe fn create(
-        ctx: &InnerContext,
+        ctx: &InnerDevice,
         info: &Self::CreateInfo,
-    ) -> VulkanResult<(Self::Handle, Self::ImmutableData, Self::MutableData)>;
-    unsafe fn destroy(ctx: &InnerContext, handle: Self::Handle) -> VulkanResult<()>;
+        supplemental_info: &Self::SupplementalInfo,
+    ) -> VulkanResult<(Self::Handle, Self::ObjectData)>;
+    unsafe fn destroy(
+        ctx: &InnerDevice,
+        handle: Self::Handle,
+        data: &Self::ObjectData,
+    ) -> VulkanResult<()>;
 }
 
-pub struct ArcHandle<T: Object>(NonNull<ArcHeader<T>>);
+pub(crate) struct ArcHandle<T: Object>(pub(crate) NonNull<ArcHeader<T>>);
 
 impl<T: Object> ArcHandle<T> {
     pub fn get_header(&self) -> &ObjectHeader<T> {
@@ -30,7 +38,7 @@ impl<T: Object> ArcHandle<T> {
     }
 }
 
-pub struct CloneMany<T: Object> {
+pub(crate) struct CloneMany<T: Object> {
     handle: ArcHandle<T>,
     count: usize,
 }
@@ -54,12 +62,11 @@ impl<T: Object> Drop for CloneMany<T> {
                 .refcount
                 .fetch_sub(self.count, std::sync::atomic::Ordering::SeqCst);
 
-            debug_assert!(prev > 0);
+            assert!(prev > 0);
 
             if prev == self.count {
-                let storage =
-                    <InnerContext as ContextGetStorage<T>>::get_storage((*header).header.ctx);
-                T::Storage::destroy(storage.as_ptr(), &mut (*header).header);
+                let storage = <T as GetContextStorage<T>>::get_storage((*header).header.ctx());
+                T::Storage::destroy(storage, header);
             }
         }
     }
@@ -73,7 +80,7 @@ impl<T: Object> ArcHandle<T> {
                 .refcount
                 .fetch_add(count, std::sync::atomic::Ordering::SeqCst);
 
-            debug_assert!(prev > 0);
+            assert!(prev > 0);
 
             CloneMany {
                 handle: ArcHandle(self.0),
@@ -91,7 +98,7 @@ impl<T: Object> Clone for ArcHandle<T> {
                 .refcount
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-            debug_assert!(prev > 0);
+            assert!(prev > 0);
 
             ArcHandle(header)
         }
@@ -106,12 +113,11 @@ impl<T: Object> Drop for ArcHandle<T> {
                 .refcount
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
 
-            debug_assert!(prev > 0);
+            assert!(prev > 0);
 
             if prev == 1 {
-                let storage =
-                    <InnerContext as ContextGetStorage<T>>::get_storage((*header).header.ctx);
-                T::Storage::destroy(storage.as_ptr(), &mut (*header).header);
+                let mut storage = <T as GetContextStorage<T>>::get_storage((*header).header.ctx());
+                T::Storage::destroy(storage, header);
             }
         }
     }

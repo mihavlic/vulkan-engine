@@ -19,10 +19,14 @@ pub struct FormatWriter<W> {
 }
 
 impl<W: Write> FormatWriter<W> {
-    pub fn new(writer: W, padding: &'static str) -> Self {
-        let padding_width = display_width(padding).try_into().unwrap();
+    pub fn new(writer: W, mut padding: &'static str) -> Self {
+        let mut padding_width = display_width(padding).try_into().unwrap();
         let max_width = termsize::get().map(|s| s.cols).unwrap_or(80);
-        assert!(max_width > padding_width);
+
+        if padding_width >= max_width {
+            padding = "";
+            padding_width = 0;
+        }
 
         Self {
             inner: writer,
