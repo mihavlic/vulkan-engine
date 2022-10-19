@@ -1,9 +1,7 @@
 use std::ptr;
 
 use crate::{
-    context::device::InnerDevice,
-    storage::{nostore::NoStore, GetContextStorage},
-    synchronization::ReaderWriterState,
+    context::device::InnerDevice, storage::nostore::NoStore, synchronization::ReaderWriterState,
     OptionalU32,
 };
 use pumice::{util::result::VulkanResult, vk};
@@ -54,6 +52,8 @@ impl Object for Buffer {
     type Storage = NoStore;
     type ObjectData = (pumice_vma::Allocation, BufferSynchronizationState);
 
+    type Parent = InnerDevice;
+
     unsafe fn create(
         ctx: &InnerDevice,
         info: &Self::CreateInfo,
@@ -75,10 +75,8 @@ impl Object for Buffer {
         ctx.allocator.destroy_buffer(handle, allocation);
         VulkanResult::new_ok(())
     }
-}
 
-impl GetContextStorage<Buffer> for Buffer {
-    fn get_storage(ctx: &InnerDevice) -> &<Buffer as Object>::Storage {
-        &ctx.image_storage
+    unsafe fn get_storage(parent: &Self::Parent) -> &Self::Storage {
+        &parent.buffer_storage
     }
 }

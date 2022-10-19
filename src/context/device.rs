@@ -8,7 +8,7 @@ use std::{
 
 use crate::{
     object::{self},
-    storage::{nostore::NoStore, GetContextStorage, ObjectStorage},
+    storage::{nostore::NoStore, ObjectStorage},
     tracing::shim_macros::{info, trace},
     util::{
         self,
@@ -19,13 +19,16 @@ use crate::{
 use pumice::{
     loader::{
         tables::{DeviceTable, EntryTable, InstanceTable},
-        InstanceLoader,
+        DeviceLoader, InstanceLoader,
     },
-    util::result::VulkanResult,
+    util::{config::ApiLoadConfig, result::VulkanResult},
     vk,
     vk10::QueueFamilyProperties,
     DeviceWrapper,
 };
+use pumice_vma::{Allocator, AllocatorCreateInfo};
+
+use super::instance::{Instance, InstanceCreateInfo};
 
 #[derive(Debug, Clone, Copy)]
 pub enum SelectionMechanism {
@@ -43,17 +46,16 @@ pub struct QueueFamilySelection {
     coalesce: bool,
 }
 
-pub struct ContextCreateInfo<'a> {
-    conf: pumice::util::config::ApiLoadConfig<'a>,
-    device_features: vk::PhysicalDeviceFeatures,
-    validation_layers: &'a [&'a CStr],
-    enable_debug_callback: bool,
-    verbose: bool,
-    queue_family_selection: Vec<QueueFamilySelection>,
-    app_name: &'a CStr,
+pub struct DeviceCreateInfo<'a> {
+    pub instance: super::instance::Instance,
+    pub config: &'a mut ApiLoadConfig<'a>,
+    pub device_features: vk::PhysicalDeviceFeatures,
+    pub queue_family_selection: Vec<QueueFamilySelection>,
+    pub verbose: bool,
 }
 
 pub(crate) struct InnerDevice {
+    pub(crate) instance: super::instance::Instance,
     pub(crate) device: pumice::DeviceWrapper,
 
     pub(crate) physical_device_properties: vk::PhysicalDeviceProperties,
@@ -64,206 +66,34 @@ pub(crate) struct InnerDevice {
     pub(crate) queues: Vec<vk::Queue>,
     pub(crate) queue_families: Vec<QueueFamilyProperties>,
 
-    pub(crate) debug_messenger: Option<pumice::extensions::ext_debug_utils::DebugUtilsMessengerEXT>,
-    pub(crate) verbose: bool,
-
-    // hanobjectdle storage
+    // object handle storage
     pub(crate) image_storage: NoStore,
+    pub(crate) buffer_storage: NoStore,
 
     // allocator
-    pub(crate) allocator: pumice_vma::Allocator,
+    pub(crate) allocator: Allocator,
     pub(crate) allocation_callbacks: Option<vk::AllocationCallbacks>,
 
     // at the bottom so that these are dropped last, the loader keeps the vulkan dll loaded
-    pub(crate) device_table: DeviceTable,
+    pub(crate) device_table: Box<DeviceTable>,
 }
 
 pub struct Device(Pin<Box<InnerDevice>>);
 
 impl Device {
-    pub unsafe fn new(info: ContextCreateInfo) -> Self {
+    pub unsafe fn new(info: DeviceCreateInfo) -> Self {
         let allocation_callbacks = None;
 
-        let ContextCreateInfo {
-            mut conf,
+        let DeviceCreateInfo {
+            instance,
+            config: conf,
             device_features,
-            validation_layers,
-            enable_debug_callback,
-            verbose,
             queue_family_selection,
-            app_name,
+            verbose,
         } = info;
 
-        if enable_debug_callback {
-            conf.add_extension(pumice::extensions::ext_debug_utils::EXT_DEBUG_UTILS_EXTENSION_NAME);
-        }
-
-        let mut tables = Box::new((
-            EntryTable::new_empty(),
-            InstanceTable::new_empty(),
-            DeviceTable::new_empty(),
-        ));
-
-        let loader = pumice::loader::EntryLoader::new().expect("Failed to create entry loader");
-        tables.0.load(&loader);
-        let entry = pumice::EntryWrapper::new(&tables.0);
-
-        let api_version = entry
-            .enumerate_instance_version()
-            .expect("enumerate_instance_version error");
-
-        if api_version < conf.get_api_version() {
-            let requested = to_version(conf.get_api_version());
-            let api_version = to_version(api_version);
-            panic!(
-                "Unsupported api version, requested {}.{}.{}, available {}.{}.{}",
-                requested.0, requested.1, requested.2, api_version.0, api_version.1, api_version.2
-            );
-        }
-
-        {
-            let available_instance_extensions = entry
-                .enumerate_instance_extension_properties(None, None)
-                .expect("enumerate_instance_extension_properties error");
-
-            let available_instance_extensions: HashSet<&CStr, RandomState> = HashSet::from_iter(
-                available_instance_extensions
-                    .iter()
-                    .map(|p| CStr::from_ptr(p.extension_name.as_ptr())),
-            );
-
-            let missing_extensions = conf
-                .get_instance_extensions_iter()
-                .filter(|e| !available_instance_extensions.contains(e));
-
-            if missing_extensions.clone().next().is_some() {
-                let missing =
-                    IterDisplay::new(missing_extensions, |i, d| i.to_string_lossy().fmt(d));
-                panic!("Instance doesn't support requested extensions:\n{missing}");
-            }
-        }
-
-        {
-            let available_layers = entry
-                .enumerate_instance_layer_properties(None)
-                .expect("enumerate_instance_extension_properties error");
-
-            let available_layers: HashSet<&CStr, RandomState> = HashSet::from_iter(
-                available_layers
-                    .iter()
-                    .map(|p| CStr::from_ptr(p.layer_name.as_ptr())),
-            );
-
-            let missing_extensions = validation_layers
-                .iter()
-                .filter(|&&e| !available_layers.contains(e));
-
-            if missing_extensions.clone().next().is_some() {
-                let missing =
-                    IterDisplay::new(missing_extensions, |i, d| i.to_string_lossy().fmt(d));
-                panic!("Instance doesn't support requested layers:\n{missing}");
-            }
-        }
-
-        let instance_layer_properties = entry
-            .enumerate_instance_layer_properties(None)
-            .expect("enumerate_instance_layer_properties error");
-
-        if verbose {
-            let iter = instance_layer_properties
-                .iter()
-                .map(|l| CStr::from_ptr(l.layer_name.as_ptr()).to_string_lossy());
-            let iter = IterDisplay::new(iter, |i, w| i.fmt(w));
-            info!(
-                "{} instance layers:\n{}",
-                instance_layer_properties.len(),
-                iter
-            );
-        } else {
-            info!("{} instance layers", instance_layer_properties.len());
-        }
-
-        let app_info = pumice::vk::ApplicationInfo {
-            p_application_name: app_name.as_ptr(),
-            application_version: 0,
-            p_engine_name: app_name.as_ptr(),
-            engine_version: 0,
-            api_version: conf.get_api_version(),
-            ..Default::default()
-        };
-
-        let instance_extensions = conf.get_instance_extensions();
-
-        let validation_layers = validation_layers
-            .iter()
-            .map(|l| l.as_ptr())
-            .collect::<Vec<_>>();
-
-        let create_info = pumice::vk::InstanceCreateInfo {
-            p_application_info: &app_info,
-            enabled_layer_count: validation_layers.len() as _,
-            pp_enabled_layer_names: validation_layers.as_ptr(),
-            enabled_extension_count: instance_extensions.len() as _,
-            pp_enabled_extension_names: instance_extensions.as_ptr(),
-            ..Default::default()
-        };
-
-        let instance_handle = entry
-            .create_instance(&create_info, allocation_callbacks.as_ref())
-            .expect("create_instance error");
-        let instance_loader = InstanceLoader::new(instance_handle, &loader);
-        tables.1.load(&instance_loader, &conf);
-        tables.2.load(&instance_loader, &conf);
-
-        let instance = pumice::InstanceWrapper::new(instance_handle, &tables.1);
-
-        let debug_messenger = if enable_debug_callback {
-            let info = pumice::extensions::ext_debug_utils::DebugUtilsMessengerCreateInfoEXT {
-                message_severity: vk::DebugUtilsMessageSeverityFlagsEXT::all(),
-                message_type: vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
-                    | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE
-                    | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION,
-                pfn_user_callback: Some(util::debug_callback::debug_callback),
-                ..Default::default()
-            };
-
-            Some(
-                instance
-                    .create_debug_utils_messenger_ext(&info, allocation_callbacks.as_ref())
-                    .expect("create_debug_utils_messenger_ext error"),
-            )
-        } else {
-            None
-        };
-
-        let physical_devices = instance
-            .enumerate_physical_devices(None)
-            .expect("enumerate_physical_devices error");
-        let physical_device_properties = physical_devices
-            .iter()
-            .map(|&d| instance.get_physical_device_properties(d))
-            .collect::<Vec<_>>();
-
-        if verbose {
-            let fun = Fun::new(|f: &mut std::fmt::Formatter<'_>| {
-                for (i, property) in physical_device_properties.iter().enumerate() {
-                    let name = CStr::from_ptr(property.device_name.as_ptr()).to_string_lossy();
-                    let core = to_version(property.api_version);
-                    let driver = to_version(property.driver_version);
-                    write! {
-                        f,
-                        "\n[{i}] {name}\n    core {}.{}.{}, driver {}.{}.{}, {:?}",
-                        core.0, core.1, core.2,
-                        driver.0, driver.1, driver.2,
-                        property.device_type,
-                    }?;
-                }
-                Ok(())
-            });
-            info!("{} physical devices:{}", physical_devices.len(), fun);
-        } else {
-            info!("{} physical devices", physical_devices.len());
-        }
+        let inner = instance.inner();
+        let instance_handle = instance.handle();
 
         // (_, _, overlay over queue_family_selection and their associated queue families)
         let (
@@ -273,9 +103,9 @@ impl Device {
             queue_families,
             selected_queue_families,
         ) = select_device(
-            &physical_devices,
-            &physical_device_properties,
-            &instance,
+            &inner.physical_devices,
+            &inner.physical_device_properties,
+            &instance_handle,
             &conf,
             &queue_family_selection,
         );
@@ -323,7 +153,7 @@ impl Device {
             ..Default::default()
         };
 
-        let device_handle = instance
+        let device_handle = instance_handle
             .create_device(
                 physical_device,
                 &device_create_info,
@@ -331,7 +161,14 @@ impl Device {
             )
             .expect("create_device error");
 
-        let device = DeviceWrapper::new(device_handle, &tables.2);
+        let (device, device_table) = {
+            let mut table = Box::new(DeviceTable::new_empty());
+            let loader = DeviceLoader::new(device_handle, &instance.instance_loader());
+            table.load(&loader, conf);
+            let device = DeviceWrapper::new(device_handle, &*table);
+
+            (device, table)
+        };
 
         let (queues, queue_selection_mapping) = {
             let mut queues = Vec::new();
@@ -361,15 +198,12 @@ impl Device {
         };
 
         let allocator = {
-            let create_info =
-                pumice_vma::AllocatorCreateInfo::new(&instance, &device, &physical_device);
-            pumice_vma::Allocator::new(create_info).unwrap()
+            let create_info = AllocatorCreateInfo::new(&instance_handle, &device, &physical_device);
+            Allocator::new(create_info).unwrap()
         };
 
         let inner = InnerDevice {
-            entry,
             instance,
-
             device,
             physical_device_properties,
             physical_device_features,
@@ -378,30 +212,21 @@ impl Device {
             queue_selection_mapping,
             queues,
 
-            debug_messenger,
-            verbose,
-
             image_storage: NoStore::new(),
+            buffer_storage: NoStore::new(),
 
             allocator,
             allocation_callbacks,
 
-            loader,
-            device_table: tables,
+            device_table,
         };
 
         Self(Box::pin(inner))
     }
-    pub fn entry(&self) -> &pumice::EntryWrapper {
-        &self.0.entry
-    }
-    pub fn instance(&self) -> &pumice::InstanceWrapper {
-        &self.0.instance
-    }
     pub fn device(&self) -> &pumice::DeviceWrapper {
         &self.0.device
     }
-    pub fn allocator(&self) -> &pumice_vma::Allocator {
+    pub fn allocator(&self) -> &Allocator {
         &self.0.allocator
     }
     pub fn allocator_callbacks(&self) -> Option<&vk::AllocationCallbacks> {
@@ -430,7 +255,7 @@ impl Device {
     ) -> VulkanResult<object::Image> {
         self.0
             .image_storage
-            .get_or_create(info, allocate, &self.0)
+            .get_or_create(info, allocate, &*self.0)
             .map(object::Image)
     }
 
@@ -451,25 +276,35 @@ use {
 fn test_context_new() {
     install_tracing_subscriber(Severity::Trace);
 
-    let info = ContextCreateInfo {
-        conf: pumice::util::config::ApiLoadConfig::new(vk::API_VERSION_1_0),
-        device_features: Default::default(),
-        validation_layers: &[pumice::cstr!("VK_LAYER_KHRONOS_validation")],
-        enable_debug_callback: true,
-        verbose: false,
-        queue_family_selection: vec![QueueFamilySelection {
-            mask: vk::QueueFlags::GRAPHICS,
-            count: 1,
-            priority: 1.0,
-            exact: false,
-            attempt_dedicated: false,
-            coalesce: true,
-        }],
-        app_name: pumice::cstr!("test_context_new"),
-    };
-
     unsafe {
-        let context = Device::new(info);
+        let mut conf = ApiLoadConfig::new(vk::API_VERSION_1_0);
+
+        let info = InstanceCreateInfo {
+            config: &mut conf,
+            validation_layers: &[pumice::cstr!("VK_LAYER_KHRONOS_validation")],
+            enable_debug_callback: true,
+            app_name: pumice::cstr!("test_context_new"),
+            verbose: false,
+        };
+
+        let instance = Instance::new(info);
+
+        let info = DeviceCreateInfo {
+            instance,
+            config: &mut conf,
+            device_features: Default::default(),
+            queue_family_selection: vec![QueueFamilySelection {
+                mask: vk::QueueFlags::GRAPHICS,
+                count: 1,
+                priority: 1.0,
+                exact: false,
+                attempt_dedicated: false,
+                coalesce: true,
+            }],
+            verbose: false,
+        };
+
+        let device = Device::new(info);
     }
 }
 
@@ -477,25 +312,35 @@ fn test_context_new() {
 fn test_create_image() {
     install_tracing_subscriber(Severity::Info);
 
-    let info = ContextCreateInfo {
-        conf: pumice::util::config::ApiLoadConfig::new(vk::API_VERSION_1_0),
-        device_features: Default::default(),
-        validation_layers: &[pumice::cstr!("VK_LAYER_KHRONOS_validation")],
-        enable_debug_callback: true,
-        verbose: false,
-        queue_family_selection: vec![QueueFamilySelection {
-            mask: vk::QueueFlags::GRAPHICS,
-            count: 1,
-            priority: 1.0,
-            exact: false,
-            attempt_dedicated: false,
-            coalesce: true,
-        }],
-        app_name: pumice::cstr!("test_context_new"),
-    };
-
     unsafe {
-        let context = Device::new(info);
+        let mut conf = ApiLoadConfig::new(vk::API_VERSION_1_0);
+
+        let info = InstanceCreateInfo {
+            config: &mut conf,
+            validation_layers: &[pumice::cstr!("VK_LAYER_KHRONOS_validation")],
+            enable_debug_callback: true,
+            app_name: pumice::cstr!("test_context_new"),
+            verbose: false,
+        };
+
+        let instance = Instance::new(info);
+
+        let info = DeviceCreateInfo {
+            instance,
+            config: &mut conf,
+            device_features: Default::default(),
+            queue_family_selection: vec![QueueFamilySelection {
+                mask: vk::QueueFlags::GRAPHICS,
+                count: 1,
+                priority: 1.0,
+                exact: false,
+                attempt_dedicated: false,
+                coalesce: true,
+            }],
+            verbose: false,
+        };
+
+        let device = Device::new(info);
 
         let info = object::ImageCreateInfo {
             flags: vk::ImageCreateFlags::empty(),
@@ -514,11 +359,11 @@ fn test_create_image() {
                 vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_CACHED,
             )
             .flags(AllocationCreateFlags::MAPPED);
-        let image = context.create_image(info, allocation_info);
+        let image = device.create_image(info, allocation_info);
 
         // explicit drop order due to very messy code
         drop(image);
-        drop(context);
+        drop(device);
     }
 }
 
@@ -526,7 +371,7 @@ unsafe fn select_device(
     physical_devices: &Vec<vk::PhysicalDevice>,
     physical_device_properties: &Vec<vk::PhysicalDeviceProperties>,
     instance: &pumice::InstanceWrapper,
-    conf: &pumice::util::config::ApiLoadConfig,
+    conf: &ApiLoadConfig,
     queue_family_selection: &Vec<QueueFamilySelection>,
 ) -> (
     vk::PhysicalDevice,
@@ -675,10 +520,4 @@ unsafe fn select_device(
         queue_families,
         selected_queue_families,
     )
-}
-
-impl GetContextStorage<object::Image> for InnerDevice {
-    fn get_storage(ctx: &InnerDevice) -> &<object::Image as object::Object>::Storage {
-        &ctx.image_storage
-    }
 }

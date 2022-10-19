@@ -27,7 +27,7 @@ impl<T: Object<Storage = Self>> ObjectStorage<T> for NoStore {
         &self,
         info: <T as Object>::CreateInfo,
         supplemental: <T as Object>::SupplementalInfo,
-        ctx: &InnerDevice,
+        ctx: &T::Parent,
     ) -> VulkanResult<ArcHandle<T>> {
         self.lock.with_locked(|| {
             create_header(ctx, info, supplemental, ()).map(|header| {
@@ -45,7 +45,8 @@ impl<T: Object<Storage = Self>> ObjectStorage<T> for NoStore {
         let alloc = Box::from_raw(header);
         let ArcHeader { refcount, header } = *alloc;
 
-        self.lock
-            .with_locked(|| T::destroy(header.ctx(), header.handle, &header.object_data).unwrap());
+        self.lock.with_locked(|| {
+            T::destroy(header.parent(), header.handle, &header.object_data).unwrap()
+        });
     }
 }

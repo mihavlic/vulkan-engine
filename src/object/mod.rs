@@ -9,25 +9,31 @@ use std::ptr::NonNull;
 
 use crate::{
     context::device::InnerDevice,
-    storage::{ArcHeader, GetContextStorage, ObjectHeader, ObjectStorage},
+    storage::{ArcHeader, ObjectHeader, ObjectStorage},
 };
 
-pub(crate) trait Object: Sized + GetContextStorage<Self> {
+pub(crate) trait Object: Sized {
     type CreateInfo;
     type SupplementalInfo;
     type Handle;
     type Storage: ObjectStorage<Self> + Sync;
     type ObjectData;
+
+    type Parent;
+
     unsafe fn create(
-        ctx: &InnerDevice,
+        ctx: &Self::Parent,
         info: &Self::CreateInfo,
         supplemental_info: &Self::SupplementalInfo,
     ) -> VulkanResult<(Self::Handle, Self::ObjectData)>;
+
     unsafe fn destroy(
-        ctx: &InnerDevice,
+        ctx: &Self::Parent,
         handle: Self::Handle,
         data: &Self::ObjectData,
     ) -> VulkanResult<()>;
+
+    unsafe fn get_storage(parent: &Self::Parent) -> &Self::Storage;
 }
 
 pub(crate) struct ArcHandle<T: Object>(pub(crate) NonNull<ArcHeader<T>>);
@@ -65,7 +71,7 @@ impl<T: Object> Drop for CloneMany<T> {
             assert!(prev > 0);
 
             if prev == self.count {
-                let storage = <T as GetContextStorage<T>>::get_storage((*header).header.ctx());
+                let storage = T::get_storage((*header).header.parent());
                 T::Storage::destroy(storage, header);
             }
         }
@@ -116,7 +122,7 @@ impl<T: Object> Drop for ArcHandle<T> {
             assert!(prev > 0);
 
             if prev == 1 {
-                let mut storage = <T as GetContextStorage<T>>::get_storage((*header).header.ctx());
+                let mut storage = T::get_storage((*header).header.parent());
                 T::Storage::destroy(storage, header);
             }
         }

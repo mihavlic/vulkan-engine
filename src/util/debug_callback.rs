@@ -58,7 +58,18 @@ pub unsafe extern "system" fn debug_callback(
         };
 
         #[cfg(not(feature = "build-tracing"))]
-        eprintln!("{args}");
+        {
+            #[rustfmt::skip]
+            let text = match level {
+                Severity::Trace => "[TRACE]",
+                Severity::Info =>  "[INFO] ",
+                Severity::Debug => "[DEBUG]",
+                Severity::Warn =>  "[WARN] ",
+                Severity::Error => "[ERROR]",
+            };
+            let color = Colored(level, &text);
+            eprintln!("{color} {args}");
+        }
     };
 
     let msg = CStr::from_ptr((*p_callback_data).p_message).to_string_lossy();

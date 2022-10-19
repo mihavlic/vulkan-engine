@@ -17,7 +17,7 @@ pub(crate) trait ObjectStorage<T: Object>: Sized {
         &self,
         info: <T as Object>::CreateInfo,
         supplemental: <T as Object>::SupplementalInfo,
-        ctx: &InnerDevice,
+        ctx: &T::Parent,
     ) -> VulkanResult<ArcHandle<T>>;
 
     /// when calling this function, exclusive access to the header must be guaranteed
@@ -31,12 +31,12 @@ pub(crate) struct ObjectHeader<T: Object> {
     pub(crate) info: T::CreateInfo,
     pub(crate) storage_data: <T::Storage as ObjectStorage<T>>::StorageData,
     pub(crate) object_data: <T as Object>::ObjectData,
-    ctx: NonNull<InnerDevice>,
+    parent: NonNull<T::Parent>,
 }
 
 impl<T: Object> ObjectHeader<T> {
-    pub(crate) unsafe fn ctx<'a, 'b>(&'a self) -> &'b InnerDevice {
-        self.ctx.as_ref()
+    pub(crate) unsafe fn parent<'a, 'b>(&'a self) -> &'b T::Parent {
+        self.parent.as_ref()
     }
 }
 
@@ -44,10 +44,6 @@ impl<T: Object> ObjectHeader<T> {
 pub(crate) struct ArcHeader<T: Object> {
     pub(crate) refcount: AtomicUsize,
     pub(crate) header: ObjectHeader<T>,
-}
-
-pub(crate) trait GetContextStorage<T: Object> {
-    fn get_storage(ctx: &InnerDevice) -> &T::Storage;
 }
 
 // help
@@ -82,7 +78,7 @@ impl ReentrantMutex {
 /// # Safety:
 /// the storage must be synchronised when calling this method
 unsafe fn create_header<T: Object>(
-    ctx: &InnerDevice,
+    ctx: &T::Parent,
     info: T::CreateInfo,
     supplemental_info: T::SupplementalInfo,
     storage_data: <T::Storage as ObjectStorage<T>>::StorageData,
@@ -92,6 +88,6 @@ unsafe fn create_header<T: Object>(
         info,
         storage_data,
         object_data,
-        ctx: NonNull::from(ctx),
+        parent: NonNull::from(ctx),
     })
 }
