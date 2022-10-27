@@ -10,7 +10,7 @@ use smallvec::SmallVec;
 use crate::{
     arena::{
         arena::{GenArena, U32Key},
-        optional::OptionalU32,
+        uint::OptionalU32,
     },
     context::device::Device,
 };
@@ -107,6 +107,8 @@ impl InnerSynchronizationManager {
         let mut timeout_ns = timeout_ns;
         let start = std::time::Instant::now();
 
+        let mut timeout = false;
+
         // since we need to know which semaphores have finished, we must emulate the requested behaviour,
         // though wait_any is going to be iffy, the performance impact of doing all of this is unknown, however here:
         // https://gitlab.freedesktop.org/mesa/mesa/-/issues/6266
@@ -135,7 +137,8 @@ impl InnerSynchronizationManager {
                         true
                     }
                     vk::Result::TIMEOUT => {
-                        return VulkanResult::new_ok(WaitResult::Timeout);
+                        timeout = true;
+                        false
                     }
                     _ => return VulkanResult::new_err(result.raw),
                 }
@@ -149,14 +152,19 @@ impl InnerSynchronizationManager {
                 let elapsed = start.elapsed().as_nanos();
                 let timeout = timeout_ns as u128;
                 if elapsed >= timeout {
-                    return VulkanResult::new_ok(WaitResult::Timeout);
+                    // we still want to check the other semaphores' status
+                    timeout_ns = 0;
                 } else {
                     timeout_ns = (timeout - elapsed) as u64;
                 }
             }
         }
 
-        return VulkanResult::new_ok(WaitResult::AllFinished);
+        if timeout {
+            return VulkanResult::new_ok(WaitResult::Timeout);
+        } else {
+            return VulkanResult::new_ok(WaitResult::AllFinished);
+        }
     }
     fn allocate(&mut self, queue: Queue, device: &Device) -> QueueSubmission {
         let semaphore = self.get_fresh_semaphore(device);

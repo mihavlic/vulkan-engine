@@ -1,7 +1,7 @@
 use std::ptr;
 
 use crate::{
-    arena::optional::OptionalU32, context::device::InnerDevice, storage::nostore::NoStore,
+    arena::uint::OptionalU32, context::device::InnerDevice, storage::nostore::NoStore,
     synchronization::ReaderWriterState,
 };
 use pumice::{util::result::VulkanResult, vk};

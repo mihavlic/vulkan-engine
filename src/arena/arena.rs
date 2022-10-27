@@ -1,19 +1,14 @@
 use std::{fmt::Debug, hash::Hash, marker::PhantomData, mem::ManuallyDrop, ops::Not};
 
-use super::optional::{Optional, UInt};
+use super::uint::{Config, Optional, PackedUint, UInt};
 
 pub trait KeyType {
     const MAX_VALID: Self;
     const INVALID: Self;
 }
 
-pub trait KeyConfig: Copy {
-    const INDEX_BITS: usize;
-    const GENERATION_BITS: usize;
+pub trait KeyConfig: Config + Copy {
     const WRAP_GENERATION: bool;
-
-    const MAX_INDEX: usize = 2usize.pow(Self::INDEX_BITS as u32);
-    const MAX_GENERATION: usize = 2usize.pow(Self::GENERATION_BITS as u32);
 }
 
 pub trait Key: Copy {
@@ -96,7 +91,7 @@ impl<K: Key, T> GenArena<K, T> {
     }
     pub fn insert(&mut self, value: T) -> K {
         if let Some(next) = self.next_free.get() {
-            assert!(self.entries.len() - 1 < K::Config::MAX_INDEX);
+            assert!(self.entries.len() - 1 < K::Config::MAX_FIRST);
 
             unsafe {
                 let free = self.entries.get_unchecked_mut(next.into_usize());
@@ -109,13 +104,14 @@ impl<K: Key, T> GenArena<K, T> {
         } else {
             let index = self.entries.len();
             self.entries.push(Entry {
-                generation: 0.into(),
+                // odd generation for occupied
+                generation: 1.into(),
                 value: EntryValue {
                     value: ManuallyDrop::new(value),
                 },
             });
 
-            K::new(UInt::from_usize(index), 0.try_into().ok().unwrap())
+            K::new(UInt::from_usize(index), 1.try_into().ok().unwrap())
         }
     }
     pub fn remove(&mut self, key: K) -> Option<T> {
@@ -140,7 +136,7 @@ impl<K: Key, T> GenArena<K, T> {
                 next_free: self.next_free,
             },
         );
-        let mut at_max = entry.generation >= UInt::from_usize(K::Config::MAX_GENERATION);
+        let mut at_max = entry.generation >= UInt::from_usize(K::Config::MAX_SECOND);
         // we just stop using the slot if it reaches max generation
         if K::Config::WRAP_GENERATION && at_max {
             entry.generation = 0.into();
@@ -192,79 +188,17 @@ impl<K: Key, T> GenArena<K, T> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct IntKey<C: KeyConfig, I: UInt>(I, PhantomData<C>);
-
-impl<C: KeyConfig, I: UInt> IntKey<C, I> {
-    const BITS: usize = std::mem::size_of::<I>() * 8;
-    const __ASSERT: () = assert!(C::INDEX_BITS + C::GENERATION_BITS <= Self::BITS);
-}
-
-impl<C: KeyConfig, I: UInt> Key for IntKey<C, I> {
-    type Config = C;
-    type StoredIndex = I;
-    type StoredGeneration = I;
-
-    fn new(index: I, generation: I) -> Self {
-        debug_assert!(index <= UInt::from_usize(C::MAX_INDEX));
-        debug_assert!(generation <= UInt::from_usize(C::MAX_GENERATION));
-
-        // little:
-        // [generation][index]
-
-        // big:
-        // [index][generation]
-
-        #[cfg(target_endian = "little")]
-        let value = (index & (I::MAX >> Self::BITS - C::INDEX_BITS))
-            | (generation << Self::BITS - C::GENERATION_BITS);
-
-        #[cfg(target_endian = "big")]
-        let value = (index & (I::MAX << Self::BITS - C::INDEX_BITS))
-            | (generation >> Self::BITS - C::GENERATION_BITS);
-
-        IntKey(value, PhantomData)
-    }
-
-    fn index(&self) -> I {
-        #[cfg(target_endian = "little")]
-        let value = self.0 & (I::MAX >> C::GENERATION_BITS);
-
-        #[cfg(target_endian = "big")]
-        let value = self.0 & (I::MAX << C::GENERATION_BITS);
-
-        value
-    }
-
-    fn generation(&self) -> I {
-        #[cfg(target_endian = "little")]
-        let value = self.0 >> (Self::BITS - C::GENERATION_BITS);
-
-        #[cfg(target_endian = "big")]
-        let value = self.0 << (Self::BITS - C::GENERATION_BITS);
-
-        value
-    }
-}
-
-impl<C: KeyConfig, I: UInt> Debug for IntKey<C, I> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IntKey")
-            .field("index", &self.index().into_usize())
-            .field("generation", &self.generation().into_usize())
-            .finish()
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct U32KeyConfig;
+impl Config for U32KeyConfig {
+    const FIRST_BITS: usize = 15;
+    const SECOND_BITS: usize = 17;
+}
 impl KeyConfig for U32KeyConfig {
-    const INDEX_BITS: usize = 15;
-    const GENERATION_BITS: usize = 17;
     const WRAP_GENERATION: bool = true;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct U32Key(IntKey<U32KeyConfig, u32>);
+pub struct U32Key(PackedUint<U32KeyConfig, u32>);
 
 impl Key for U32Key {
     type Config = U32KeyConfig;
@@ -272,13 +206,13 @@ impl Key for U32Key {
     type StoredGeneration = u32;
 
     fn new(index: Self::StoredIndex, generation: Self::StoredGeneration) -> Self {
-        Self(IntKey::new(index, generation))
+        Self(PackedUint::new(index, generation))
     }
     fn index(&self) -> Self::StoredIndex {
-        IntKey::index(&self.0)
+        self.0.first()
     }
     fn generation(&self) -> Self::StoredGeneration {
-        IntKey::generation(&self.0)
+        self.0.second()
     }
 }
 
@@ -294,7 +228,7 @@ impl Debug for U32Key {
 #[test]
 fn test_arena() {
     // we want to test that entries are abandoned when they reach their maximum generation
-    let max_by_one = UInt::from_usize(<U32Key as Key>::Config::MAX_GENERATION - 1);
+    let max_by_one = UInt::from_usize(<U32Key as Key>::Config::MAX_SECOND);
     let mut map: GenArena<U32Key, u32> = GenArena {
         entries: vec![Entry {
             generation: max_by_one,
@@ -306,16 +240,16 @@ fn test_arena() {
         spooky: PhantomData,
     };
 
-    map.remove(<U32Key as Key>::new(0, max_by_one));
+    map.remove(Key::new(0, max_by_one));
     let inserted = map.insert(1);
 
-    assert_eq!(map.capacity(), 2);
+    // test generation wraparound
+    assert_eq!(map.entries[0].generation, 1);
 
     let removed = map.remove(inserted).unwrap();
     assert_eq!(removed, 1);
 
     map.insert(2);
-    assert_eq!(map.capacity(), 2);
 
     let none = map.remove(inserted);
     assert_eq!(none, None);

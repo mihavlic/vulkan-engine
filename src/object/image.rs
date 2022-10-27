@@ -4,7 +4,7 @@ use pumice::{util::result::VulkanResult, vk};
 use smallvec::SmallVec;
 
 use crate::{
-    arena::optional::OptionalU32,
+    arena::uint::OptionalU32,
     context::device::InnerDevice,
     storage::{nostore::NoStore, MutableShared},
     synchronization::ReaderWriterState,

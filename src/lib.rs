@@ -2,6 +2,7 @@
 
 pub mod arena;
 pub mod context;
+pub mod graph;
 pub mod object;
 pub mod storage;
 pub mod synchronization;
