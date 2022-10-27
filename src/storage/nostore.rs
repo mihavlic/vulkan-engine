@@ -49,4 +49,11 @@ impl<T: Object<Storage = Self>> ObjectStorage<T> for NoStore {
             T::destroy(header.parent(), header.handle, &header.object_data).unwrap()
         });
     }
+
+    fn synchronize_header_access<'a>(
+        &'a self,
+        header: *const ArcHeader<T>,
+    ) -> super::SynchronizationLock<'a> {
+        self.lock.lock()
+    }
 }

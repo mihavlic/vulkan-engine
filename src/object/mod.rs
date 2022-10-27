@@ -1,8 +1,12 @@
 mod buffer;
 mod image;
+mod surface;
+mod swapchain;
 
 pub use buffer::*;
 pub use image::*;
+pub use surface::*;
+pub use swapchain::*;
 
 use pumice::util::result::VulkanResult;
 use std::ptr::NonNull;

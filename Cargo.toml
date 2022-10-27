@@ -5,11 +5,19 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[[bin]]
+path = "./test-bin/main.rs"
+name = "test-bin"
+
 [dependencies]
 pumice = {path = "../pumice", features = ["wrappers"]}
 pumice-vma = {path = "../pumice-vma"}
+
 smallvec = {version = "1.10.0", features = ["union"]}
 parking_lot = "0.12.1"
+
+raw-window-handle = "0.5.0"
+winit = "0.27.4"
 
 tracing = {version = "0.1", optional = true}
 tracing-subscriber = {version = "0.3.15", default-features = false, features = ["fmt"], optional = true}

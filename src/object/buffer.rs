@@ -1,8 +1,8 @@
 use std::ptr;
 
 use crate::{
-    context::device::InnerDevice, storage::nostore::NoStore, synchronization::ReaderWriterState,
-    OptionalU32,
+    arena::optional::OptionalU32, context::device::InnerDevice, storage::nostore::NoStore,
+    synchronization::ReaderWriterState,
 };
 use pumice::{util::result::VulkanResult, vk};
 use smallvec::SmallVec;

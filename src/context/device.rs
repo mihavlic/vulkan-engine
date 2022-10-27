@@ -1,14 +1,8 @@
-use std::{
-    collections::{hash_map::RandomState, HashSet},
-    ffi::CStr,
-    fmt::Display,
-    pin::Pin,
-    sync::Mutex,
-};
-
+use super::instance::{Instance, InstanceCreateInfo};
 use crate::{
     object::{self},
     storage::{nostore::NoStore, ObjectStorage},
+    synchronization::InnerSynchronizationManager,
     tracing::shim_macros::{info, trace},
     util::{
         self,
@@ -27,8 +21,13 @@ use pumice::{
     DeviceWrapper,
 };
 use pumice_vma::{Allocator, AllocatorCreateInfo};
-
-use super::instance::{Instance, InstanceCreateInfo};
+use std::{
+    collections::{hash_map::RandomState, HashSet},
+    ffi::CStr,
+    fmt::Display,
+    pin::Pin,
+    sync::Mutex,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub enum SelectionMechanism {
@@ -36,28 +35,27 @@ pub enum SelectionMechanism {
     Contains,
 }
 
-#[derive(Debug, Clone)]
-pub struct QueueFamilySelection {
-    mask: vk::QueueFlags,
-    count: u32,
-    priority: f32,
-    exact: bool,
-    attempt_dedicated: bool,
-    coalesce: bool,
+#[derive(Clone)]
+pub struct QueueFamilySelection<'a> {
+    pub mask: vk::QueueFlags,
+    pub count: u32,
+    pub priority: f32,
+    pub exact: bool,
+    pub attempt_dedicated: bool,
+    pub coalesce: bool,
+    pub support_surfaces: &'a [&'a object::Surface],
 }
 
 pub struct DeviceCreateInfo<'a> {
     pub instance: super::instance::Instance,
     pub config: &'a mut ApiLoadConfig<'a>,
     pub device_features: vk::PhysicalDeviceFeatures,
-    pub queue_family_selection: Vec<QueueFamilySelection>,
+    pub queue_family_selection: &'a [QueueFamilySelection<'a>],
     pub verbose: bool,
 }
 
 pub(crate) struct InnerDevice {
-    pub(crate) instance: super::instance::Instance,
     pub(crate) device: pumice::DeviceWrapper,
-
     pub(crate) physical_device_properties: vk::PhysicalDeviceProperties,
     pub(crate) physical_device_features: vk::PhysicalDeviceFeatures,
 
@@ -69,21 +67,23 @@ pub(crate) struct InnerDevice {
     // object handle storage
     pub(crate) image_storage: NoStore,
     pub(crate) buffer_storage: NoStore,
+    pub(crate) swapchain_storage: NoStore,
 
     // allocator
     pub(crate) allocator: Allocator,
-    pub(crate) allocation_callbacks: Option<vk::AllocationCallbacks>,
 
-    // at the bottom so that these are dropped last, the loader keeps the vulkan dll loaded
+    // synchronization
+    pub(crate) synchronization_manager: parking_lot::RwLock<InnerSynchronizationManager>,
+
+    // at the bottom so that these are dropped last
     pub(crate) device_table: Box<DeviceTable>,
+    pub(crate) instance: super::instance::Instance,
 }
 
-pub struct Device(Pin<Box<InnerDevice>>);
+pub struct Device(pub(crate) Pin<Box<InnerDevice>>);
 
 impl Device {
     pub unsafe fn new(info: DeviceCreateInfo) -> Self {
-        let allocation_callbacks = None;
-
         let DeviceCreateInfo {
             instance,
             config: conf,
@@ -92,10 +92,11 @@ impl Device {
             verbose,
         } = info;
 
+        let allocation_callbacks = instance.allocator_callbacks();
         let inner = instance.inner();
         let instance_handle = instance.handle();
 
-        // (_, _, overlay over queue_family_selection and their associated queue families)
+        // (_, _, _, overlay over queue_family_selection and their associated queue families)
         let (
             physical_device,
             physical_device_properties,
@@ -154,11 +155,7 @@ impl Device {
         };
 
         let device_handle = instance_handle
-            .create_device(
-                physical_device,
-                &device_create_info,
-                allocation_callbacks.as_ref(),
-            )
+            .create_device(physical_device, &device_create_info, allocation_callbacks)
             .expect("create_device error");
 
         let (device, device_table) = {
@@ -214,9 +211,11 @@ impl Device {
 
             image_storage: NoStore::new(),
             buffer_storage: NoStore::new(),
+            swapchain_storage: NoStore::new(),
 
             allocator,
-            allocation_callbacks,
+
+            synchronization_manager: parking_lot::RwLock::new(InnerSynchronizationManager::new()),
 
             device_table,
         };
@@ -230,7 +229,7 @@ impl Device {
         &self.0.allocator
     }
     pub fn allocator_callbacks(&self) -> Option<&vk::AllocationCallbacks> {
-        self.0.allocation_callbacks.as_ref()
+        self.0.instance.allocator_callbacks()
     }
     pub fn get_queue(&self, selection_index: usize, offset: usize) -> Option<vk::Queue> {
         let range = self
@@ -259,8 +258,14 @@ impl Device {
             .map(object::Image)
     }
 
-    fn inner(&self) -> &InnerDevice {
-        &self.0
+    pub unsafe fn create_swapchain(
+        &self,
+        info: object::SwapchainCreateInfo,
+    ) -> VulkanResult<object::Swapchain> {
+        self.0
+            .swapchain_storage
+            .get_or_create(info, (), &*self.0)
+            .map(object::Swapchain)
     }
 }
 
@@ -273,43 +278,7 @@ use {
 };
 
 #[test]
-fn test_context_new() {
-    install_tracing_subscriber(Severity::Trace);
-
-    unsafe {
-        let mut conf = ApiLoadConfig::new(vk::API_VERSION_1_0);
-
-        let info = InstanceCreateInfo {
-            config: &mut conf,
-            validation_layers: &[pumice::cstr!("VK_LAYER_KHRONOS_validation")],
-            enable_debug_callback: true,
-            app_name: pumice::cstr!("test_context_new"),
-            verbose: false,
-        };
-
-        let instance = Instance::new(info);
-
-        let info = DeviceCreateInfo {
-            instance,
-            config: &mut conf,
-            device_features: Default::default(),
-            queue_family_selection: vec![QueueFamilySelection {
-                mask: vk::QueueFlags::GRAPHICS,
-                count: 1,
-                priority: 1.0,
-                exact: false,
-                attempt_dedicated: false,
-                coalesce: true,
-            }],
-            verbose: false,
-        };
-
-        let device = Device::new(info);
-    }
-}
-
-#[test]
-fn test_create_image() {
+fn test_device() {
     install_tracing_subscriber(Severity::Info);
 
     unsafe {
@@ -329,13 +298,14 @@ fn test_create_image() {
             instance,
             config: &mut conf,
             device_features: Default::default(),
-            queue_family_selection: vec![QueueFamilySelection {
+            queue_family_selection: &[QueueFamilySelection {
                 mask: vk::QueueFlags::GRAPHICS,
                 count: 1,
                 priority: 1.0,
                 exact: false,
                 attempt_dedicated: false,
                 coalesce: true,
+                support_surfaces: &[],
             }],
             verbose: false,
         };
@@ -361,7 +331,7 @@ fn test_create_image() {
             .flags(AllocationCreateFlags::MAPPED);
         let image = device.create_image(info, allocation_info);
 
-        // explicit drop order due to very messy code
+        // explicit drop order due to my crimes
         drop(image);
         drop(device);
     }
@@ -372,7 +342,7 @@ unsafe fn select_device(
     physical_device_properties: &Vec<vk::PhysicalDeviceProperties>,
     instance: &pumice::InstanceWrapper,
     conf: &ApiLoadConfig,
-    queue_family_selection: &Vec<QueueFamilySelection>,
+    queue_family_selection: &[QueueFamilySelection],
 ) -> (
     vk::PhysicalDevice,
     vk::PhysicalDeviceProperties,
@@ -441,15 +411,34 @@ unsafe fn select_device(
                     |flags: vk::QueueFlags, mask: vk::QueueFlags| flags.contains(mask)
                 };
 
-                let family_iter = queue_families.iter().zip(&family_search_scratch);
+                let surface_supported = |queue_family_index: usize| {
+                    selection.support_surfaces.iter().all(|s| {
+                        instance
+                            .get_physical_device_surface_support_khr(
+                                physical_device,
+                                queue_family_index as u32,
+                                s.handle(),
+                            )
+                            .unwrap()
+                            != vk::FALSE
+                    })
+                };
+
+                let family_iter = queue_families
+                    .iter()
+                    .zip(&family_search_scratch)
+                    .enumerate();
 
                 // try to select some family that does not have queues
                 if selection.attempt_dedicated {
-                    let position = family_iter.clone().position(|(family, selected_count)| {
-                        *selected_count == 0
-                            && is_valid(family.queue_flags, selection.mask)
-                            && *selected_count + selection.count <= family.queue_count
-                    });
+                    let position = family_iter
+                        .clone()
+                        .position(|(i, (family, selected_count))| {
+                            *selected_count == 0
+                                && is_valid(family.queue_flags, selection.mask)
+                                && *selected_count + selection.count <= family.queue_count
+                                && surface_supported(i)
+                        });
 
                     if let Some(position) = position {
                         family_search_scratch[position] += selection.count;
@@ -459,11 +448,14 @@ unsafe fn select_device(
                 }
                 // try to select some family that already has queues
                 if selection.coalesce {
-                    let position = family_iter.clone().position(|(family, selected_count)| {
-                        *selected_count > 0
-                            && is_valid(family.queue_flags, selection.mask)
-                            && *selected_count + selection.count <= family.queue_count
-                    });
+                    let position = family_iter
+                        .clone()
+                        .position(|(i, (family, selected_count))| {
+                            *selected_count > 0
+                                && is_valid(family.queue_flags, selection.mask)
+                                && *selected_count + selection.count <= family.queue_count
+                                && surface_supported(i)
+                        });
 
                     if let Some(position) = position {
                         family_search_scratch[position] += selection.count;
@@ -473,10 +465,13 @@ unsafe fn select_device(
                 }
                 // then try to match anything
                 {
-                    let position = family_iter.clone().position(|(family, selected_count)| {
-                        is_valid(family.queue_flags, selection.mask)
-                            && *selected_count + selection.count <= family.queue_count
-                    });
+                    let position = family_iter
+                        .clone()
+                        .position(|(i, (family, selected_count))| {
+                            is_valid(family.queue_flags, selection.mask)
+                                && *selected_count + selection.count <= family.queue_count
+                                && surface_supported(i)
+                        });
 
                     if let Some(position) = position {
                         family_search_scratch[position] += selection.count;

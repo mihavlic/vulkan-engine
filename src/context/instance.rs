@@ -10,11 +10,13 @@ use pumice::{
         tables::{DeviceTable, EntryTable, InstanceTable},
         EntryLoader, InstanceLoader,
     },
-    util::config::ApiLoadConfig,
+    util::{config::ApiLoadConfig, result::VulkanResult},
     vk, InstanceWrapper,
 };
+use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
 
 use crate::{
+    object,
     tracing::shim_macros::{info, trace},
     util::{
         self,
@@ -32,6 +34,8 @@ pub(crate) struct InnerInstance {
 
     pub(crate) debug_messenger: Option<pumice::extensions::ext_debug_utils::DebugUtilsMessengerEXT>,
     pub(crate) verbose: bool,
+
+    pub(crate) allocation_callbacks: Option<vk::AllocationCallbacks>,
 
     pub(crate) instance_table: Box<InstanceTable>,
     pub(crate) entry_table: Box<EntryTable>,
@@ -253,8 +257,9 @@ impl Instance {
             physical_device_properties,
             debug_messenger,
             verbose,
-            entry_table,
+            allocation_callbacks,
             instance_table,
+            entry_table,
             entry_loader,
         };
 
@@ -268,5 +273,16 @@ impl Instance {
     }
     pub unsafe fn instance_loader(&self) -> InstanceLoader {
         InstanceLoader::new(self.0.instance.handle(), &self.0.entry_loader)
+    }
+    pub fn allocator_callbacks(&self) -> Option<&vk::AllocationCallbacks> {
+        self.0.allocation_callbacks.as_ref()
+    }
+    pub unsafe fn create_surface<W: HasRawDisplayHandle + HasRawWindowHandle>(
+        &self,
+        window: &W,
+    ) -> VulkanResult<object::Surface> {
+        self.handle()
+            .create_surface(window, self.allocator_callbacks())
+            .map(|raw| object::Surface::from_raw(raw, self.clone()))
     }
 }

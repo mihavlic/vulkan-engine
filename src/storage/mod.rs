@@ -6,10 +6,14 @@ use crate::{
 };
 use pumice::util::result::VulkanResult;
 use std::{
-    cell::UnsafeCell,
+    cell::{RefCell, RefMut, UnsafeCell},
     ptr::NonNull,
     sync::{atomic::AtomicUsize, Mutex},
 };
+
+pub enum SynchronizationLock<'a> {
+    ReentrantMutexGuard(parking_lot::ReentrantMutexGuard<'a, ()>),
+}
 
 pub(crate) trait ObjectStorage<T: Object>: Sized {
     type StorageData;
@@ -24,6 +28,11 @@ pub(crate) trait ObjectStorage<T: Object>: Sized {
     /// currently this only gets called when the reference count reaches zero which should happen only once
     /// also the reference count cannot decrease while we are holding a mutex?
     unsafe fn destroy(&self, header: *mut ArcHeader<T>);
+
+    fn synchronize_header_access<'a>(
+        &'a self,
+        header: *const ArcHeader<T>,
+    ) -> SynchronizationLock<'a>;
 }
 
 pub(crate) struct ObjectHeader<T: Object> {
@@ -48,14 +57,14 @@ pub(crate) struct ArcHeader<T: Object> {
 
 // help
 
-pub struct MutableShared<T>(UnsafeCell<T>);
+pub struct MutableShared<T>(RefCell<T>);
 
 impl<T> MutableShared<T> {
-    pub(crate) fn new(whalue: T) -> Self {
-        MutableShared(UnsafeCell::new(whalue))
+    pub(crate) fn new(value: T) -> Self {
+        MutableShared(RefCell::new(value))
     }
-    pub unsafe fn borrow_mut(&self) -> &mut T {
-        unsafe { &mut *UnsafeCell::get(&self.0) }
+    pub unsafe fn borrow_mut<'a>(&'a self, lock: &'a SynchronizationLock) -> RefMut<'a, T> {
+        self.0.borrow_mut()
     }
 }
 
@@ -72,6 +81,9 @@ impl ReentrantMutex {
         let out = fun();
         drop(guard);
         out
+    }
+    pub fn lock<'a>(&'a self) -> SynchronizationLock<'a> {
+        SynchronizationLock::ReentrantMutexGuard(self.0.lock())
     }
 }
 

@@ -4,8 +4,10 @@ use pumice::{util::result::VulkanResult, vk};
 use smallvec::SmallVec;
 
 use crate::{
-    context::device::InnerDevice, storage::nostore::NoStore, synchronization::ReaderWriterState,
-    OptionalU32,
+    arena::optional::OptionalU32,
+    context::device::InnerDevice,
+    storage::{nostore::NoStore, MutableShared},
+    synchronization::ReaderWriterState,
 };
 
 use super::{ArcHandle, Object};
@@ -117,13 +119,25 @@ impl ImageSynchronizationState {
     }
 }
 
+pub struct ImageMutableState {
+    synchronization: ImageSynchronizationState,
+}
+
+impl ImageMutableState {
+    pub fn with_initial_layout(layout: vk::ImageLayout) -> Self {
+        Self {
+            synchronization: ImageSynchronizationState::with_initial_layout(layout),
+        }
+    }
+}
+
 pub struct Image(pub(crate) ArcHandle<Self>);
 impl Object for Image {
     type CreateInfo = ImageCreateInfo;
     type SupplementalInfo = pumice_vma::AllocationCreateInfo;
     type Handle = vk::Image;
     type Storage = NoStore;
-    type ObjectData = (pumice_vma::Allocation, ImageSynchronizationState);
+    type ObjectData = (pumice_vma::Allocation, MutableShared<ImageMutableState>);
 
     type Parent = InnerDevice;
 
@@ -140,7 +154,9 @@ impl Object for Image {
                     handle,
                     (
                         allocation,
-                        ImageSynchronizationState::with_initial_layout(info.initial_layout),
+                        MutableShared::new(ImageMutableState::with_initial_layout(
+                            info.initial_layout,
+                        )),
                     ),
                 )
             })
