@@ -61,6 +61,15 @@ pub struct Queue {
     family: u32,
 }
 
+impl Queue {
+    pub fn raw(&self) -> vk::Queue {
+        self.raw
+    }
+    pub fn family(&self) -> u32 {
+        self.family
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Semaphore {
     raw: vk::Semaphore,
