@@ -1,9 +1,10 @@
-use std::{borrow::Cow, hash::Hash};
+use std::{borrow::Cow, cell::Cell, hash::Hash, ops::Deref};
 
 use pumice::{util::result::VulkanResult, vk};
+use smallvec::SmallVec;
 
 use crate::{
-    arena::uint::{Config, PackedUint},
+    arena::uint::{Config, OptionalU32, PackedUint},
     context::device::Device,
     object::{self, Object},
     synchronization,
@@ -32,11 +33,160 @@ impl<T: Pass> ObjectSafePass for StoredPass<T> {
     }
 }
 
-pub struct Graph;
+#[derive(Clone)]
+struct PassMeta {
+    alive: Cell<bool>,
+}
+#[derive(Clone)]
+struct ImageMeta {
+    alive: Cell<bool>,
+    physical: OptionalU32,
+}
+#[derive(Clone)]
+struct BufferMeta {
+    alive: Cell<bool>,
+    physical: OptionalU32,
+}
+
+struct PhysicalImage {
+    info: object::ImageCreateInfo,
+}
+
+pub struct Graph {
+    queues: Vec<GraphQueue>,
+    passes: Vec<GraphObject<PassData>>,
+    images: Vec<GraphObject<ImageData>>,
+    buffers: Vec<GraphObject<BufferData>>,
+
+    pass_meta: Vec<PassMeta>,
+    image_meta: Vec<ImageMeta>,
+    buffer_meta: Vec<BufferMeta>,
+
+    physical_images: Vec<PhysicalImage>,
+    physical_buffers: Vec<PhysicalBuffer>,
+}
+
 impl Graph {
-    pub fn run<F: FnOnce(&mut GraphBuilder)>(fun: F) {
-        let mut builder = GraphBuilder::new();
-        fun(&mut builder);
+    fn mark_pass_alive(&self, handle: GraphPass) {
+        let i = handle.index();
+        let pass = &self.passes[i];
+        let meta = &self.pass_meta[i];
+
+        // if it is marked, we have touched its dependencies already and can safely return
+        if meta.alive.get() {
+            return;
+        }
+
+        meta.alive.set(true);
+        pass.dependencies().for_each(|p| self.mark_pass_alive(p));
+    }
+    fn mark_image_alive<'a>(&'a self, mut handle: &'a GraphImage) {
+        loop {
+            let i = handle.resource() as usize;
+            self.image_meta[i].alive.set(true);
+            match &*self.images[i] {
+                ImageData::Moved { dst, .. } => {
+                    handle = dst;
+                }
+                _ => {}
+            }
+        }
+    }
+    fn mark_buffer_alive(&self, handle: &GraphBuffer) {
+        let i = handle.resource() as usize;
+        self.buffer_meta[i].alive.set(true);
+    }
+    fn clear(&mut self) {
+        self.queues.clear();
+        self.passes.clear();
+        self.images.clear();
+        self.buffers.clear();
+    }
+    fn prepare_meta(&mut self) {
+        self.pass_meta.clear();
+        self.image_meta.clear();
+        self.buffer_meta.clear();
+
+        let len = self.passes.len();
+
+        self.pass_meta.resize(
+            len,
+            PassMeta {
+                alive: Cell::new(false),
+            },
+        );
+        self.image_meta.resize(
+            len,
+            ImageMeta {
+                alive: Cell::new(false),
+                physical: OptionalU32::NONE,
+            },
+        );
+        self.buffer_meta.resize(
+            len,
+            BufferMeta {
+                alive: Cell::new(false),
+                physical: OptionalU32::NONE,
+            },
+        );
+    }
+    fn is_image_external<'a>(&'a self, mut handle: &'a GraphImage) -> bool {
+        loop {
+            match self.get_image_data(handle) {
+                ImageData::Transient { .. } => break false,
+                ImageData::Imported { .. } => break true,
+                ImageData::Swapchain { .. } => break true,
+                ImageData::Moved { dst, to } => {
+                    handle = dst;
+                }
+            }
+        }
+    }
+    fn is_buffer_external(&self, mut handle: &GraphBuffer) -> bool {
+        match self.get_buffer_data(handle) {
+            BufferData::Transient { .. } => false,
+            BufferData::Imported { .. } => true,
+        }
+    }
+    fn get_image_data(&self, handle: &GraphImage) -> &ImageData {
+        &self.images[handle.resource() as usize]
+    }
+    fn get_buffer_data(&self, handle: &GraphBuffer) -> &BufferData {
+        &self.buffers[handle.resource() as usize]
+    }
+    fn get_pass_data(&self, handle: GraphPass) -> &PassData {
+        &self.passes[handle.0 as usize]
+    }
+    pub fn run<F: FnOnce(&mut GraphBuilder)>(&mut self, fun: F) {
+        self.clear();
+        // sound because GraphBuilder is repr(transparent)
+        let builder = unsafe { std::mem::transmute::<&mut Graph, &mut GraphBuilder>(self) };
+        fun(builder);
+        self.prepare_meta();
+
+        for (i, pass) in self.passes.iter().enumerate() {
+            if self.pass_meta[i].alive.get() {
+                continue;
+            }
+
+            if pass
+                .images
+                .iter()
+                .any(|i| self.is_image_external(&i.handle))
+                || pass
+                    .buffers
+                    .iter()
+                    .any(|p| self.is_buffer_external(&p.handle))
+            {
+                self.mark_pass_alive(GraphPass(i as u32));
+                for i in &pass.images {
+                    self.mark_image_alive(&i.handle);
+                }
+                for b in &pass.buffers {
+                    self.mark_buffer_alive(&b.handle);
+                }
+            }
+        }
 
         // (some caching where identical frames don't need to be fully recomputed {
         //   while we would like to not schedule the passes every frame, reusing the computation would require checking that would either be extremely fragile
@@ -115,20 +265,39 @@ struct PassData {
     queue: GraphQueue,
     images: Vec<PassImageData>,
     buffers: Vec<PassBufferData>,
+    dependencies: Vec<GraphPass>,
     pass: Box<dyn ObjectSafePass>,
 }
+impl PassData {
+    fn dependencies<'a>(&'a self) -> impl Iterator<Item = GraphPass> + 'a {
+        self.images
+            .iter()
+            .filter_map(|i| i.handle.producer())
+            .chain(self.buffers.iter().filter_map(|b| b.handle.producer()))
+            .chain(self.dependencies.iter().cloned())
+    }
+}
 enum ImageData {
-    Swapchain { handle: object::Swapchain },
     Transient { info: object::ImageCreateInfo },
+    Imported { handle: object::Image },
+    Swapchain { handle: object::Swapchain },
     Moved { dst: GraphImage, to: ImageMove },
 }
-struct BufferData {
-    info: object::BufferCreateInfo,
+enum BufferData {
+    Transient { info: object::BufferCreateInfo },
+    Imported { handle: object::Buffer },
 }
 
 struct GraphObject<T> {
     name: Option<Cow<'static, str>>,
     inner: T,
+}
+
+impl<T> Deref for GraphObject<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 pub struct ImageMove {
@@ -137,15 +306,9 @@ pub struct ImageMove {
     extent: vk::Extent3D,
 }
 
-pub struct GraphBuilder {
-    passes: Vec<GraphObject<PassData>>,
-    images: Vec<GraphObject<ImageData>>,
-    buffers: Vec<GraphObject<BufferData>>,
-}
+#[repr(transparent)]
+pub struct GraphBuilder(Graph);
 impl GraphBuilder {
-    fn new() -> Self {
-        todo!()
-    }
     pub fn acquire_swapchain(&mut self, swapchain: object::Swapchain) -> GraphImage {
         todo!()
     }
@@ -201,7 +364,11 @@ impl GraphPassBuilder {
     }
 }
 
+pub struct GraphImageInstance;
+pub struct GraphBufferInstance;
+
 pub struct GraphExecutor;
+
 impl GraphExecutor {
     pub fn get_image(&self, handle: GraphImage) -> GraphImageInstance {
         todo!()
@@ -211,17 +378,25 @@ impl GraphExecutor {
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct GraphQueue(u32);
-#[derive(Clone, Copy)]
-pub struct GraphPass(u32);
-#[derive(Clone, Copy)]
-pub struct GraphImage(PassResourceIndex);
-#[derive(Clone, Copy)]
-pub struct GraphBuffer(PassResourceIndex);
+macro_rules! simple_handle {
+    ($($name:ident),+) => {
+        $(
+            #[derive(Clone, Copy)]
+            pub struct $name(u32);
+            impl $name {
+                fn new(index: usize) -> Self {
+                    assert!(index <= u32::MAX as usize);
+                    Self(index as u32)
+                }
+                fn index(&self) -> usize {
+                    self.0 as usize
+                }
+            }
+        )+
+    };
+}
 
-pub struct GraphImageInstance;
-pub struct GraphBufferInstance;
+simple_handle! { GraphQueue, GraphPass }
 
 #[derive(Clone, Copy)]
 struct ResourceConfig;
@@ -235,12 +410,17 @@ impl Config for ResourceConfig {
 #[derive(Clone, Copy)]
 struct PassResourceIndex(PackedUint<ResourceConfig, u32>);
 impl PassResourceIndex {
-    fn new(resource: u32, producer: u32) -> Self {
+    #[inline]
+    fn new(resource: u32, producer: Option<u32>) -> Self {
+        assert_ne!(producer, Some(ResourceConfig::MAX_SECOND as u32));
+        let producer = producer.unwrap_or(ResourceConfig::MAX_SECOND as u32);
         Self(PackedUint::new(resource, producer))
     }
+    #[inline]
     fn resource(&self) -> u32 {
         self.0.first()
     }
+    #[inline]
     fn producer(&self) -> Option<u32> {
         let value = self.0.second();
         if value == ResourceConfig::MAX_SECOND as u32 {
@@ -250,3 +430,28 @@ impl PassResourceIndex {
         }
     }
 }
+
+macro_rules! resource_handle {
+    ($($name:ident),+) => {
+        $(
+            pub struct $name(PassResourceIndex);
+            impl $name {
+                fn new(resource: u32, producer: Option<u32>) -> Self {
+                    Self(PassResourceIndex::new(resource, producer))
+                }
+                fn resource(&self) -> u32 {
+                    self.0.resource()
+                }
+                fn producer(&self) -> Option<GraphPass> {
+                    self.0.producer().map(GraphPass)
+                }
+                /// creates a copy of the handle, bypassing the usual producer-consumer invariants
+                fn clone_internal(&self) -> Self {
+                    Self(self.0)
+                }
+            }
+        )+
+    };
+}
+
+resource_handle! { GraphImage, GraphBuffer }
