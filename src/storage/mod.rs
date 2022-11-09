@@ -88,7 +88,7 @@ impl ReentrantMutex {
 }
 
 /// # Safety:
-/// the storage must be synchronised when calling this method
+/// the storage must be synchronized when calling this method
 unsafe fn create_header<T: Object>(
     ctx: &T::Parent,
     info: T::CreateInfo,

@@ -143,7 +143,7 @@ impl<K: Key, T> GenArena<K, T> {
             at_max = false;
         }
         if !at_max {
-            self.next_free = Optional::new(index);
+            self.next_free = Optional::new_some(index);
         }
         ManuallyDrop::into_inner(unsafe { value.value })
     }

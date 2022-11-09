@@ -62,6 +62,9 @@ pub struct Queue {
 }
 
 impl Queue {
+    pub(crate) fn new(raw: vk::Queue, family: u32) -> Self {
+        Self { raw, family }
+    }
     pub fn raw(&self) -> vk::Queue {
         self.raw
     }

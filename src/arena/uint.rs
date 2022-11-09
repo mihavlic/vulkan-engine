@@ -52,13 +52,22 @@ pub struct Optional<T: UInt>(T);
 impl<T: UInt> Optional<T> {
     pub const NONE: Self = Self(T::MAX);
 
-    pub fn new(value: T) -> Optional<T> {
+    #[inline]
+    pub fn new(value: Option<T>) -> Optional<T> {
+        assert!(value != Some(T::MAX));
+        let value = value.unwrap_or(T::MAX);
+        Self(value)
+    }
+    #[inline]
+    pub fn new_some(value: T) -> Optional<T> {
         assert!(value != T::MAX);
         Self(value)
     }
+    #[inline]
     pub fn new_none() -> Self {
         Self::NONE
     }
+    #[inline]
     pub fn get(&self) -> Option<T> {
         if self.0 == T::MAX {
             None
@@ -66,12 +75,15 @@ impl<T: UInt> Optional<T> {
             Some(self.0)
         }
     }
+    #[inline]
     pub fn is_some(&self) -> bool {
         self.0 != T::MAX
     }
+    #[inline]
     pub fn is_none(&self) -> bool {
         self.0 == T::MAX
     }
+    #[inline]
     fn set(&mut self, value: Option<T>) {
         if let Some(value) = value {
             assert!(value != T::MAX);
