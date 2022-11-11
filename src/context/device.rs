@@ -26,7 +26,7 @@ use std::{
     ffi::CStr,
     fmt::Display,
     pin::Pin,
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -80,7 +80,8 @@ pub(crate) struct InnerDevice {
     pub(crate) instance: super::instance::Instance,
 }
 
-pub struct Device(pub(crate) Pin<Box<InnerDevice>>);
+#[derive(Clone)]
+pub struct Device(pub(crate) Pin<Arc<InnerDevice>>);
 
 impl Device {
     pub unsafe fn new(info: DeviceCreateInfo) -> Self {
@@ -220,7 +221,7 @@ impl Device {
             device_table,
         };
 
-        Self(Box::pin(inner))
+        Self(Arc::pin(inner))
     }
     pub fn device(&self) -> &pumice::DeviceWrapper {
         &self.0.device
@@ -278,39 +279,18 @@ use {
 };
 
 #[test]
+fn test_create_device() {
+    unsafe {
+        let _ = __test_create_device();
+    }
+}
+
+#[test]
 fn test_device() {
     install_tracing_subscriber(Severity::Info);
 
     unsafe {
-        let mut conf = ApiLoadConfig::new(vk::API_VERSION_1_0);
-
-        let info = InstanceCreateInfo {
-            config: &mut conf,
-            validation_layers: &[pumice::cstr!("VK_LAYER_KHRONOS_validation")],
-            enable_debug_callback: true,
-            app_name: pumice::cstr!("test_context_new"),
-            verbose: false,
-        };
-
-        let instance = Instance::new(info);
-
-        let info = DeviceCreateInfo {
-            instance,
-            config: &mut conf,
-            device_features: Default::default(),
-            queue_family_selection: &[QueueFamilySelection {
-                mask: vk::QueueFlags::GRAPHICS,
-                count: 1,
-                priority: 1.0,
-                exact: false,
-                attempt_dedicated: false,
-                coalesce: true,
-                support_surfaces: &[],
-            }],
-            verbose: false,
-        };
-
-        let device = Device::new(info);
+        let device = __test_create_device();
 
         let info = object::ImageCreateInfo {
             flags: vk::ImageCreateFlags::empty(),
@@ -335,6 +315,35 @@ fn test_device() {
         drop(image);
         drop(device);
     }
+}
+
+pub(crate) unsafe fn __test_create_device() -> Device {
+    let mut conf = ApiLoadConfig::new(vk::API_VERSION_1_0);
+    let info = InstanceCreateInfo {
+        config: &mut conf,
+        validation_layers: &[pumice::cstr!("VK_LAYER_KHRONOS_validation")],
+        enable_debug_callback: true,
+        app_name: pumice::cstr!("test_context_new"),
+        verbose: false,
+    };
+    let instance = Instance::new(info);
+    let info = DeviceCreateInfo {
+        instance,
+        config: &mut conf,
+        device_features: Default::default(),
+        queue_family_selection: &[QueueFamilySelection {
+            mask: vk::QueueFlags::GRAPHICS,
+            count: 1,
+            priority: 1.0,
+            exact: false,
+            attempt_dedicated: false,
+            coalesce: true,
+            support_surfaces: &[],
+        }],
+        verbose: false,
+    };
+    let device = Device::new(info);
+    device
 }
 
 unsafe fn select_device(

@@ -1,8 +1,10 @@
 use std::{
-    borrow::Cow,
+    borrow::{Borrow, Cow},
     cell::Cell,
     collections::VecDeque,
+    fmt::Display,
     hash::Hash,
+    io::Write,
     ops::{Deref, DerefMut},
 };
 
@@ -14,16 +16,17 @@ use smallvec::{smallvec, SmallVec};
 
 use crate::{
     arena::uint::{Config, OptionalU32, PackedUint},
-    context::device::Device,
+    context::device::{Device, __test_create_device},
     object::{self, Object},
-    synchronization,
+    synchronization, token_abuse,
+    util::{self, format_utils::Fun, macro_abuse::WeirdFormatter},
 };
 
-pub trait CreatePass<'a> {
+pub trait CreatePass {
     type Pass: RenderPass;
-    fn create(self, builder: &'a mut GraphPassBuilder, device: &'a Device) -> Self::Pass;
+    fn create(self, builder: &mut GraphPassBuilder, device: &Device) -> Self::Pass;
 }
-pub trait RenderPass {
+pub trait RenderPass: 'static {
     fn prepare(&mut self);
     fn execute(self, executor: &GraphExecutor, device: &Device) -> VulkanResult<()>;
 }
@@ -42,9 +45,9 @@ impl<T: RenderPass> ObjectSafePass for StoredPass<T> {
     }
 }
 
-impl<'a, P: RenderPass, F: FnOnce(&'a mut GraphPassBuilder, &'a Device) -> P> CreatePass<'a> for F {
+impl<P: RenderPass, F: FnOnce(&mut GraphPassBuilder, &Device) -> P> CreatePass for F {
     type Pass = P;
-    fn create(self, builder: &'a mut GraphPassBuilder, device: &'a Device) -> Self::Pass {
+    fn create(self, builder: &mut GraphPassBuilder, device: &Device) -> Self::Pass {
         self(builder, device)
     }
 }
@@ -63,36 +66,57 @@ struct PassMeta {
     alive: Cell<bool>,
     children_start: Cell<u32>,
     children_end: Cell<u32>,
-    // // numeric interval for answering "is this node a descendant of some other node?"
-    // // I have no idea what the method is called
-    // interval_min: Cell<u32>,
-    // interval_max: Cell<u32>,
     scheduled_position: Cell<OptionalU32>,
+    scheduled_submission: Cell<OptionalU32>,
     queue_intervals: Cell<QueueIntervals>,
 }
 #[derive(Clone)]
 struct ImageMeta {
     alive: Cell<bool>,
     physical: OptionalU32,
+    producer: Cell<GraphPassOption>,
+}
+impl ImageMeta {
+    fn new() -> Self {
+        Self {
+            alive: Cell::new(false),
+            physical: OptionalU32::NONE,
+            producer: Cell::new(GraphPassOption::NONE),
+        }
+    }
 }
 #[derive(Clone)]
 struct BufferMeta {
     alive: Cell<bool>,
     physical: OptionalU32,
+    producer: Cell<GraphPassOption>,
+}
+impl BufferMeta {
+    fn new() -> Self {
+        Self {
+            alive: Cell::new(false),
+            physical: OptionalU32::NONE,
+            producer: Cell::new(GraphPassOption::NONE),
+        }
+    }
 }
 
 struct PhysicalImage {
-    location: u64,
     info: object::ImageCreateInfo,
 }
 
 struct PhysicalBuffer {
-    location: u64,
     info: object::ImageCreateInfo,
 }
 
+#[derive(Clone, Default)]
+struct Submission {
+    passes: Vec<GraphPass>,
+    dependencies: Vec<QueueSubmission>,
+}
+
 pub struct Graph {
-    queues: Vec<synchronization::Queue>,
+    queues: Vec<GraphObject<synchronization::Queue>>,
     passes: Vec<GraphObject<PassData>>,
     images: Vec<GraphObject<ImageData>>,
     buffers: Vec<GraphObject<BufferData>>,
@@ -105,10 +129,11 @@ pub struct Graph {
     physical_buffers: Vec<PhysicalBuffer>,
 
     pass_children: Vec<GraphPass>,
+    device: Device,
 }
 
 impl Graph {
-    pub fn new() -> Self {
+    pub fn new(device: Device) -> Self {
         Self {
             queues: Vec::new(),
             passes: Vec::new(),
@@ -120,6 +145,7 @@ impl Graph {
             physical_images: Vec::new(),
             physical_buffers: Vec::new(),
             pass_children: Vec::new(),
+            device,
         }
     }
     fn mark_pass_alive(&self, handle: GraphPass) {
@@ -173,33 +199,20 @@ impl Graph {
                 alive: Cell::new(false),
                 children_start: Cell::new(0),
                 children_end: Cell::new(0),
-                // interval_min: Cell::new(0),
-                // interval_max: Cell::new(0),
                 scheduled_position: Cell::new(OptionalU32::NONE),
+                scheduled_submission: Cell::new(OptionalU32::NONE),
                 queue_intervals: Cell::new(QueueIntervals::NONE),
             },
         );
-        self.image_meta.resize(
-            len,
-            ImageMeta {
-                alive: Cell::new(false),
-                physical: OptionalU32::NONE,
-            },
-        );
-        self.buffer_meta.resize(
-            len,
-            BufferMeta {
-                alive: Cell::new(false),
-                physical: OptionalU32::NONE,
-            },
-        );
+        self.image_meta.resize(len, ImageMeta::new());
+        self.buffer_meta.resize(len, BufferMeta::new());
     }
     fn is_image_external<'a>(&'a self, mut image: &'a GraphImage) -> bool {
         loop {
             match self.get_image_data(image) {
-                ImageData::Transient { .. } => break false,
-                ImageData::Imported { .. } => break true,
-                ImageData::Swapchain { .. } => break true,
+                ImageData::Transient(_) => break false,
+                ImageData::Imported(_) => break true,
+                ImageData::Swapchain(_) => break true,
                 ImageData::Moved { dst, to } => {
                     image = dst;
                 }
@@ -208,8 +221,8 @@ impl Graph {
     }
     fn is_buffer_external(&self, mut buffer: &GraphBuffer) -> bool {
         match self.get_buffer_data(buffer) {
-            BufferData::Transient { .. } => false,
-            BufferData::Imported { .. } => true,
+            BufferData::Transient(_) => false,
+            BufferData::Imported(_) => true,
         }
     }
     fn is_pass_alive(&self, pass: GraphPass) -> bool {
@@ -248,34 +261,18 @@ impl Graph {
     fn get_dependencies(&self, pass: GraphPass) -> &[GraphPass] {
         &self.passes[pass.index()].dependencies
     }
-    // fn build_interval_tree(&self, p: GraphPass, i: &mut u32) -> (u32, u32) {
-    //     let meta = &self.pass_meta[p.index()];
-    //     if meta.interval_min.get() > 0 {
-    //         return (meta.interval_min.get(), meta.interval_max.get());
-    //     }
-
-    //     let children = self.get_children(p);
-
-    //     let mut min = u32::MAX;
-    //     let mut max = u32::MIN;
-
-    //     if children.is_empty() {
-    //         *i += 1;
-    //         min = *i;
-    //         max = *i;
-    //     } else {
-    //         for &d in children {
-    //             let (a, b) = self.build_interval_tree(d, i);
-    //             min = a.min(min);
-    //             max = b.max(max);
-    //         }
-    //     }
-
-    //     meta.interval_min.set(min);
-    //     meta.interval_max.set(max);
-
-    //     (min, max)
-    // }
+    fn get_queue_display(&self, queue: GraphQueue) -> GraphObjectDisplay<'_> {
+        self.queues[queue.index()].display(queue.index())
+    }
+    fn get_pass_display(&self, pass: GraphPass) -> GraphObjectDisplay<'_> {
+        self.passes[pass.index()].display(pass.index())
+    }
+    fn get_image_display(&self, image: GraphImage) -> GraphObjectDisplay<'_> {
+        self.images[image.index()].display(image.index())
+    }
+    fn get_buffer_display(&self, buffer: GraphBuffer) -> GraphObjectDisplay<'_> {
+        self.buffers[buffer.index()].display(buffer.index())
+    }
     pub fn run<F: FnOnce(&mut GraphBuilder)>(&mut self, fun: F) {
         self.clear();
 
@@ -293,15 +290,15 @@ impl Graph {
                 continue;
             }
 
-            if true
-            // pass
-            //     .images
-            //     .iter()
-            //     .any(|i| i.is_written() && self.is_image_external(&i.handle))
-            //     || pass
-            //         .buffers
-            //         .iter()
-            //         .any(|p| p.is_written() && self.is_buffer_external(&p.handle))
+            if pass.force_run
+                || pass
+                    .images
+                    .iter()
+                    .any(|i| i.is_written() && self.is_image_external(&i.handle))
+                || pass
+                    .buffers
+                    .iter()
+                    .any(|p| p.is_written() && self.is_buffer_external(&p.handle))
             {
                 self.mark_pass_alive(GraphPass(i as u32));
                 for i in &pass.images {
@@ -359,24 +356,7 @@ impl Graph {
             let _ = std::mem::replace(&mut self.pass_children, dependees);
         }
 
-        // // create a weird interval "tree", it will be used for answering "is this node on the path to another node?"
-        // // please note that due to this actually being an arbitrary collection of graphs this can give false positives (TODO clarify)
-        // //
-        // //      1*2 2*2  3*3
-        // //      / \ /     |
-        // //    1*1 2*2    3*3
-        // //     |   |      |
-        // //    1*1 2*2    3*3
-
-        // let mut i = 0;
-        // for p in self.get_alive_passes() {
-        //     self.build_interval_tree(p, &mut i);
-        // }
-
         // we run a bfs to do a topological sort of active passes
-        // this will result in a submission order where neighboring passes have
-        // no dependencies so that the gpu can be saturated
-
         // TODO use some heuristics for scheduling
 
         let mut queue_positions: Vec<u32> = vec![0; self.queues.len()];
@@ -433,167 +413,327 @@ impl Graph {
             }
         }
 
-        // passes execute on multiple queues
-        //
-        //  A     B      B[2] depends on A[2], A[4] depends on B[4]
-        // [1]   [1]     This creates points of forced `submission`/`start` of command buffer to allow us to signal the neccessary semaphores.
-        // [2]-->[2]     We can move `submission` points down and `begin` points up and also merge them, as long as they don't cross over each other
-        // [3]   [3]
-        // [4]<--[4]
-        // [5]   [5]
-
-        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-        enum QueueDelimiter {
-            Begin,
-            Submit,
-        }
-
-        let mut queue_delimiters: Vec<Vec<(u32, QueueDelimiter)>> =
-            vec![vec![(0, QueueDelimiter::Begin)]; self.queues.len()];
+        let mut active_submissions: Vec<Submission> =
+            vec![Submission::default(); self.queues.len()];
+        let mut submissions = Vec::new();
 
         for &p in &scheduled {
             let pass = self.get_pass_data(p);
-            let queue = pass.queue;
+            let own = &mut active_submissions[pass.queue.index()];
+            own.passes.push(p);
 
-            for &p in &pass.dependencies {
-                let data = self.get_pass_data(p);
-                let meta = self.get_pass_meta(p);
+            for &d in &pass.dependencies {
+                let dep = self.get_pass_data(d);
+                let meta = self.get_pass_meta(d);
 
-                if data.queue != pass.queue {
-                    queue_delimiters[data.queue.index()].push((
-                        meta.scheduled_position.get().get().unwrap(),
-                        QueueDelimiter::Submit,
-                    ));
-                }
-            }
-
-            for &p in self.get_children(p) {
-                let data = self.get_pass_data(p);
-                let meta = self.get_pass_meta(p);
-
-                if data.queue != pass.queue {
-                    queue_delimiters[data.queue.index()].push((
-                        meta.scheduled_position.get().get().unwrap(),
-                        QueueDelimiter::Begin,
-                    ));
-                }
-            }
-        }
-
-        for queue_i in 0..self.queues.len() {
-            queue_delimiters[queue_i].push((
-                queue_positions[queue_i].saturating_sub(1),
-                QueueDelimiter::Submit,
-            ));
-        }
-
-        for delimiters in &mut queue_delimiters {
-            // delimiters.dedup_by_key(|(_, d)| *d);
-        }
-
-        for q in 0..self.queues.len() {
-            let mut passes = scheduled
-                .iter()
-                .filter(|&&p| self.get_pass_data(p).queue.index() == q);
-            let mut delimiters = queue_delimiters[q].iter();
-
-            while let Some(&next) = passes.next() {
-                let data = self.get_pass_data(next);
-                let meta = self.get_pass_meta(next);
-                let pass_pos = meta.scheduled_position.get().get().unwrap();
-
-                let mut before = "";
-                let mut after = "";
-
-                while let Some(&(pos, kind)) = delimiters.clone().next() {
-                    if pass_pos == pos {
-                        delimiters.next();
-                        match kind {
-                            QueueDelimiter::Begin => before = "<begin> ",
-                            QueueDelimiter::Submit => after = " <submit>",
+                if dep.queue != pass.queue {
+                    let submission = &mut active_submissions[dep.queue.index()];
+                    if !submission.passes.is_empty() {
+                        for &p in &submission.passes {
+                            let meta = self.get_pass_meta(p);
+                            let index = submissions.len() as u32;
+                            assert!(meta.scheduled_submission.get().is_none());
+                            meta.scheduled_submission.set(OptionalU32::new_some(index));
                         }
-                    } else {
-                        break;
+                        let old = std::mem::replace(submission, Submission::default());
+                        submissions.push((dep.queue, old));
+                    }
+
+                    let position = QueueSubmission(meta.scheduled_submission.get().get().unwrap());
+                    let own = &mut active_submissions[pass.queue.index()];
+                    if !own.dependencies.contains(&position) {
+                        own.dependencies.push(position);
                     }
                 }
+            }
+        }
 
-                print!("{before}#{}{after} ", next.index());
+        // flush the currently active submissions, order doesn't matter because they're leaf nodes
+        for (q, s) in active_submissions.into_iter().enumerate() {
+            if s.passes.is_empty() {
+                continue;
             }
 
-            println!();
+            let queue = GraphQueue::new(q);
+            for &p in &s.passes {
+                let meta = self.get_pass_meta(p);
+                let index = submissions.len() as u32;
+                assert!(meta.scheduled_submission.get().is_none());
+                meta.scheduled_submission.set(OptionalU32::new_some(index));
+            }
+            submissions.push((queue, s));
         }
-    }
-    fn build_queue_intervals(
-        &self,
-        p: GraphPass,
-        queue_intervals: &mut Vec<Cell<u32>>,
-    ) -> QueueIntervals {
-        let pass = &self.passes[p.index()];
-        let meta = &self.pass_meta[p.index()];
-        let queue_position = meta.queue_intervals.get();
 
-        if queue_position.index().is_some() {
-            queue_position
-        } else {
-            let queue = pass.queue.index();
-            let count = self.queues.len();
-            let end = queue_intervals.len();
-            queue_intervals.extend((0..count).map(|_| Cell::new(0u32)));
+        // perform transitive reduction on the nodes
+        // lifted from petgraph, https://docs.rs/petgraph/latest/petgraph/algo/tred/fn.dag_transitive_reduction_closure.html
+        {
+            let len = submissions.len();
 
-            let pass_prev_position = meta
-                .scheduled_position
-                .get()
-                .get()
-                .unwrap()
-                .saturating_sub(1);
-            queue_intervals[end + queue].set(pass_prev_position);
+            let mut tred = vec![Vec::new(); len];
+            let mut tclos = Vec::with_capacity(len);
+            let mut mark = vec![false; len];
 
-            for &d in self.get_dependencies(p) {
-                let d_pass = self.get_pass_data(d);
-                let d_meta = &self.pass_meta[d.index()];
-                queue_intervals[end + d_pass.queue.index()].set(
-                    queue_intervals[end + d_pass.queue.index()]
-                        .get()
-                        .max(d_meta.scheduled_position.get().get().unwrap()),
-                );
+            for i in 0..len {
+                tclos.push(Vec::with_capacity(submissions[i].1.dependencies.len()));
+            }
 
-                let dep_intervals = self.build_queue_intervals(d, queue_intervals);
+            // since each node has a list of predecessors and not successors, we need to reverse the order of all iteration
+            // in relation to the petgraph implementation, it does actually work
+            for i in 0..len {
+                for &x in submissions[i].1.dependencies.iter().rev() {
+                    if !mark[x.index()] {
+                        tred[i].push(x);
+                        tclos[i].push(x);
 
-                let mut i = end;
-                let mut j = dep_intervals.index().unwrap();
-
-                for _ in 0..count {
-                    queue_intervals[i].set(queue_intervals[i].get().max(queue_intervals[j].get()));
-                    i += 1;
-                    j += 1;
+                        for y_i in (0..tclos[x.index()].len()).rev() {
+                            let y = tclos[x.index()][y_i];
+                            if !mark[y.index()] {
+                                mark[y.index()] = true;
+                                tclos[i].push(y);
+                            }
+                        }
+                    }
+                }
+                for y in &tclos[i] {
+                    mark[y.index()] = false;
                 }
             }
 
-            // the closest position on the pass' queue that can be achieved is the previous pass
-            assert_eq!(queue_intervals[end + queue].get(), pass_prev_position);
-
-            let intervals = QueueIntervals::new(Some(end));
-            meta.queue_intervals.set(intervals);
-            intervals
+            for (submission, reduced_dependencies) in submissions.iter_mut().zip(tred.into_iter()) {
+                submission.1.dependencies = reduced_dependencies;
+            }
         }
+
+        let mut stderr = std::io::stderr();
+        self.write_dot_representation(&submissions, &mut stderr);
+        // Self::write_submissions_dot_representation(&submissions, &mut stderr);
+    }
+
+    fn write_dot_representation(
+        &mut self,
+        submissions: &Vec<(GraphQueue, Submission)>,
+        writer: &mut dyn std::io::Write,
+    ) {
+        let clusters = Fun::new(|w| {
+            writeln!(w);
+
+            // q0[label="Queue 0:"; peripheries=0; fontsize=15; fontname="Helvetica,Arial,sans-serif bold"];
+            for q in 0..self.queues.len() {
+                write!(
+                    w,
+                    r#"q{q}[label="Queue {}:"; peripheries=0; fontsize=15; fontname="Helvetica,Arial,sans-serif bold"];"#,
+                    self.get_queue_display(GraphQueue::new(q))
+                        .set_prefix("Queue ")
+                );
+            }
+
+            writeln!(w);
+
+            let queue_submitions = |queue_index: usize| {
+                submissions
+                    .iter()
+                    .filter(move |(qr, _)| qr.index() == queue_index)
+                    .flat_map(|(_, s)| &s.passes)
+                    .cloned()
+            };
+
+            // subgraph cluster_0 {
+            //     style=dashed;
+            //     p0[label="#0"];
+            //     p1[label="#1"];
+            // }
+            for (i, (q, s)) in submissions.iter().enumerate() {
+                let nodes = Fun::new(|w| {
+                    for &p in &s.passes {
+                        write!(
+                            w,
+                            r#"p{}[label="{}"];"#,
+                            p.index(),
+                            self.get_pass_display(p).set_prefix("#")
+                        );
+                    }
+                    Ok(())
+                });
+
+                token_abuse!(
+                    w,
+                    "subgraph cluster_$ {\
+                        style=dashed;\
+                        $\
+                    }",
+                    i,
+                    nodes
+                );
+            }
+
+            writeln!(w);
+
+            // next edges will serve as layout constraints, don't show them
+            write!(w, "edge[style=invis];");
+
+            writeln!(w);
+
+            let heads = (0..self.queues.len())
+                .map(|q| queue_submitions(q).next())
+                .collect::<Vec<_>>();
+
+            // make sure that queues start vertically aligned
+            if self.queues.len() > 1 {
+                for q in 1..self.queues.len() {
+                    write!(w, "q{} -> q{}[weight=99];", q - 1, q);
+                }
+            }
+
+            // a weird way to count that heads has at least two Some(_)
+            if heads.iter().flatten().nth(1).is_some() {
+                let mut heads = heads
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, p)| p.map(|p| (i, p)));
+
+                for (q, p) in heads {
+                    write!(w, "q{} -> p{};", q, p.index());
+                }
+            }
+
+            writeln!(w);
+
+            // p0 -> p1 -> p2;
+            for q in 0..self.queues.len() {
+                if queue_submitions(q).nth(1).is_some() {
+                    let mut first = true;
+                    for p in queue_submitions(q) {
+                        if !first {
+                            write!(w, " -> ");
+                        }
+                        write!(w, "p{}", p.index());
+                        first = false;
+                    }
+                    write!(w, ";");
+                }
+            }
+
+            writeln!(w);
+
+            // { rank = same; q1; p2; p3; }
+            for q in 0..self.queues.len() {
+                let nodes = Fun::new(|w| {
+                    write!(w, "q{q}; ");
+
+                    for p in queue_submitions(q) {
+                        write!(w, "p{}; ", p.index());
+                    }
+                    Ok(())
+                });
+
+                token_abuse!(w, (nodes)
+                    {
+                        rank = same;
+                        $
+                    }
+                );
+            }
+
+            writeln!(w);
+            write!(w, "edge[style=filled];");
+            writeln!(w);
+
+            // the visible edges for the actual dependencies
+            for q in 0..self.queues.len() {
+                for p in queue_submitions(q) {
+                    let children = self.get_children(p);
+                    if !children.is_empty() {
+                        write!(w, "p{} -> {{", p.index());
+                        for d in children {
+                            write!(w, "p{} ", d.index());
+                        }
+                        write!(w, "}}");
+                    }
+                }
+            }
+
+            Ok(())
+        });
+        let mut writer = WeirdFormatter::new(writer);
+        token_abuse!(
+            writer,
+            (clusters)
+            digraph G {
+                fontname="Helvetica,Arial,sans-serif";
+                node[fontname="Helvetica,Arial,sans-serif"; fontsize=9; shape=rect];
+                edge[fontname="Helvetica,Arial,sans-serif"];
+
+                newrank = true;
+                rankdir = TB;
+
+                $
+            }
+        );
+    }
+    fn write_submissions_dot_representation(
+        submissions: &Vec<(GraphQueue, Submission)>,
+        writer: &mut dyn std::io::Write,
+    ) {
+        let clusters = Fun::new(|w| {
+            for (i, (q, s)) in submissions.iter().enumerate() {
+                write!(w, r##"s{i}[label="#{i},{}"];"##, q.index());
+                if !s.dependencies.is_empty() {
+                    write!(w, "{{");
+                    for p in &s.dependencies {
+                        write!(w, "s{} ", p.index());
+                    }
+                    write!(w, "}} -> s{i};");
+                }
+            }
+            Ok(())
+        });
+        let mut writer = WeirdFormatter::new(writer);
+        token_abuse!(
+            writer,
+            (clusters)
+            digraph G {
+                fontname="Helvetica,Arial,sans-serif";
+                node[fontname="Helvetica,Arial,sans-serif"; fontsize=9; shape=rect];
+                edge[fontname="Helvetica,Arial,sans-serif"];
+
+                newrank = true;
+                rankdir = TB;
+
+                $
+            }
+        );
     }
 }
 
 #[test]
 fn test_graph() {
-    let mut g = Graph::new();
+    let device = unsafe { __test_create_device() };
+    let mut g = Graph::new(device);
     g.run(|b| {
-        let q = b.import_queue(synchronization::Queue::new(pumice::vk10::Queue::null(), 0));
-        let r = b.import_queue(synchronization::Queue::new(pumice::vk10::Queue::null(), 0));
+        let dummy_queue = synchronization::Queue::new(pumice::vk10::Queue::null(), 0);
 
-        let p1 = b.add_pass(q, |_, _| {});
-        let p2 = b.add_pass(q, |_, _| {});
+        let q0 = b.import_queue(dummy_queue.clone());
+        let q1 = b.import_queue(dummy_queue.clone());
+        let q2 = b.import_queue(dummy_queue);
 
-        let s1 = b.add_pass(r, |_, _| {});
-        let s2 = b.add_pass(r, |_, _| {});
+        let p0 = b.add_pass(q0, |_: &mut GraphPassBuilder, _: &Device| {});
+        let p1 = b.add_pass(q0, |_: &mut GraphPassBuilder, _: &Device| {});
 
-        b.add_pass_dependency(p1, p2);
-        b.add_pass_dependency(p1, s2);
+        let p2 = b.add_pass(q1, |_: &mut GraphPassBuilder, _: &Device| {});
+        let p3 = b.add_pass(q1, |_: &mut GraphPassBuilder, _: &Device| {});
+
+        let p4 = b.add_pass(q2, |_: &mut GraphPassBuilder, _: &Device| {});
+
+        b.add_pass_dependency(p0, p1);
+        b.add_pass_dependency(p0, p2);
+        b.add_pass_dependency(p2, p3);
+
+        b.add_pass_dependency(p0, p4);
+        b.add_pass_dependency(p3, p4);
+
+        b.force_pass_run(p1);
+        b.force_pass_run(p3);
+        b.force_pass_run(p4);
     });
 }
 
@@ -623,25 +763,55 @@ impl PassBufferData {
 
 struct PassData {
     queue: GraphQueue,
+    force_run: bool,
     images: Vec<PassImageData>,
     buffers: Vec<PassBufferData>,
     dependencies: Vec<GraphPass>,
     pass: Box<dyn ObjectSafePass>,
 }
 enum ImageData {
-    Transient { info: object::ImageCreateInfo },
-    Imported { handle: object::Image },
-    Swapchain { handle: object::Swapchain },
+    Transient(object::ImageCreateInfo),
+    Imported(object::Image),
+    Swapchain(object::Swapchain),
     Moved { dst: GraphImage, to: ImageMove },
 }
+impl ImageData {
+    fn get_variant_name(&self) -> &'static str {
+        match self {
+            ImageData::Transient(_) => "Transient",
+            ImageData::Imported(_) => "Imported",
+            ImageData::Swapchain(_) => "Swapchain",
+            ImageData::Moved { .. } => "Moved",
+        }
+    }
+}
 enum BufferData {
-    Transient { info: object::BufferCreateInfo },
-    Imported { handle: object::Buffer },
+    Transient(object::BufferCreateInfo),
+    Imported(object::Buffer),
 }
 
 struct GraphObject<T> {
     name: Option<Cow<'static, str>>,
     inner: T,
+}
+
+impl<T> GraphObject<T> {
+    fn map_named<I, N: Named<I>, F: FnOnce(I) -> T>(named: N, fun: F) -> Self {
+        let (inner, name) = named.to_named();
+        let inner = fun(inner);
+        Self { name, inner }
+    }
+    fn from_named<N: Named<T>>(named: N) -> Self {
+        let (inner, name) = named.to_named();
+        Self { name, inner }
+    }
+    fn display(&self, index: usize) -> GraphObjectDisplay<'_> {
+        GraphObjectDisplay {
+            name: &self.name,
+            index,
+            prefix: "#",
+        }
+    }
 }
 
 impl<T> Deref for GraphObject<T> {
@@ -657,82 +827,237 @@ impl<T> DerefMut for GraphObject<T> {
     }
 }
 
+struct GraphObjectDisplay<'a> {
+    name: &'a Option<Cow<'static, str>>,
+    index: usize,
+    prefix: &'a str,
+}
+
+impl<'a> GraphObjectDisplay<'a> {
+    fn set_prefix(mut self, prefix: &'a str) -> Self {
+        self.prefix = prefix;
+        self
+    }
+}
+
+impl<'a> Display for GraphObjectDisplay<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(name) = self.name {
+            write!(f, "{}", name.as_ref())
+        } else {
+            write!(f, "{}{}", self.prefix, self.index)
+        }
+    }
+}
+
 pub struct ImageMove {
     terget_subresource: vk::ImageSubresourceLayers,
     target_offset: vk::Offset3D,
     extent: vk::Extent3D,
 }
 
+pub trait Named<T> {
+    fn to_named(self) -> (T, Option<Cow<'static, str>>);
+}
+
+impl<T> Named<T> for T {
+    fn to_named(self) -> (T, Option<Cow<'static, str>>) {
+        (self, None)
+    }
+}
+
+impl<T> Named<T> for (T, &'static str) {
+    fn to_named(self) -> (T, Option<Cow<'static, str>>) {
+        (self.0, Some(Cow::Borrowed(self.1)))
+    }
+}
+
+impl<T> Named<T> for (T, String) {
+    fn to_named(self) -> (T, Option<Cow<'static, str>>) {
+        (self.0, Some(Cow::Owned(self.1)))
+    }
+}
+
 #[repr(transparent)]
 pub struct GraphBuilder(Graph);
 impl GraphBuilder {
-    pub fn acquire_swapchain(&mut self, swapchain: object::Swapchain) -> GraphImage {
-        todo!()
-    }
-    pub fn import_queue(&mut self, queue: synchronization::Queue) -> GraphQueue {
-        let handle = GraphQueue::new(self.0.queues.len());
-        self.0.queues.push(queue);
+    pub fn acquire_swapchain(&mut self, swapchain: impl Named<object::Swapchain>) -> GraphImage {
+        let handle = GraphImage::new(self.0.images.len());
+        self.0.image_meta.push(ImageMeta::new());
+        self.0
+            .images
+            .push(GraphObject::map_named(swapchain, ImageData::Swapchain));
         handle
     }
-    pub fn import_image(&mut self, image: object::Image) -> GraphImage {
-        todo!()
+    pub fn import_queue(&mut self, queue: impl Named<synchronization::Queue>) -> GraphQueue {
+        let object = GraphObject::from_named(queue);
+        if let Some(i) = self
+            .0
+            .queues
+            .iter()
+            .position(|q| q.inner.raw() == object.inner.raw())
+        {
+            GraphQueue::new(i)
+        } else {
+            let handle = GraphQueue::new(self.0.queues.len());
+            self.0.queues.push(object);
+            handle
+        }
     }
-    pub fn import_buffer(&mut self, buffer: object::Buffer) -> GraphBuffer {
-        todo!()
+    pub fn import_image(&mut self, image: impl Named<object::Image>) -> GraphImage {
+        let handle = GraphImage::new(self.0.images.len());
+        self.0.image_meta.push(ImageMeta::new());
+        self.0
+            .images
+            .push(GraphObject::map_named(image, ImageData::Imported));
+        handle
     }
-    pub fn create_image(&mut self, info: object::ImageCreateInfo) -> GraphImage {
-        todo!()
+    pub fn import_buffer(&mut self, buffer: impl Named<object::Buffer>) -> GraphBuffer {
+        let handle = GraphBuffer::new(self.0.buffers.len());
+        self.0.buffer_meta.push(BufferMeta::new());
+        self.0
+            .buffers
+            .push(GraphObject::map_named(buffer, BufferData::Imported));
+        handle
+    }
+    pub fn create_image(&mut self, info: impl Named<object::ImageCreateInfo>) -> GraphImage {
+        let handle = GraphImage::new(self.0.images.len());
+        self.0.image_meta.push(ImageMeta::new());
+        self.0
+            .images
+            .push(GraphObject::map_named(info, ImageData::Transient));
+        handle
     }
     pub fn create_buffer(&mut self, info: object::BufferCreateInfo) -> GraphBuffer {
-        todo!()
+        let handle = GraphBuffer::new(self.0.buffers.len());
+        self.0.buffer_meta.push(BufferMeta::new());
+        self.0
+            .buffers
+            .push(GraphObject::map_named(info, BufferData::Transient));
+        handle
     }
-    pub fn move_image(&mut self, src: &GraphImage, dst: &GraphImage, to: ImageMove) {
-        todo!()
+    pub fn move_image(&mut self, src: GraphImage, dst: GraphImage, to: ImageMove) {
+        let src_data = &mut self.0.images[src.index()].inner;
+        let ImageData::Transient(_) = src_data else {
+            panic!("Only Transient images can be moved, image '{}' has state '{}'", "TODO", src_data.get_variant_name());
+        };
+        *src_data = ImageData::Moved { dst, to };
     }
-    pub fn add_pass<'a, T: CreatePass<'a>>(&mut self, queue: GraphQueue, pass: T) -> GraphPass {
+    pub fn add_pass<T: CreatePass>(&mut self, queue: GraphQueue, pass: impl Named<T>) -> GraphPass {
         let handle = GraphPass::new(self.0.passes.len());
-        self.0.passes.push(GraphObject {
-            name: None,
-            inner: PassData {
-                queue,
-                images: Vec::new(),
-                buffers: Vec::new(),
-                dependencies: Vec::new(),
-                pass: Box::new(StoredPass(Some(()))),
-            },
+        let object = GraphObject::map_named(pass, |a| {
+            let mut builder = GraphPassBuilder::new(self, handle);
+            let pass = a.create(&mut builder, &self.0.device);
+            builder.finish(queue, pass)
         });
+        self.0.passes.push(object);
         handle
     }
     pub fn add_pass_dependency(&mut self, first: GraphPass, then: GraphPass) {
         self.0.passes[then.index()].dependencies.push(first);
     }
+    pub fn force_pass_run(&mut self, pass: GraphPass) {
+        self.0.passes[pass.index()].force_run = true;
+    }
 }
 
-pub struct GraphPassBuilder(PassData);
-impl GraphPassBuilder {
+pub struct GraphPassBuilder<'a> {
+    graph_builder: &'a GraphBuilder,
+    pass: GraphPass,
+    images: Vec<PassImageData>,
+    buffers: Vec<PassBufferData>,
+    dependencies: Vec<GraphPass>,
+}
+
+impl<'a> GraphPassBuilder<'a> {
+    fn new(graph_builder: &'a GraphBuilder, pass: GraphPass) -> Self {
+        Self {
+            graph_builder,
+            pass,
+            images: Vec::new(),
+            buffers: Vec::new(),
+            dependencies: Vec::new(),
+        }
+    }
+    fn finish<T: RenderPass>(self, queue: GraphQueue, pass: T) -> PassData {
+        PassData {
+            queue: queue,
+            force_run: false,
+            images: self.images,
+            buffers: self.buffers,
+            dependencies: self.dependencies,
+            pass: Box::new(StoredPass(Some(pass))),
+        }
+    }
     pub fn read_image(
         &mut self,
-        image: &GraphImage,
+        image: GraphImage,
         access: vk::AccessFlags2KHR,
         layout: vk::ImageLayout,
     ) {
+        let meta = &self.graph_builder.0.image_meta[image.index()];
+        if let Some(producer) = meta.producer.get().index() {
+            if producer != self.pass.index() {
+                self.dependencies.push(GraphPass::new(producer));
+            }
+        }
+        self.images.push(PassImageData {
+            handle: image,
+            access,
+            start_layout: layout,
+            end_layout: layout,
+        });
     }
-    pub fn read_buffer(&mut self, buffer: &GraphBuffer, access: vk::AccessFlags2KHR) {}
+    pub fn read_buffer(&mut self, buffer: GraphBuffer, access: vk::AccessFlags2KHR) {
+        let meta = &self.graph_builder.0.buffer_meta[buffer.index()];
+        if let Some(producer) = meta.producer.get().index() {
+            if producer != self.pass.index() {
+                self.dependencies.push(GraphPass::new(producer));
+            }
+        }
+        self.buffers.push(PassBufferData {
+            handle: buffer,
+            access,
+        });
+    }
     pub fn write_image(
         &mut self,
         image: GraphImage,
         access: vk::AccessFlags2KHR,
         start_layout: vk::ImageLayout,
         end_layout: vk::ImageLayout,
-    ) -> GraphImage {
-        todo!()
+    ) {
+        let meta = &self.graph_builder.0.image_meta[image.index()];
+        if let Some(producer) = meta.producer.get().index() {
+            if producer != self.pass.index() {
+                self.dependencies.push(GraphPass::new(producer));
+            }
+        }
+        // consider checking whether the access actually writes and only setting the producer then
+        meta.producer
+            .set(GraphPassOption::new(Some(self.pass.index())));
+
+        self.images.push(PassImageData {
+            handle: image,
+            access,
+            start_layout,
+            end_layout,
+        });
     }
-    pub fn write_buffer(
-        &mut self,
-        buffer: GraphBuffer,
-        access: vk::AccessFlags2KHR,
-    ) -> GraphBuffer {
-        todo!()
+    pub fn write_buffer(&mut self, buffer: GraphBuffer, access: vk::AccessFlags2KHR) {
+        let meta = &self.graph_builder.0.buffer_meta[buffer.index()];
+        if let Some(producer) = meta.producer.get().index() {
+            if producer != self.pass.index() {
+                self.dependencies.push(GraphPass::new(producer));
+            }
+        }
+        meta.producer
+            .set(GraphPassOption::new(Some(self.pass.index())));
+
+        self.buffers.push(PassBufferData {
+            handle: buffer,
+            access,
+        });
     }
 }
 
@@ -751,10 +1076,10 @@ impl GraphExecutor {
 }
 
 macro_rules! simple_handle {
-    ($($name:ident),+) => {
+    ($($visibility:vis $name:ident),+) => {
         $(
             #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-            pub struct $name(u32);
+            $visibility struct $name(u32);
             impl $name {
                 fn new(index: usize) -> Self {
                     assert!(index <= u32::MAX as usize);
@@ -768,7 +1093,7 @@ macro_rules! simple_handle {
     };
 }
 
-simple_handle! { GraphQueue, GraphPass, GraphImage, GraphBuffer }
+simple_handle! { pub GraphQueue, pub GraphPass, pub GraphImage, pub GraphBuffer, QueueSubmission }
 
 macro_rules! optional_index {
     ($($name:ident),+) => {
@@ -790,55 +1115,4 @@ macro_rules! optional_index {
     };
 }
 
-optional_index! { QueueIntervals }
-
-#[derive(Clone, Copy)]
-struct QueuePositionConfig;
-impl Config for QueuePositionConfig {
-    // render pass index
-    const FIRST_BITS: usize = 24;
-    // executing queue index (graph-wise index, not device)
-    const SECOND_BITS: usize = 8;
-}
-
-#[derive(Clone, Copy)]
-struct QueuePosition(PackedUint<QueuePositionConfig, u32>);
-impl QueuePosition {
-    #[inline]
-    fn new(position: u32, queue: GraphQueue) -> Self {
-        Self(PackedUint::new(position, queue.0))
-    }
-    #[inline]
-    fn position(&self) -> GraphPass {
-        GraphPass(self.0.first())
-    }
-    #[inline]
-    fn queue(&self) -> GraphQueue {
-        GraphQueue(self.0.second())
-    }
-}
-
-// macro_rules! resource_handle {
-//     ($($name:ident),+) => {
-//         $(
-//             pub struct $name(PassResourceIndex);
-//             impl $name {
-//                 fn new(resource: u32, producer: Option<u32>) -> Self {
-//                     Self(PassResourceIndex::new(resource, producer))
-//                 }
-//                 fn resource(&self) -> u32 {
-//                     self.0.resource()
-//                 }
-//                 fn producer(&self) -> Option<GraphPass> {
-//                     self.0.producer().map(GraphPass)
-//                 }
-//                 /// creates a copy of the handle, bypassing the usual producer-consumer invariants
-//                 fn clone_internal(&self) -> Self {
-//                     Self(self.0)
-//                 }
-//             }
-//         )+
-//     };
-// }
-
-// resource_handle! { GraphImage, GraphBuffer }
+optional_index! { QueueIntervals, GraphPassOption }
