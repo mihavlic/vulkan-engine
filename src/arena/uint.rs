@@ -1,6 +1,7 @@
 use std::{
+    fmt::{Debug, Display},
     marker::PhantomData,
-    ops::{Add, BitAnd, BitOr, Div, Mul, Rem, Shl, Shr}, fmt::{Debug, Display},
+    ops::{Add, BitAnd, BitOr, Div, Mul, Rem, Shl, Shr},
 };
 
 pub trait UInt:
@@ -100,8 +101,8 @@ pub trait Config: Copy {
     const FIRST_BITS: usize;
     const SECOND_BITS: usize;
 
-    const MAX_FIRST: usize = 2usize.pow(Self::SECOND_BITS as u32) - 1;
-    const MAX_SECOND: usize = 2usize.pow(Self::FIRST_BITS as u32) - 1;
+    const MAX_FIRST: usize = 2usize.pow(Self::FIRST_BITS as u32) - 1;
+    const MAX_SECOND: usize = 2usize.pow(Self::SECOND_BITS as u32) - 1;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -113,8 +114,8 @@ impl<C: Config, I: UInt> PackedUint<C, I> {
 
     #[rustfmt::skip]
     pub(crate) fn new(first: I, second: I) -> Self {
-        debug_assert!(first <= UInt::from_usize(C::MAX_FIRST));
-        debug_assert!(second <= UInt::from_usize(C::MAX_SECOND));
+        debug_assert!(first <= UInt::from_usize(C::MAX_FIRST), "First is too large {} > {}", first, C::MAX_FIRST);
+        debug_assert!(second <= UInt::from_usize(C::MAX_SECOND), "Second is too large {} > {}", second, C::MAX_SECOND);
 
         // little:
         // [first][second]
@@ -123,12 +124,12 @@ impl<C: Config, I: UInt> PackedUint<C, I> {
         // [second][first]
 
         #[cfg(target_endian = "little")]
-        let value = 
+        let value =
               (first << Self::BITS - C::FIRST_BITS)
             | (second & (I::MAX >> Self::BITS - C::SECOND_BITS));
 
         #[cfg(target_endian = "big")]
-        let value = 
+        let value =
               (first >> Self::BITS - C::FIRST_BITS)
             | (second & (I::MAX << Self::BITS - C::SECOND_BITS));
 
@@ -141,7 +142,7 @@ impl<C: Config, I: UInt> PackedUint<C, I> {
 
         #[cfg(target_endian = "big")]
         let value = self.0 << (Self::BITS - C::FIRST_BITS);
-        
+
         value
     }
 

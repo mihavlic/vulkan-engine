@@ -1,13 +1,20 @@
-use std::ptr;
+use std::{
+    borrow::BorrowMut,
+    cell::UnsafeCell,
+    hash::{BuildHasher, Hash, Hasher},
+    ops::DerefMut,
+    ptr,
+};
 
-use pumice::{util::result::VulkanResult, vk};
+use pumice::{try_vk, util::result::VulkanResult, vk};
 use smallvec::SmallVec;
 
 use crate::{
     arena::uint::OptionalU32,
-    context::device::InnerDevice,
-    storage::{nostore::NoStore, MutableShared},
-    synchronization::ReaderWriterState,
+    batch::GenerationId,
+    context::device::Device,
+    storage::{constant_ahash_hasher, nostore::SimpleStorage, MutableShared, ObjectStorage},
+    submission::ReaderWriterState,
 };
 
 use super::{ArcHandle, Object};
@@ -119,14 +126,77 @@ impl ImageSynchronizationState {
     }
 }
 
+#[derive(Clone, Hash)]
+pub struct ImageViewCreateInfo {
+    view_type: vk::ImageViewType,
+    format: vk::Format,
+    components: vk::ComponentMapping,
+    subresource_range: vk::ImageSubresourceRange,
+}
+
+impl ImageViewCreateInfo {
+    fn get_hash(&self) -> u32 {
+        let mut hasher = constant_ahash_hasher();
+        self.hash(&mut hasher);
+
+        // this is dumb but with a high quality function truncating like this should be kind of ok
+        hasher.finish() as u32
+    }
+}
+
+struct ImageViewEntry {
+    handle: vk::ImageView,
+    info_hash: u32,
+    last_use: GenerationId,
+}
+
 pub struct ImageMutableState {
+    views: SmallVec<[ImageViewEntry; 2]>,
     synchronization: ImageSynchronizationState,
 }
 
 impl ImageMutableState {
     pub fn with_initial_layout(layout: vk::ImageLayout) -> Self {
         Self {
+            views: SmallVec::new(),
             synchronization: ImageSynchronizationState::with_initial_layout(layout),
+        }
+    }
+    unsafe fn get_view(
+        &mut self,
+        self_handle: vk::Image,
+        info: &ImageViewCreateInfo,
+        batch_id: GenerationId,
+        device: &Device,
+    ) -> VulkanResult<vk::ImageView> {
+        let hash = info.get_hash();
+
+        if let Some(found) = self.views.iter_mut().find(|v| v.info_hash == hash) {
+            found.last_use = batch_id;
+            VulkanResult::new_ok(found.handle)
+        } else {
+            let raw = vk::ImageViewCreateInfo {
+                image: self_handle,
+                view_type: info.view_type,
+                format: info.format,
+                components: info.components.clone(),
+                subresource_range: info.subresource_range.clone(),
+                ..Default::default()
+            };
+
+            let view = try_vk!(device
+                .device()
+                .create_image_view(&raw, device.allocator_callbacks()));
+
+            let entry = ImageViewEntry {
+                handle: view,
+                info_hash: hash,
+                last_use: batch_id,
+            };
+
+            self.views.push(entry);
+
+            VulkanResult::new_ok(view)
         }
     }
 }
@@ -136,13 +206,13 @@ impl Object for Image {
     type CreateInfo = ImageCreateInfo;
     type SupplementalInfo = pumice_vma::AllocationCreateInfo;
     type Handle = vk::Image;
-    type Storage = NoStore;
+    type Storage = SimpleStorage<Self>;
     type ObjectData = (pumice_vma::Allocation, MutableShared<ImageMutableState>);
 
-    type Parent = InnerDevice;
+    type Parent = Device;
 
     unsafe fn create(
-        ctx: &InnerDevice,
+        ctx: &Device,
         info: &Self::CreateInfo,
         allocation_info: &Self::SupplementalInfo,
     ) -> VulkanResult<(Self::Handle, Self::ObjectData)> {
@@ -163,7 +233,7 @@ impl Object for Image {
     }
 
     unsafe fn destroy(
-        ctx: &InnerDevice,
+        ctx: &Device,
         handle: Self::Handle,
         &(allocation, _): &Self::ObjectData,
     ) -> VulkanResult<()> {
@@ -173,5 +243,18 @@ impl Object for Image {
 
     unsafe fn get_storage(parent: &Self::Parent) -> &Self::Storage {
         &parent.image_storage
+    }
+}
+
+impl Image {
+    unsafe fn get_view(
+        &self,
+        info: &ImageViewCreateInfo,
+        batch_id: GenerationId,
+    ) -> VulkanResult<vk::ImageView> {
+        let storage = self.0.get_storage();
+        let header = storage.read_object(&self.0);
+        let mut data = header.object_data.1.borrow_mut(header.get_lock());
+        data.get_view(header.handle, info, batch_id, self.0.get_parent())
     }
 }

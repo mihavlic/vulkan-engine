@@ -1,9 +1,8 @@
 use std::ptr;
 
 use super::{ArcHandle, Object};
-use crate::{
-    context::device::InnerDevice, storage::nostore::NoStore, synchronization::ReaderWriterState,
-};
+use crate::context::device::Device;
+use crate::{storage::nostore::SimpleStorage, submission::ReaderWriterState};
 use pumice::util::impl_macros::ObjectHandle;
 use pumice::util::result::VulkanResult;
 use pumice::vk;
@@ -55,13 +54,13 @@ impl Object for Swapchain {
     type CreateInfo = SwapchainCreateInfo;
     type SupplementalInfo = ();
     type Handle = vk::SwapchainKHR;
-    type Storage = NoStore;
+    type Storage = SimpleStorage<Self>;
     type ObjectData = ();
 
-    type Parent = InnerDevice;
+    type Parent = Device;
 
     unsafe fn create(
-        ctx: &InnerDevice,
+        ctx: &Device,
         info: &Self::CreateInfo,
         allocation_info: &Self::SupplementalInfo,
     ) -> VulkanResult<(Self::Handle, Self::ObjectData)> {
@@ -72,7 +71,7 @@ impl Object for Swapchain {
     }
 
     unsafe fn destroy(
-        ctx: &InnerDevice,
+        ctx: &Device,
         handle: Self::Handle,
         _: &Self::ObjectData,
     ) -> VulkanResult<()> {

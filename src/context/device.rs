@@ -1,8 +1,9 @@
 use super::instance::{Instance, InstanceCreateInfo};
 use crate::{
-    object::{self},
-    storage::{nostore::NoStore, ObjectStorage},
-    synchronization::InnerSynchronizationManager,
+    batch::GenerationManager,
+    object::{self, Buffer, Image, Swapchain},
+    storage::{nostore::SimpleStorage, ObjectStorage},
+    submission::SubmissionManager,
     tracing::shim_macros::{info, trace},
     util::{
         self,
@@ -21,11 +22,15 @@ use pumice::{
     DeviceWrapper,
 };
 use pumice_vma::{Allocator, AllocatorCreateInfo};
+use smallvec::{smallvec, SmallVec};
 use std::{
+    borrow::Borrow,
     collections::{hash_map::RandomState, HashSet},
     ffi::CStr,
     fmt::Display,
+    ops::Deref,
     pin::Pin,
+    ptr::NonNull,
     sync::{Arc, Mutex},
 };
 
@@ -51,10 +56,12 @@ pub struct DeviceCreateInfo<'a> {
     pub config: &'a mut ApiLoadConfig<'a>,
     pub device_features: vk::PhysicalDeviceFeatures,
     pub queue_family_selection: &'a [QueueFamilySelection<'a>],
+    /// substrings of device names, devices that contain them are prioritized
+    pub device_substrings: &'a [&'a str],
     pub verbose: bool,
 }
 
-pub(crate) struct InnerDevice {
+pub struct Device {
     pub(crate) device: pumice::DeviceWrapper,
     pub(crate) physical_device_properties: vk::PhysicalDeviceProperties,
     pub(crate) physical_device_features: vk::PhysicalDeviceFeatures,
@@ -65,15 +72,17 @@ pub(crate) struct InnerDevice {
     pub(crate) queue_families: Vec<QueueFamilyProperties>,
 
     // object handle storage
-    pub(crate) image_storage: NoStore,
-    pub(crate) buffer_storage: NoStore,
-    pub(crate) swapchain_storage: NoStore,
+    pub(crate) image_storage: SimpleStorage<Image>,
+    pub(crate) buffer_storage: SimpleStorage<Buffer>,
+    pub(crate) swapchain_storage: SimpleStorage<Swapchain>,
 
     // allocator
     pub(crate) allocator: Allocator,
 
     // synchronization
-    pub(crate) synchronization_manager: parking_lot::RwLock<InnerSynchronizationManager>,
+    pub(crate) synchronization_manager: parking_lot::RwLock<SubmissionManager>,
+    // coarse grained synchronization
+    pub(crate) generation_manager: parking_lot::RwLock<GenerationManager>,
 
     // at the bottom so that these are dropped last
     pub(crate) device_table: Box<DeviceTable>,
@@ -81,15 +90,24 @@ pub(crate) struct InnerDevice {
 }
 
 #[derive(Clone)]
-pub struct Device(pub(crate) Pin<Arc<InnerDevice>>);
+pub struct OwnedDevice(pub(crate) Arc<Device>);
+
+impl Deref for OwnedDevice {
+    type Target = Device;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.0.as_ref() }
+    }
+}
 
 impl Device {
-    pub unsafe fn new(info: DeviceCreateInfo) -> Self {
+    pub unsafe fn new(info: DeviceCreateInfo) -> OwnedDevice {
         let DeviceCreateInfo {
             instance,
             config: conf,
             device_features,
             queue_family_selection,
+            device_substrings,
             verbose,
         } = info;
 
@@ -110,6 +128,7 @@ impl Device {
             &instance_handle,
             &conf,
             &queue_family_selection,
+            device_substrings
         );
 
         // (queue family, individual queue priorities, offset of reclaimed queue (needed later))
@@ -200,7 +219,7 @@ impl Device {
             Allocator::new(create_info).unwrap()
         };
 
-        let inner = InnerDevice {
+        let inner = Device {
             instance,
             device,
             physical_device_properties,
@@ -210,40 +229,35 @@ impl Device {
             queue_selection_mapping,
             queues,
 
-            image_storage: NoStore::new(),
-            buffer_storage: NoStore::new(),
-            swapchain_storage: NoStore::new(),
+            image_storage: SimpleStorage::new(),
+            buffer_storage: SimpleStorage::new(),
+            swapchain_storage: SimpleStorage::new(),
 
             allocator,
 
-            synchronization_manager: parking_lot::RwLock::new(InnerSynchronizationManager::new()),
+            synchronization_manager: parking_lot::RwLock::new(SubmissionManager::new()),
+            generation_manager: parking_lot::RwLock::new(GenerationManager::new(10)),
 
             device_table,
         };
 
-        Self(Arc::pin(inner))
+        OwnedDevice(Arc::new(inner))
     }
     pub fn device(&self) -> &pumice::DeviceWrapper {
-        &self.0.device
+        &self.device
     }
     pub fn allocator(&self) -> &Allocator {
-        &self.0.allocator
+        &self.allocator
     }
     pub fn allocator_callbacks(&self) -> Option<&vk::AllocationCallbacks> {
-        self.0.instance.allocator_callbacks()
+        self.instance.allocator_callbacks()
     }
     pub fn get_queue(&self, selection_index: usize, offset: usize) -> Option<vk::Queue> {
-        let range = self
-            .0
-            .queue_selection_mapping
-            .get(selection_index)?
-            .1
-            .clone();
-        self.0.queues.get(range)?.get(offset).cloned()
+        let range = self.queue_selection_mapping.get(selection_index)?.1.clone();
+        self.queues.get(range)?.get(offset).cloned()
     }
     pub fn get_queue_family(&self, selection_index: usize, offset: usize) -> Option<u32> {
-        self.0
-            .queue_selection_mapping
+        self.queue_selection_mapping
             .get(selection_index)
             .map(|(family, _)| *family as u32)
     }
@@ -253,9 +267,8 @@ impl Device {
         info: object::ImageCreateInfo,
         allocate: pumice_vma::AllocationCreateInfo,
     ) -> VulkanResult<object::Image> {
-        self.0
-            .image_storage
-            .get_or_create(info, allocate, &*self.0)
+        self.image_storage
+            .get_or_create(info, allocate, NonNull::from(self))
             .map(object::Image)
     }
 
@@ -263,10 +276,24 @@ impl Device {
         &self,
         info: object::SwapchainCreateInfo,
     ) -> VulkanResult<object::Swapchain> {
-        self.0
-            .swapchain_storage
-            .get_or_create(info, (), &*self.0)
+        self.swapchain_storage
+            .get_or_create(info, (), NonNull::from(self))
             .map(object::Swapchain)
+    }
+}
+
+impl Drop for Device {
+    // at this point, the reference count of the Arc is zero but it's possible that various
+    // handles still have a NonNull<Device> in their headers
+    //
+    // there isn't much to be done, for those types of storage that can reach all their headers
+    // can assert that all refcounts are zero, hovever this is not always possible, so we just tell
+    // the users to not do that
+    fn drop(&mut self) {
+        unsafe {
+            self.device().device_wait_idle();
+            self.device().destroy_device(self.allocator_callbacks());
+        }
     }
 }
 
@@ -281,7 +308,7 @@ use {
 #[test]
 fn test_create_device() {
     unsafe {
-        let _ = __test_create_device();
+        let _ = __test_init_device(false);
     }
 }
 
@@ -290,7 +317,7 @@ fn test_device() {
     install_tracing_subscriber(Severity::Info);
 
     unsafe {
-        let device = __test_create_device();
+        let device = __test_init_device(false);
 
         let info = object::ImageCreateInfo {
             flags: vk::ImageCreateFlags::empty(),
@@ -317,7 +344,7 @@ fn test_device() {
     }
 }
 
-pub(crate) unsafe fn __test_create_device() -> Device {
+pub(crate) unsafe fn __test_init_device(mock_device: bool) -> OwnedDevice {
     let mut conf = ApiLoadConfig::new(vk::API_VERSION_1_0);
     let info = InstanceCreateInfo {
         config: &mut conf,
@@ -340,6 +367,8 @@ pub(crate) unsafe fn __test_create_device() -> Device {
             coalesce: true,
             support_surfaces: &[],
         }],
+        // in case the user has the Mock ICD installed, possibly prefer that
+        device_substrings: if mock_device { &["Mock"] } else { &[] },
         verbose: false,
     };
     let device = Device::new(info);
@@ -352,6 +381,7 @@ unsafe fn select_device(
     instance: &pumice::InstanceWrapper,
     conf: &ApiLoadConfig,
     queue_family_selection: &[QueueFamilySelection],
+    device_substrings: &[&str],
 ) -> (
     vk::PhysicalDevice,
     vk::PhysicalDeviceProperties,
@@ -369,12 +399,59 @@ unsafe fn select_device(
     let device_extensions: HashSet<&CStr, RandomState> =
         HashSet::from_iter(conf.get_device_extensions_iter());
 
-    for (i, (physical_device, physical_device_properties)) in physical_devices
-        .iter()
-        .cloned()
-        .zip(physical_device_properties)
-        .enumerate()
-    {
+    let mut device_considered: SmallVec<[bool; 16]> = smallvec![false; physical_devices.len()];
+    let mut substrings = device_substrings.into_iter().peekable();
+
+    // weird mimicry of an iterator
+    let mut next = move || loop {
+        // try to find a device that hasn't been considered that contains the requested substring
+        if let Some(&&str) = substrings.peek() {
+            let index = physical_device_properties
+                .iter()
+                .enumerate()
+                .filter(|&(i, device)| {
+                    device_considered[i] == false
+                        && 
+                        // FIXME quadratic complexity, maybe do this beforehand into a vector?
+                        // though I think we can at most 4 devices in a system
+                        CStr::from_ptr(device.device_name.as_ptr())
+                            .to_str()
+                            .expect("Device name is invalid UTF8")
+                            .contains(str)
+                })
+                .next()
+                .map(|(i, _)| i);
+
+            if let Some(index) = index {
+                device_considered[index] = true;
+                return Some(index);
+            } else {
+                substrings.next();
+                continue;
+            }
+        };
+
+        // otherwise just return the first non-checked device
+        let index = device_considered
+            .iter()
+            .enumerate()
+            .filter(|&(i, &checked)| checked == false)
+            .next()
+            .map(|(i, _)| i);
+
+        if let Some(index) = index {
+            device_considered[index] = true;
+            return Some(index);
+        } else {
+            // we've exhausted all available devices
+            return None;
+        }
+    };
+
+    while let Some(i) = next() {
+        let physical_device = physical_devices[i];
+        let physical_device_properties = &physical_device_properties[i];
+
         let device_name =
             CStr::from_ptr(physical_device_properties.device_name.as_ptr()).to_string_lossy();
 

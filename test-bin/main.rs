@@ -54,6 +54,7 @@ fn main() {
                 coalesce: true,
                 support_surfaces: &[&surface],
             }],
+            device_substrings: &[],
             verbose: false,
         };
 

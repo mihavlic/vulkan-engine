@@ -7,6 +7,24 @@
         {
             "type": "lldb",
             "request": "launch",
+            "name": "Test graph",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--quiet",
+                    "--",
+                    "graph::test_graph",
+                ],
+                "filter": {
+                    "name": "graph",
+                    "kind": "lib"
+                }
+            },
+            "args": []
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
             "name": "Debug unit tests in library 'graph'",
             "cargo": {
                 "args": [

@@ -1,8 +1,8 @@
 use std::ptr;
 
 use crate::{
-    arena::uint::OptionalU32, context::device::InnerDevice, storage::nostore::NoStore,
-    synchronization::ReaderWriterState,
+    arena::uint::OptionalU32, context::device::Device, storage::nostore::SimpleStorage,
+    submission::ReaderWriterState,
 };
 use pumice::{util::result::VulkanResult, vk};
 use smallvec::SmallVec;
@@ -49,13 +49,13 @@ impl Object for Buffer {
     type CreateInfo = BufferCreateInfo;
     type SupplementalInfo = pumice_vma::AllocationCreateInfo;
     type Handle = vk::Buffer;
-    type Storage = NoStore;
+    type Storage = SimpleStorage<Self>;
     type ObjectData = (pumice_vma::Allocation, BufferSynchronizationState);
 
-    type Parent = InnerDevice;
+    type Parent = Device;
 
     unsafe fn create(
-        ctx: &InnerDevice,
+        ctx: &Device,
         info: &Self::CreateInfo,
         allocation_info: &Self::SupplementalInfo,
     ) -> VulkanResult<(Self::Handle, Self::ObjectData)> {
@@ -68,7 +68,7 @@ impl Object for Buffer {
     }
 
     unsafe fn destroy(
-        ctx: &InnerDevice,
+        ctx: &Device,
         handle: Self::Handle,
         &(allocation, _): &Self::ObjectData,
     ) -> VulkanResult<()> {
