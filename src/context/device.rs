@@ -128,7 +128,7 @@ impl Device {
             &instance_handle,
             &conf,
             &queue_family_selection,
-            device_substrings
+            device_substrings,
         );
 
         // (queue family, individual queue priorities, offset of reclaimed queue (needed later))
@@ -328,6 +328,7 @@ fn test_device() {
             array_layers: 1,
             tiling: vk::ImageTiling::OPTIMAL,
             usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            sharing_mode_concurrent: false,
             initial_layout: vk::ImageLayout::UNDEFINED,
         };
         let allocation_info = AllocationCreateInfo::new()
@@ -411,7 +412,7 @@ unsafe fn select_device(
                 .enumerate()
                 .filter(|&(i, device)| {
                     device_considered[i] == false
-                        && 
+                        &&
                         // FIXME quadratic complexity, maybe do this beforehand into a vector?
                         // though I think we can at most 4 devices in a system
                         CStr::from_ptr(device.device_name.as_ptr())

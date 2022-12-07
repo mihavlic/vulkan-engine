@@ -81,6 +81,7 @@ pub struct ImageCreateInfo {
     pub array_layers: u32,
     pub tiling: vk::ImageTiling,
     pub usage: vk::ImageUsageFlags,
+    pub sharing_mode_concurrent: bool,
     pub initial_layout: vk::ImageLayout,
 }
 
@@ -97,7 +98,7 @@ impl ImageCreateInfo {
             samples: self.samples,
             tiling: self.tiling,
             usage: self.usage,
-            sharing_mode: vk::SharingMode::EXCLUSIVE,
+            sharing_mode: vk::SharingMode(self.sharing_mode_concurrent as _),
             queue_family_index_count: 0,
             p_queue_family_indices: ptr::null(),
             initial_layout: self.initial_layout,

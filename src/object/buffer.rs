@@ -14,6 +14,7 @@ pub struct BufferCreateInfo {
     flags: vk::BufferCreateFlags,
     size: u64,
     usage: vk::BufferUsageFlags,
+    pub sharing_mode_concurrent: bool,
 }
 
 impl BufferCreateInfo {
@@ -23,7 +24,7 @@ impl BufferCreateInfo {
             flags: self.flags,
             size: self.size,
             usage: self.usage,
-            sharing_mode: vk::SharingMode::EXCLUSIVE,
+            sharing_mode: vk::SharingMode(self.sharing_mode_concurrent as _),
             queue_family_index_count: 0,
             p_queue_family_indices: ptr::null(),
             ..Default::default()

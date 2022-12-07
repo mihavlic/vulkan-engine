@@ -85,7 +85,7 @@ impl<T: UInt> Optional<T> {
         self.0 == T::MAX
     }
     #[inline]
-    fn set(&mut self, value: Option<T>) {
+    pub fn set(&mut self, value: Option<T>) {
         if let Some(value) = value {
             assert!(value != T::MAX);
             *self = Self(value);

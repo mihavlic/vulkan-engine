@@ -1,12 +1,12 @@
 use std::{
     borrow::{Borrow, Cow},
-    cell::Cell,
-    collections::{BinaryHeap, VecDeque},
+    cell::{Cell, RefCell},
+    collections::{BinaryHeap, HashSet, VecDeque},
     fmt::Display,
     fs::OpenOptions,
     hash::Hash,
     io::Write,
-    ops::{ControlFlow, Deref, DerefMut, Not},
+    ops::{ControlFlow, Deref, DerefMut, Not, Range},
 };
 
 use pumice::{
@@ -67,8 +67,8 @@ struct PassMeta {
     alive: Cell<bool>,
     children_start: Cell<u32>,
     children_end: Cell<u32>,
-    scheduled_position: Cell<OptionalU32>,
     scheduled_submission: Cell<OptionalU32>,
+    scheduled_submission_position: Cell<OptionalU32>,
     queue_intervals: Cell<QueueIntervals>,
 }
 #[derive(Clone)]
@@ -108,75 +108,145 @@ struct PhysicalImageData {
     state: object::ImageMutableState,
 }
 
+#[derive(Clone)]
+struct ImageBarrier {
+    pub image: GraphImage,
+    pub src_stage_mask: vk::PipelineStageFlags2KHR,
+    pub src_access_mask: vk::AccessFlags2KHR,
+    pub dst_stage_mask: vk::PipelineStageFlags2KHR,
+    pub dst_access_mask: vk::AccessFlags2KHR,
+    pub old_layout: vk::ImageLayout,
+    pub new_layout: vk::ImageLayout,
+    pub src_queue_family_index: u32,
+    pub dst_queue_family_index: u32,
+}
+
+#[derive(Clone)]
+struct BufferBarrier {
+    pub buffer: vk::Buffer,
+    pub src_access_mask: vk::AccessFlags,
+    pub dst_access_mask: vk::AccessFlags,
+    pub src_queue_family_index: u32,
+    pub dst_queue_family_index: u32,
+}
+
+#[derive(Clone)]
+struct MemoryBarrier {
+    pub src_stage_mask: vk::PipelineStageFlags2KHR,
+    pub src_access_mask: vk::AccessFlags2KHR,
+    pub dst_stage_mask: vk::PipelineStageFlags2KHR,
+    pub dst_access_mask: vk::AccessFlags2KHR,
+}
+
 struct PhysicalBufferData {
     info: object::ImageCreateInfo,
 }
 
-#[derive(Clone, Default)]
+// #[derive(Clone)]
+// struct SubmissionPassData {
+//     pass: GraphPass,
+//     image_barriers: Vec<ImageBarrier>,
+//     buffer_barriers: Vec<BufferBarrier>,
+//     memory_barriers: Vec<MemoryBarrier>,
+// }
+
+#[derive(Clone)]
+struct SimpleBarrier {
+    pub src_stages: vk::PipelineStageFlags2KHR,
+    pub src_access: vk::AccessFlags2KHR,
+    pub dst_stages: vk::PipelineStageFlags2KHR,
+    pub dst_access: vk::AccessFlags2KHR,
+}
+
+#[derive(Clone)]
+enum SpecialBarrier {
+    LayoutTransition {
+        image: GraphImage,
+        src_layout: vk::ImageLayout,
+        dst_layout: vk::ImageLayout,
+    },
+    ImageOwnershipTransition {
+        image: GraphImage,
+        src_family: u32,
+        dst_family: u32,
+    },
+    BufferOwnershipTransition {
+        buffer: GraphBuffer,
+        src_family: u32,
+        dst_family: u32,
+    },
+}
+
+#[derive(Clone)]
 struct Submission {
+    queue: GraphQueue,
     passes: Vec<GraphPass>,
-    dependencies: Vec<QueueSubmission>,
+    semaphore_dependencies: Vec<GraphSubmission>,
+    // barriers and special_barriers may have SubmissionPass targets that go beyond the actual passes vector
+    // these are emitted to fixup synchronization for queue ownership transfer
+    barriers: Vec<(SubmissionPass, SimpleBarrier)>,
+    special_barriers: Vec<(SubmissionPass, SpecialBarrier)>,
 }
 
-pub struct ImageSubresourceRange2 {
-    pub aspect_mask: u32,
-    pub base_mip_level: u32,
-    pub level_count: u32,
-    pub base_array_layer: u32,
-    pub layer_count: u32,
-}
+// pub struct ImageSubresourceRange2 {
+//     pub aspect_mask: u32,
+//     pub base_mip_level: u32,
+//     pub level_count: u32,
+//     pub base_array_layer: u32,
+//     pub layer_count: u32,
+// }
 
-pub struct ImageSubresourceRange3 {
-    pub aspect_mask: u32,
-    pub base_mip_level: u8,
-    // max ~15
-    pub level_count: u8,
-    pub base_array_layer: u16,
-    // max 2048
-    pub layer_count: u16,
-}
+// pub struct ImageSubresourceRange3 {
+//     pub aspect_mask: u32,
+//     pub base_mip_level: u8,
+//     // max ~15
+//     pub level_count: u8,
+//     pub base_array_layer: u16,
+//     // max 2048
+//     pub layer_count: u16,
+// }
 
-fn is_subresource_overlap(a: &ImageSubresourceRange2, b: &ImageSubresourceRange2) -> bool {
-    macro_rules! range_overlap {
-        ($index1:expr, $count1:expr, $index2:expr, $count2:expr) => {
-            ($index1 <= ($index2 + $count2) && $index2 <= ($index1 + $count1))
-        };
-    }
-    (a.aspect_mask & b.aspect_mask) != 0
-        && range_overlap!(
-            a.base_array_layer,
-            a.layer_count,
-            b.base_array_layer,
-            b.layer_count
-        )
-        && range_overlap!(
-            a.base_mip_level,
-            a.level_count,
-            b.base_mip_level,
-            b.level_count
-        )
-}
+// fn is_subresource_overlap(a: &ImageSubresourceRange2, b: &ImageSubresourceRange2) -> bool {
+//     macro_rules! range_overlap {
+//         ($index1:expr, $count1:expr, $index2:expr, $count2:expr) => {
+//             ($index1 <= ($index2 + $count2) && $index2 <= ($index1 + $count1))
+//         };
+//     }
+//     (a.aspect_mask & b.aspect_mask) != 0
+//         && range_overlap!(
+//             a.base_array_layer,
+//             a.layer_count,
+//             b.base_array_layer,
+//             b.layer_count
+//         )
+//         && range_overlap!(
+//             a.base_mip_level,
+//             a.level_count,
+//             b.base_mip_level,
+//             b.level_count
+//         )
+// }
 
-fn is_subresource_overlap2(a: &ImageSubresourceRange3, b: &ImageSubresourceRange3) -> bool {
-    macro_rules! range_overlap {
-        ($index1:expr, $count1:expr, $index2:expr, $count2:expr) => {
-            ($index1 <= ($index2 + $count2) && $index2 <= ($index1 + $count1))
-        };
-    }
-    (a.aspect_mask & b.aspect_mask) != 0
-        && range_overlap!(
-            a.base_array_layer,
-            a.layer_count,
-            b.base_array_layer,
-            b.layer_count
-        )
-        && range_overlap!(
-            a.base_mip_level,
-            a.level_count,
-            b.base_mip_level,
-            b.level_count
-        )
-}
+// fn is_subresource_overlap2(a: &ImageSubresourceRange3, b: &ImageSubresourceRange3) -> bool {
+//     macro_rules! range_overlap {
+//         ($index1:expr, $count1:expr, $index2:expr, $count2:expr) => {
+//             ($index1 <= ($index2 + $count2) && $index2 <= ($index1 + $count1))
+//         };
+//     }
+//     (a.aspect_mask & b.aspect_mask) != 0
+//         && range_overlap!(
+//             a.base_array_layer,
+//             a.layer_count,
+//             b.base_array_layer,
+//             b.layer_count
+//         )
+//         && range_overlap!(
+//             a.base_mip_level,
+//             a.level_count,
+//             b.base_mip_level,
+//             b.level_count
+//         )
+// }
 
 pub struct Graph {
     queues: Vec<GraphObject<submission::Queue>>,
@@ -278,7 +348,7 @@ impl Graph {
                 alive: Cell::new(false),
                 children_start: Cell::new(0),
                 children_end: Cell::new(0),
-                scheduled_position: Cell::new(OptionalU32::NONE),
+                scheduled_submission_position: Cell::new(OptionalU32::NONE),
                 scheduled_submission: Cell::new(OptionalU32::NONE),
                 queue_intervals: Cell::new(QueueIntervals::NONE),
             },
@@ -290,7 +360,7 @@ impl Graph {
         let mut image = image;
         loop {
             match self.get_image_data(image) {
-                ImageData::Moved(to, _) => {
+                ImageData::Moved(to, ..) => {
                     image = *to;
                 }
                 other => return other,
@@ -308,7 +378,6 @@ impl Graph {
     fn is_buffer_external(&self, mut buffer: GraphBuffer) -> bool {
         match self.get_buffer_data(buffer) {
             BufferData::Transient(..) => false,
-            BufferData::TransientRealized(_) => unreachable!(),
             BufferData::Imported(_) => true,
         }
     }
@@ -354,6 +423,18 @@ impl Graph {
     fn get_dependencies(&self, pass: GraphPass) -> &[PassDependency] {
         &self.passes[pass.index()].dependencies
     }
+    fn get_queue_family(&self, queue: GraphQueue) -> u32 {
+        self.queues[queue.index()].family()
+    }
+    fn get_queue_families(&self) -> SmallVec<[u32; 4]> {
+        let mut vec: SmallVec<[u32; 4]> = SmallVec::new();
+        for queue in &self.queues {
+            vec.push(queue.family());
+        }
+        vec.sort_unstable();
+        vec.dedup();
+        vec
+    }
     fn get_queue_display(&self, queue: GraphQueue) -> GraphObjectDisplay<'_> {
         self.queues[queue.index()].display(queue.index())
     }
@@ -367,7 +448,7 @@ impl Graph {
         self.buffers[buffer.index()].display(buffer.index())
     }
     fn compute_graph_layer(&self, pass: GraphPass, graph_layers: &mut [i32]) -> i32 {
-        // either its -1 and is dead or already has been touched and has a positive number
+        // either it's -1 and is dead or has already been touched and has a positive number
         let layer = graph_layers[pass.index()];
         if layer == -1 {
             return -1;
@@ -394,98 +475,103 @@ impl Graph {
         fun(builder);
         self.prepare_meta();
 
-        #[derive(Default, Clone, PartialEq)]
-        enum ResourceState {
-            #[default]
-            Uninit,
-            MoveDst {
-                reading: SmallVec<[GraphPass; 8]>,
-                writing: SmallVec<[GraphPass; 8]>,
-            },
-            Normal {
-                reading: SmallVec<[GraphPass; 8]>,
-                writing: Option<GraphPass>,
-            },
-            Moved,
-        }
-
-        impl ResourceState {
-            fn new_normal(accessor: GraphPass, writing: bool) -> Self {
-                if writing {
-                    ResourceState::Normal {
-                        reading: SmallVec::new(),
-                        writing: Some(accessor),
-                    }
-                } else {
-                    ResourceState::Normal {
-                        reading: smallvec![accessor],
-                        writing: None,
-                    }
-                }
+        // src dst
+        //  W   W  -- hard
+        //  W   R  -- hard
+        //  R   W  -- soft
+        //  R   R  -- nothing
+        #[inline]
+        const fn is_hard(src_writes: bool, dst_writes: bool) -> Option<bool> {
+            match (src_writes, dst_writes) {
+                (true, true) => Some(true),
+                (true, false) => Some(true),
+                (false, true) => Some(false),
+                (false, false) => None,
             }
         }
 
-        fn update_resource_state(
-            src: &mut ResourceState,
-            p: GraphPass,
-            dst_writing: bool,
-            data: &mut PassData,
-        ) {
-            // src dst
-            //  W   W  -- hard
-            //  W   R  -- hard
-            //  R   W  -- soft
-            //  R   R  -- nothing
-            #[inline]
-            const fn is_hard(src: bool, dst: bool) -> Option<bool> {
-                match (src, dst) {
-                    (true, true) => Some(true),
-                    (true, false) => Some(true),
-                    (false, true) => Some(false),
-                    (false, false) => None,
-                }
+        // replay timeline events and add dependency between passes that arise out of memory dependencies
+        {
+            #[derive(Default, Clone)]
+            enum ResourceState {
+                #[default]
+                Uninit,
+                MoveDst {
+                    reading: SmallVec<[GraphPass; 8]>,
+                    writing: SmallVec<[GraphPass; 8]>,
+                },
+                Normal {
+                    reading: SmallVec<[GraphPass; 8]>,
+                    writing: Option<GraphPass>,
+                },
+                Moved,
             }
 
-            match src {
-                // no dependency
-                ResourceState::Uninit => {
-                    *src = ResourceState::new_normal(p, dst_writing);
-                }
-                // inherit all dependencies
-                ResourceState::MoveDst { reading, writing } => {
-                    if let Some(is_hard) = is_hard(false, dst_writing) {
-                        for r in reading {
-                            data.try_add_dependency(*r, is_hard);
-                        }
-                    }
-                    if let Some(is_hard) = is_hard(true, dst_writing) {
-                        for r in writing {
-                            data.try_add_dependency(*r, is_hard);
-                        }
-                    }
-                }
-                ResourceState::Normal { reading, writing } => {
-                    if let Some(producer) = writing {
-                        assert!(reading.is_empty());
-                        data.try_add_dependency(
-                            *producer,
-                            // src is WRITE, some dependency must occur
-                            is_hard(true, dst_writing).unwrap(),
-                        );
-
-                        // W W
-                        if dst_writing {
-                            *writing = Some(p);
-                        }
-                        // W R
-                        else {
-                            reading.push(p);
+            impl ResourceState {
+                fn new_normal(accessor: GraphPass, writing: bool) -> Self {
+                    if writing {
+                        ResourceState::Normal {
+                            reading: SmallVec::new(),
+                            writing: Some(accessor),
                         }
                     } else {
+                        ResourceState::Normal {
+                            reading: smallvec![accessor],
+                            writing: None,
+                        }
+                    }
+                }
+            }
+
+            fn update_resource_state(
+                src: &mut ResourceState,
+                p: GraphPass,
+                dst_writing: bool,
+                data: &mut PassData,
+            ) {
+                match src {
+                    // no dependency
+                    ResourceState::Uninit => {
+                        *src = ResourceState::new_normal(p, dst_writing);
+                    }
+                    // inherit all dependencies
+                    ResourceState::MoveDst { reading, writing } => {
+                        if let Some(is_hard) = is_hard(false, dst_writing) {
+                            for r in reading {
+                                data.add_dependency(*r, is_hard);
+                            }
+                        }
+                        if let Some(is_hard) = is_hard(true, dst_writing) {
+                            for r in writing {
+                                data.add_dependency(*r, is_hard);
+                            }
+                        }
+                    }
+                    ResourceState::Normal { reading, writing } => {
+                        // note that when a Write occurs and then some Reads, the next Write will
+                        // make a hard dependency to the previous Write and soft dependencies to all the Reads
+
+                        if let Some(producer) = writing {
+                            assert!(reading.is_empty());
+                            data.add_dependency(
+                                *producer,
+                                // src is WRITE, some dependency must occur
+                                is_hard(true, dst_writing).unwrap(),
+                            );
+
+                            // W W
+                            if dst_writing {
+                                *writing = Some(p);
+                            }
+                            // W R
+                            else {
+                                reading.push(p);
+                            }
+                        }
                         // R W
                         if dst_writing {
                             for r in &*reading {
-                                data.try_add_dependency(
+                                data.add_dependency(
                                     *r,
                                     is_hard(false, /* dst_writing == */ true).unwrap(),
                                 );
@@ -500,73 +586,74 @@ impl Graph {
                             }
                         }
                     }
+                    // TODO perhaps this shouldn't be a hard error and instead delegate access to the move destination
+                    ResourceState::Moved => panic!("Attempt to access moved resource"),
                 }
-                // TODO perhaps this shouldn't be a hard error and instead delegate access to the move destination
-                ResourceState::Moved => panic!("Attempt to access moved resource"),
             }
-        }
 
-        let mut image_rw = vec![ResourceState::default(); self.images.len()];
-        let mut buffer_rw = vec![ResourceState::default(); self.buffers.len()];
+            let mut image_rw = vec![ResourceState::default(); self.images.len()];
+            let mut buffer_rw = vec![ResourceState::default(); self.buffers.len()];
 
-        for &e in &self.timeline {
-            match e.get_kind() {
-                PassEventKind::Pass => {
-                    let p = e.get_pass().unwrap();
-                    let data = &mut self.passes[p.index()];
+            for &e in &self.timeline {
+                match e.get() {
+                    PassEventData::Pass(p) => {
+                        let data = &mut self.passes[p.index()];
 
-                    for i_index in 0..data.images.len() {
-                        let image = &data.images[i_index];
-                        let dst_writing = image.is_written();
-                        let src = &mut image_rw[image.handle.index()];
+                        for i_index in 0..data.images.len() {
+                            let image = &data.images[i_index];
+                            let dst_writing = image.is_written();
+                            let src = &mut image_rw[image.handle.index()];
 
-                        update_resource_state(src, p, dst_writing, data);
+                            update_resource_state(src, p, dst_writing, data);
+                        }
+
+                        for b_index in 0..data.buffers.len() {
+                            let buffer = &data.buffers[b_index];
+                            let dst_writing = buffer.is_written();
+                            let src = &mut buffer_rw[buffer.handle.index()];
+
+                            update_resource_state(src, p, dst_writing, data);
+                        }
                     }
-
-                    for b_index in 0..data.buffers.len() {
-                        let buffer = &data.buffers[b_index];
-                        let dst_writing = buffer.is_written();
-                        let src = &mut buffer_rw[buffer.handle.index()];
-
-                        update_resource_state(src, p, dst_writing, data);
-                    }
-                }
-                PassEventKind::Move => {
-                    let index = e.get_move().unwrap();
-                    let ImageMove { from, to } = self.get_pass_move(index);
-                    assert!(image_rw[to.index()] == ResourceState::Uninit);
-
-                    // TODO reuse allocations for this from the moved images
-                    let mut reads = SmallVec::new();
-                    let mut writes = SmallVec::new();
-
-                    // collect dependencies from all constituent resources
-                    for &i in from {
-                        let ResourceState::Normal { reading, writing } = std::mem::replace(&mut image_rw[i.index()], ResourceState::Moved) else {
-                            panic!("Resource in unsupported state");
+                    PassEventData::Move(m) => {
+                        let ImageMove { from, to } = self.get_pass_move(m);
+                        // ResourceState will not have PartialEq, use this to compare varitants
+                        let ResourceState::Uninit = image_rw[to.index()] else {
+                            panic!("Move destinations is not Uninit!");
                         };
 
-                        for r in reading {
-                            if !reads.contains(&r) {
-                                reads.push(r);
+                        // TODO reuse allocations for this from the moved images
+                        let mut reads = SmallVec::new();
+                        let mut writes = SmallVec::new();
+
+                        // collect dependencies from all constituent resources
+                        for &i in from {
+                            let ResourceState::Normal { reading, writing } = std::mem::replace(&mut image_rw[i.index()], ResourceState::Moved) else {
+                                panic!("Resource in unsupported state");
+                            };
+
+                            for r in reading {
+                                if !reads.contains(&r) {
+                                    reads.push(r);
+                                }
+                            }
+                            if let Some(r) = writing {
+                                if let Some(found) = reads.iter().position(|&p| p == r) {
+                                    reads.swap_remove(found);
+                                }
+                                if !writes.contains(&r) {
+                                    writes.push(r);
+                                }
                             }
                         }
-                        if let Some(r) = writing {
-                            if let Some(found) = reads.iter().position(|&p| p == r) {
-                                reads.swap_remove(found);
-                            }
-                            if !writes.contains(&r) {
-                                writes.push(r);
-                            }
-                        }
+                        image_rw[to.index()] = ResourceState::MoveDst {
+                            reading: reads,
+                            writing: writes,
+                        };
                     }
-                    image_rw[to.index()] = ResourceState::MoveDst {
-                        reading: reads,
-                        writing: writes,
-                    };
+                    // flushes constrain scheduling order but do not have any effect on resource state
+                    PassEventData::Flush(_) => {}
                 }
-                // flushes constrain scheduling order but do not have any effect on resource state
-                PassEventKind::Flush => {}
             }
         }
 
@@ -574,6 +661,7 @@ impl Graph {
         // outside of the graph and mark all of its dependencies as alive, any passes that don't get touched
         // are never scheduled and their resources never instantiated
         for (i, pass) in self.passes.iter().enumerate() {
+            // if this pass is already alive, all of its dependendies must have been touched already and we have nothing to do
             if self.pass_meta[i].alive.get() {
                 continue;
             }
@@ -638,52 +726,59 @@ impl Graph {
             let _ = std::mem::replace(&mut self.pass_children, dependees);
         }
 
-        let mut dependency_count = self
-            .passes
-            .iter()
-            .map(|p| p.dependencies.len() as u32)
-            .collect::<Vec<_>>();
-
-        #[derive(Clone)]
-        struct AvailablePass {
-            pass: GraphPass,
-            cost: i32,
-        }
-
-        impl AvailablePass {
-            fn new(pass: GraphPass, graph: &Graph, graph_layers: &mut [i32]) -> Self {
-                let layer = graph.compute_graph_layer(pass, graph_layers);
-                Self { pass, cost: -layer }
+        // do a greedy graph traversal where nodes with a larger priority will be selected first
+        // at this point this is essentially just a bfs
+        let scheduled = {
+            #[derive(Clone)]
+            struct AvailablePass {
+                pass: GraphPass,
+                priority: i32,
             }
-        }
 
-        impl PartialEq for AvailablePass {
-            fn eq(&self, other: &Self) -> bool {
-                self.cost == other.cost
+            impl AvailablePass {
+                fn new(pass: GraphPass, graph: &Graph, graph_layers: &mut [i32]) -> Self {
+                    let layer = graph.compute_graph_layer(pass, graph_layers);
+                    Self {
+                        pass,
+                        priority: -layer,
+                    }
+                }
             }
-        }
-        impl PartialOrd for AvailablePass {
-            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-                self.cost.partial_cmp(&other.cost)
-            }
-        }
-        impl Eq for AvailablePass {}
-        impl Ord for AvailablePass {
-            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                self.cost.cmp(&other.cost)
-            }
-        }
 
-        let mut graph_layers = vec![0; self.passes.len()];
-        let mut available: Vec<(u32, BinaryHeap<AvailablePass>)> =
-            vec![(0, BinaryHeap::new()); self.queues.len()];
-        let mut scheduled: Vec<GraphPass> = Vec::new();
+            impl PartialEq for AvailablePass {
+                fn eq(&self, other: &Self) -> bool {
+                    self.priority == other.priority
+                }
+            }
+            impl PartialOrd for AvailablePass {
+                fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                    self.priority.partial_cmp(&other.priority)
+                }
+            }
+            impl Eq for AvailablePass {}
+            impl Ord for AvailablePass {
+                fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                    self.priority.cmp(&other.priority)
+                }
+            }
 
-        {
+            // (u16, bool) <- flags whether the pass is in a currently active flush region
+            //  ^ count of unscheduled dependencies
+            let mut dependency_count = self
+                .passes
+                .iter()
+                .map(|p| (p.dependencies.len() as u16, false))
+                .collect::<Vec<_>>();
+
+            let mut available: Vec<(u32, BinaryHeap<AvailablePass>)> =
+                vec![(0, BinaryHeap::new()); self.queues.len()];
+            let mut scheduled: Vec<GraphPassEvent> = Vec::new();
+
+            let mut graph_layers = vec![0; self.passes.len()];
             // in a bfs, each node gets a "layer" in which is the maximum distance from a root node
             // we would like to use this in the scheduling heuristic because there are no dependencies within each layer
             // and we can saturate the gpu better
-            for (pass_i, &dep_count) in dependency_count.iter().enumerate() {
+            for (pass_i, &(dep_count, _)) in dependency_count.iter().enumerate() {
                 let p = GraphPass::new(pass_i);
                 if !self.is_pass_alive(p) {
                     graph_layers[pass_i] = -1;
@@ -692,11 +787,10 @@ impl Graph {
                 // root nodes get a layer 1 and are pushed into the available heaps
                 if dep_count == 0 {
                     graph_layers[pass_i] = 1;
-                    let queue = self.get_pass_data(p).queue;
-                    let item = AvailablePass::new(p, self, &mut graph_layers);
-                    available[queue.index()].1.push(item);
                 }
             }
+
+            let mut queue_flush_region = vec![0usize; self.queues.len()];
 
             // currently we are creating the scheduled passes by looping over each queue and poppping the locally optimal pass
             // this is rather questionable so TODO think this over
@@ -705,15 +799,51 @@ impl Graph {
                 for queue_i in 0..self.queues.len() {
                     let (position, heap) = &mut available[queue_i];
 
-                    let Some(AvailablePass { pass, .. }) = heap.pop() else {
-                        continue;
+                    let pass;
+                    if let Some(AvailablePass { pass: p, .. }) = heap.pop() {
+                        pass = p;
+                    } else {
+                        // we've depleted the last flush region, continue to the next one
+                        let index = &mut queue_flush_region[queue_i];
+                        for &e in &self.timeline[*index..] {
+                            *index += 1;
+                            match e.get() {
+                                PassEventData::Pass(next_pass) => {
+                                    let data = &self.get_pass_data(next_pass);
+                                    if data.queue.index() != queue_i {
+                                        continue;
+                                    }
+                                    let dependency_info = &mut dependency_count[next_pass.index()];
+                                    // if the pass has no outstanding deendencies, we measure its priority and add it to the heap
+                                    if dependency_info.0 == 0 {
+                                        let queue = data.queue;
+                                        let item =
+                                            AvailablePass::new(next_pass, self, &mut graph_layers);
+                                        heap.push(item);
+                                    }
+                                    dependency_info.1 = true;
+                                }
+                                PassEventData::Flush(f) => {
+                                    if f.index() == queue_i {
+                                        scheduled.push(GraphPassEvent::new(PassEventData::Flush(
+                                            GraphQueue::new(queue_i),
+                                        )));
+                                        break;
+                                    }
+                                }
+                                // moves are handled later
+                                PassEventData::Move(_) => {}
+                            }
+                        }
+
+                        if let Some(AvailablePass { pass: p, .. }) = heap.pop() {
+                            pass = p;
+                        } else {
+                            continue;
+                        }
                     };
 
-                    self.pass_meta[pass.index()]
-                        .scheduled_position
-                        .set(OptionalU32::new_some(*position));
-
-                    scheduled.push(pass);
+                    scheduled.push(GraphPassEvent::new(PassEventData::Pass(pass)));
                     *position += 1;
 
                     for &child in self.get_children(pass) {
@@ -722,8 +852,8 @@ impl Graph {
                         }
 
                         let count = &mut dependency_count[child.index()];
-                        *count -= 1;
-                        if *count == 0 {
+                        count.0 -= 1;
+                        if count.0 == 0 && count.1 == true {
                             let queue = self.get_pass_data(child).queue;
                             let item = AvailablePass::new(child, self, &mut graph_layers);
                             available[queue.index()].1.push(item);
@@ -736,130 +866,743 @@ impl Graph {
                     break;
                 }
             }
-        }
+            scheduled
+        };
 
-        for (i, p) in scheduled.iter().enumerate() {
-            let display = self.get_pass_display(*p);
-            println!("{i} \"{display}\"");
-        }
+        // collect live intervals of the resources
+        // this is used for physical resource physical resource assignment and correct image move handling
+        let (image_usage, buffer_usage) = {
+            let mut image_usage = vec![0..0; self.images.len()];
+            let mut buffer_usage = vec![0..0; self.buffers.len()];
 
-        let mut active_submissions: Vec<Submission> =
-            vec![Submission::default(); self.queues.len()];
-        let mut submissions = Vec::new();
-
-        for &p in &scheduled {
-            let pass = self.get_pass_data(p);
-            let own = &mut active_submissions[pass.queue.index()];
-            own.passes.push(p);
-
-            for &d in &pass.dependencies {
-                let dep = self.get_pass_data(d.get_pass());
-                let meta = self.get_pass_meta(d.get_pass());
-
-                if dep.queue != pass.queue {
-                    let submission = &mut active_submissions[dep.queue.index()];
-                    if !submission.passes.is_empty() {
-                        for &p in &submission.passes {
-                            let meta = self.get_pass_meta(p);
-                            let index = submissions.len() as u32;
-                            assert!(meta.scheduled_submission.get().is_none());
-                            meta.scheduled_submission.set(OptionalU32::new_some(index));
+            for (event_i, e) in scheduled.iter().enumerate() {
+                match e.get() {
+                    PassEventData::Pass(p) => {
+                        let data = self.get_pass_data(p);
+                        for i in &data.images {
+                            let usage = &mut image_usage[i.handle.index()];
+                            if usage.start == 0 {
+                                usage.start = event_i;
+                            }
+                            usage.end = event_i;
                         }
-                        let old = std::mem::replace(submission, Submission::default());
-                        submissions.push((dep.queue, old));
+                        for b in &data.buffers {
+                            let usage = &mut buffer_usage[b.handle.index()];
+                            if usage.start == 0 {
+                                usage.start = event_i;
+                            }
+                            usage.end = event_i;
+                        }
                     }
-
-                    let position = QueueSubmission(meta.scheduled_submission.get().get().unwrap());
-                    let own = &mut active_submissions[pass.queue.index()];
-                    if !own.dependencies.contains(&position) {
-                        own.dependencies.push(position);
-                    }
+                    PassEventData::Move(_) => {}
+                    PassEventData::Flush(_) => {}
                 }
             }
-        }
+            (image_usage, buffer_usage)
+        };
 
-        // flush the currently active submissions, order doesn't matter because they're leaf nodes
-        for (q, s) in active_submissions.into_iter().enumerate() {
-            if s.passes.is_empty() {
-                continue;
+        // the moment the move-src images aren't used anymore, they are "moved"
+        // Vec<(index of pass after which the move occurs, handle to the move to perform)>
+        let mut image_moves = self
+            .moves
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let pass = TimelinePass::new(
+                    m.from
+                        .iter()
+                        .map(|i| image_usage[i.index()].end)
+                        .max()
+                        .unwrap(),
+                );
+                let mov = GraphPassMove::new(i);
+                (pass, mov)
+            })
+            .collect::<Vec<_>>();
+        image_moves.sort_unstable_by_key(|(p, _)| *p);
+
+        // separate the scheduled passes into specific submissions
+        // this is a greedy process, but due to the previous scheduling it should yield somewhat decent results
+        let submissions = {
+            let mut image_rw: Vec<(ResourceState<ImageMarker>, bool)> =
+                vec![(ResourceState::default(), false); self.images.len()];
+            let mut buffer_rw: Vec<(ResourceState<BufferMarker>, bool)> =
+                vec![(ResourceState::default(), false); self.buffers.len()];
+
+            for i in 0..self.images.len() {
+                let image = GraphImage::new(i);
+                image_rw[i].1 = self.get_image_data(image).is_sharing_concurrent();
             }
 
-            let queue = GraphQueue::new(q);
-            for &p in &s.passes {
-                let meta = self.get_pass_meta(p);
-                let index = submissions.len() as u32;
-                assert!(meta.scheduled_submission.get().is_none());
-                meta.scheduled_submission.set(OptionalU32::new_some(index));
-            }
-            submissions.push((queue, s));
-        }
-
-        // perform transitive reduction on the nodes
-        // lifted from petgraph, https://docs.rs/petgraph/latest/petgraph/algo/tred/fn.dag_transitive_reduction_closure.html
-        {
-            let len = submissions.len();
-
-            let mut tred = vec![Vec::new(); len];
-            let mut tclos = Vec::with_capacity(len);
-            let mut mark = vec![false; len];
-
-            for i in 0..len {
-                tclos.push(Vec::with_capacity(submissions[i].1.dependencies.len()));
+            for i in 0..self.buffers.len() {
+                let buffer = GraphBuffer::new(i);
+                buffer_rw[i].1 = self.get_buffer_data(buffer).is_sharing_concurrent();
             }
 
-            // since each node has a list of predecessors and not successors, we need to reverse the order of all iteration
-            // in relation to the petgraph implementation, it does actually work
-            for i in 0..len {
-                for &x in submissions[i].1.dependencies.iter().rev() {
-                    if !mark[x.index()] {
-                        tred[i].push(x);
-                        tclos[i].push(x);
+            let mut recorder = RefCell::new(SubmissionRecorder::new(self));
 
-                        for y_i in (0..tclos[x.index()].len()).rev() {
-                            let y = tclos[x.index()][y_i];
-                            if !mark[y.index()] {
-                                mark[y.index()] = true;
-                                tclos[i].push(y);
+            // TODO pack this into 32 bits
+            #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+            enum GraphResource {
+                Image(GraphImage),
+                Buffer(GraphBuffer),
+            }
+
+            // some random buffers extracted here to keep the allocations
+            let mut waitfor_submissions: Vec<GraphSubmission> = Vec::new();
+            let mut waitfor_resources: Vec<GraphResource> = Vec::new();
+            // (src queue family, src pass, dst pass, resource in question)
+            let mut queue_family_accesses: SmallVec<
+                [(
+                    u32,
+                    Vec<(
+                        GraphSubmission,
+                        SubmissionPass,
+                        SubmissionPass,
+                        GraphResource,
+                    )>,
+                ); 8],
+            > = self
+                .get_queue_families()
+                .iter()
+                .map(|f| (*f, Vec::new()))
+                .collect();
+
+            for (timeline_i, &e) in scheduled.iter().enumerate() {
+                match e.get() {
+                    PassEventData::Pass(p) => {
+                        let on_end = |recorder: &mut SubmissionRecorder| {
+                            let dst_queue_family =
+                                self.get_queue_family(recorder.get_current_submission().queue);
+                            for &mut (src_queue_family, ref mut src_submissions) in
+                                &mut queue_family_accesses
+                            {
+                                use slice_group_by::GroupBy;
+                                // list of submissions which we need to wait on to perform a queue ownership release
+                                waitfor_submissions.clear();
+                                // list of resources that will be released and then acquired
+                                waitfor_resources.clear();
+
+                                // create the queue ownership release barriers (and dummy submissions)
+                                // queue ownership acquire has already been emitted during resource state updates
+                                src_submissions.sort_unstable_by_key(|(_, _, _, s)| *s);
+                                for entries in
+                                    src_submissions.binary_group_by_key(|(_, _, _, s)| *s)
+                                {
+                                    // assert that only one dst pass is causing the transition
+                                    debug_assert!(entries[1..]
+                                        .iter()
+                                        .all(|(_, _, dst, _)| *dst == entries[0].2));
+
+                                    for &(submission, src_pass, dst_pass, data) in entries {
+                                        let barrier = match data {
+                                            GraphResource::Image(image) => {
+                                                SpecialBarrier::ImageOwnershipTransition {
+                                                    image,
+                                                    src_family: src_queue_family,
+                                                    dst_family: dst_queue_family,
+                                                }
+                                            }
+                                            GraphResource::Buffer(buffer) => {
+                                                SpecialBarrier::BufferOwnershipTransition {
+                                                    buffer,
+                                                    src_family: src_queue_family,
+                                                    dst_family: dst_queue_family,
+                                                }
+                                            }
+                                        };
+                                        recorder
+                                            .get_current_submission_mut()
+                                            .special_barriers
+                                            .push((dst_pass, barrier));
+                                    }
+
+                                    match entries {
+                                        &[] => unreachable!(),
+                                        // only a single dependency, put the barrier straigh after the src pass
+                                        &[(submission, src_pass, dst_pass, data)] => {
+                                            let sub =
+                                                recorder.get_closed_submission_mut(submission);
+                                            // hack the handle to point to the pass after the src
+                                            // FIXME maybe just handle ownership release differently from other barriers
+                                            let pass_after =
+                                                SubmissionPass(src_pass.0.checked_add(1).unwrap());
+                                            let barrier = match data {
+                                                GraphResource::Image(image) => {
+                                                    SpecialBarrier::ImageOwnershipTransition {
+                                                        image,
+                                                        src_family: src_queue_family,
+                                                        dst_family: dst_queue_family,
+                                                    }
+                                                }
+                                                GraphResource::Buffer(buffer) => {
+                                                    SpecialBarrier::BufferOwnershipTransition {
+                                                        buffer,
+                                                        src_family: src_queue_family,
+                                                        dst_family: dst_queue_family,
+                                                    }
+                                                }
+                                            };
+                                            sub.special_barriers.push((pass_after, barrier));
+                                        }
+                                        &[(submission, _, _, data), ..] => {
+                                            // if all of the accesses are within the same submission, we can just add a dummy pass at the end
+                                            // which waits for all of the passes and then releases ownership
+                                            if entries[1..].iter().all(|(s, ..)| *s == entries[0].0)
+                                            {
+                                                let sub =
+                                                    recorder.get_closed_submission_mut(submission);
+
+                                                // barriers that don't target actual passes will require special handling during execution
+                                                let dummy_pass =
+                                                    SubmissionPass::new(sub.passes.len());
+
+                                                sub.barriers.push((dummy_pass, SimpleBarrier {
+                                                    // TODO accumulate actual accesses of passes and use that 
+                                                    src_stages: vk::PipelineStageFlags2KHR::ALL_COMMANDS,
+                                                    src_access: vk::AccessFlags2KHR::all(),
+                                                    dst_stages: vk::PipelineStageFlags2KHR::empty(),
+                                                    dst_access: vk::AccessFlags2KHR::empty(),
+                                                }));
+                                                let barrier = match data {
+                                                    GraphResource::Image(image) => {
+                                                        SpecialBarrier::ImageOwnershipTransition {
+                                                            image,
+                                                            src_family: src_queue_family,
+                                                            dst_family: dst_queue_family,
+                                                        }
+                                                    }
+                                                    GraphResource::Buffer(buffer) => {
+                                                        SpecialBarrier::BufferOwnershipTransition {
+                                                            buffer,
+                                                            src_family: src_queue_family,
+                                                            dst_family: dst_queue_family,
+                                                        }
+                                                    }
+                                                };
+                                                sub.special_barriers.push((dummy_pass, barrier));
+                                            } else {
+                                                // we need to create a dummy submission that synchronizes all of the previous ones
+                                                // this is done later, for now only push the required data
+                                                for &(submission, _, _, data) in entries {
+                                                    if !waitfor_submissions.contains(&submission) {
+                                                        waitfor_submissions.push(submission);
+                                                    }
+                                                    // FIXME this check may be unneccessary
+                                                    if !waitfor_resources.contains(&data) {
+                                                        waitfor_resources.push(data);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // here is the dummy submission stuff
+                                if !waitfor_submissions.is_empty() {
+                                    // find a queue that has the src family
+                                    let queue =
+                                        recorder.find_queue_with_family(src_queue_family).unwrap();
+
+                                    let barrier_iter = waitfor_resources.iter().map(|&res| {
+                                        (
+                                            // possibl
+                                            SubmissionPass(0),
+                                            match res {
+                                                GraphResource::Image(image) => {
+                                                    SpecialBarrier::ImageOwnershipTransition {
+                                                        image,
+                                                        src_family: src_queue_family,
+                                                        dst_family: dst_queue_family,
+                                                    }
+                                                }
+                                                GraphResource::Buffer(buffer) => {
+                                                    SpecialBarrier::BufferOwnershipTransition {
+                                                        buffer,
+                                                        src_family: src_queue_family,
+                                                        dst_family: dst_queue_family,
+                                                    }
+                                                }
+                                            },
+                                        )
+                                    });
+
+                                    let submission = Submission {
+                                        queue,
+                                        passes: Default::default(),
+                                        semaphore_dependencies: waitfor_submissions.clone(),
+                                        barriers: Default::default(),
+                                        special_barriers: barrier_iter.collect(),
+                                    };
+
+                                    let sub = recorder.add_submission_sneaky(submission);
+                                    recorder.add_semaphore_dependency(sub);
+                                }
+                            }
+                            // clear the data we've just processed
+                            for v in &mut queue_family_accesses {
+                                v.1.clear();
+                            }
+                        };
+                        let timeline_pass = e.to_timeline_pass().unwrap();
+                        let dst_pass = recorder.borrow_mut().begin_pass(timeline_pass, p, on_end);
+
+                        let pass_position = TimelinePass::new(timeline_i);
+                        let data = self.get_pass_data(p);
+                        let queue = data.queue;
+                        let dst_queue_family = self.get_queue_family(queue);
+
+                        for (i, img) in data.images.iter().enumerate() {
+                            let raw_image = img.handle.to_raw();
+                            let resource_handle = GraphResource::Image(img.handle);
+                            let &mut (ref mut state, concurrent) = &mut image_rw[i];
+
+                            let mut dst_writes = img.access.contains_write();
+                            let dst_touch = PassTouch {
+                                pass: p,
+                                access: img.access,
+                                stages: img.stages,
+                            };
+                            let dst_layout = ImageMarker::maybe_extract_start_layout(img);
+
+                            let normal_state = || ResourceState::Normal {
+                                layout: dst_layout,
+                                queue_family: dst_queue_family,
+                                access: smallvec![dst_touch],
+                            };
+
+                            match state {
+                                // no dependency
+                                ResourceState::Uninit => {
+                                    *state = normal_state();
+                                }
+                                // if the current access only needs to read, add it to the readers (and handle layout transitions)
+                                // otherwise synchronize against all passes and transition to normal state
+                                ResourceState::MoveDst { parts } => {
+                                    assert!(ImageMarker::IS_IMAGE, "Only images  can be moved");
+
+                                    let parts = parts.get_mut();
+                                    for (part, part_i) in parts.iter_mut().zip(0u32..) {
+                                        let (src_touch, src_layout, move_src) = part.clone();
+
+                                        let mut synchronized = false;
+                                        let mut synchronize = || {
+                                            if !synchronized {
+                                                let (touch, src_layout, move_src) = part;
+                                                // we need the previous access to finish before we can transition the layout
+                                                recorder.borrow_mut().add_dependency(
+                                                    touch.pass,
+                                                    touch.access,
+                                                    touch.stages,
+                                                    img.access,
+                                                    img.stages,
+                                                );
+                                                synchronized = true;
+                                                touch.access = vk::AccessFlags2KHR::empty();
+                                            }
+                                        };
+
+                                        if dst_writes {
+                                            synchronize();
+                                            dst_writes = true;
+                                        }
+
+                                        if dst_layout != vk::ImageLayout::UNDEFINED
+                                            && dst_layout != src_layout
+                                        {
+                                            synchronize();
+                                            dst_writes = true;
+                                            recorder.borrow_mut().layout_transition(
+                                                move_src,
+                                                src_layout..dst_layout,
+                                            );
+                                        }
+
+                                        // queue family ownership transition
+                                        let data = self.get_pass_data(src_touch.pass);
+                                        let src_queue_family = self.get_queue_family(data.queue);
+                                        // 1. concurrent images do not need ownership transition
+                                        // 2. if we do not need the contents of the resource (=layout UNDEFINED), we can simply ignore the transfer
+                                        //   https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#synchronization-queue-transfers
+                                        // 3. no transfer is neccessary if both accesses are on the same queue
+                                        if !concurrent
+                                            && dst_layout != vk::ImageLayout::UNDEFINED
+                                            && src_queue_family != dst_queue_family
+                                        {
+                                            synchronize();
+                                            dst_writes = true;
+                                            // ownership release and acquire is handled when the current submission is closed, push some data that
+                                            // we want to acquire ownership from src_queue_family
+
+                                            // find the vector of pending acquires for the src queue
+                                            let (_, entry) = queue_family_accesses
+                                                .iter_mut()
+                                                .find(|(f, _)| *f == src_queue_family)
+                                                .unwrap();
+
+                                            let src_meta = self.get_pass_meta(src_touch.pass);
+                                            let submission = GraphSubmission(
+                                                src_meta.scheduled_submission.get().get().unwrap(),
+                                            );
+                                            let pass = SubmissionPass(
+                                                src_meta
+                                                    .scheduled_submission_position
+                                                    .get()
+                                                    .get()
+                                                    .unwrap(),
+                                            );
+
+                                            entry.push((
+                                                submission,
+                                                pass,
+                                                dst_pass,
+                                                GraphResource::Image(move_src),
+                                            ));
+                                        }
+                                    }
+
+                                    let mut recorder = recorder.borrow_mut();
+
+                                    // ???
+                                    if dst_writes {
+                                        *state = normal_state();
+                                    } else {
+                                        // TODO verify this, seems flaky
+                                        parts.retain(|p| !p.0.access.is_empty());
+                                        // using img.handle is dubious
+                                        parts.push((dst_touch, dst_layout, img.handle));
+                                    }
+                                }
+                                &mut ResourceState::Normal {
+                                    layout: ref mut src_layout,
+                                    queue_family: ref mut src_queue_family,
+                                    ref mut access,
+                                } => {
+                                    let mut synchronized = false;
+                                    let mut synchronize = || {
+                                        if !synchronized {
+                                            for touch in &*access {
+                                                // we need the previous access to finish before we can transition the layout
+                                                recorder.borrow_mut().add_dependency(
+                                                    touch.pass,
+                                                    touch.access,
+                                                    touch.stages,
+                                                    img.access,
+                                                    img.stages,
+                                                );
+                                                synchronized = true;
+                                            }
+                                        }
+                                    };
+
+                                    if dst_writes {
+                                        synchronize();
+                                    }
+
+                                    let image_undefined = ImageMarker::IS_IMAGE
+                                        && dst_layout == vk::ImageLayout::UNDEFINED;
+
+                                    // layout transition
+                                    if !image_undefined && dst_layout != *src_layout {
+                                        synchronize();
+                                        dst_writes = true;
+                                        recorder
+                                            .borrow_mut()
+                                            .layout_transition(img.handle, *src_layout..dst_layout);
+                                        *src_layout = dst_layout;
+                                    }
+
+                                    // queue family ownership transition
+                                    if !image_undefined
+                                        && !concurrent
+                                        && *src_queue_family != self.get_queue_family(data.queue)
+                                    {
+                                        synchronize();
+                                        dst_writes = true;
+
+                                        // ownership release and acquire is handled when the current submission is closed, push some data that
+                                        // we want to acquire ownership from src_queue_family
+
+                                        // find the vector of pending acquires for the src queue
+                                        let (_, entry) = queue_family_accesses
+                                            .iter_mut()
+                                            .find(|(f, _)| *f == *src_queue_family)
+                                            .unwrap();
+
+                                        for src_touch in &*access {
+                                            let src_meta = self.get_pass_meta(src_touch.pass);
+                                            let submission = GraphSubmission(
+                                                src_meta.scheduled_submission.get().get().unwrap(),
+                                            );
+                                            let pass = SubmissionPass(
+                                                src_meta
+                                                    .scheduled_submission_position
+                                                    .get()
+                                                    .get()
+                                                    .unwrap(),
+                                            );
+
+                                            entry.push((
+                                                submission,
+                                                pass,
+                                                dst_pass,
+                                                resource_handle,
+                                            ));
+
+                                            *src_queue_family = dst_queue_family;
+                                        }
+                                    }
+
+                                    if dst_writes {
+                                        // already synchronized
+                                        access.clear();
+                                    }
+                                    access.push(dst_touch);
+                                }
+                                // TODO perhaps this shouldn't be a hard error and instead delegate access to the move destination
+                                ResourceState::Moved => panic!("Attempt to access moved resource"),
+                            }
+                        }
+
+                        // apply image moves
+                        for (_, mov) in image_moves
+                            .iter()
+                            .take_while(|(move_pass, _)| move_pass.index() <= timeline_i)
+                        {
+                            let data = &self.moves[mov.index()];
+
+                            let mut new_parts: SmallVec<
+                                [(PassTouch, vk::ImageLayout, GraphImage); 4],
+                            > = SmallVec::new();
+
+                            for &i in &data.from {
+                                match std::mem::replace(
+                                    &mut image_rw[i.index()].0,
+                                    ResourceState::Moved,
+                                ) {
+                                    ResourceState::MoveDst { parts } => {
+                                        new_parts.extend(parts.take())
+                                    }
+                                    ResourceState::Normal {
+                                        layout,
+                                        queue_family,
+                                        access,
+                                    } => {
+                                        // TODO verify this, seems finicky?
+                                        for touch in access {
+                                            new_parts.push((touch, layout, i));
+                                        }
+                                    }
+                                    _ => panic!("Resource in unsupported state"),
+                                }
+                            }
+                            let state = &mut image_rw[data.to.index()].0;
+                            let ResourceState::Uninit = *state else {
+                                panic!("Image move destination must be unitialized!");
+                            };
+                            *state = ResourceState::<ImageMarker>::MoveDst {
+                                parts: TypeSome(new_parts),
+                            };
+                        }
+                    }
+                    PassEventData::Move(_) => {} // this is handled differently
+                    PassEventData::Flush(q) => recorder.borrow_mut().close_current_submission(),
+                }
+            }
+
+            let mut submissions = RefCell::into_inner(recorder).finish();
+
+            // perform transitive reduction on the submissions
+            // lifted from petgraph, https://docs.rs/petgraph/latest/petgraph/algo/tred/fn.dag_transitive_reduction_closure.html
+            {
+                let len = submissions.len();
+
+                let mut tred = vec![Vec::new(); len];
+                let mut tclos = Vec::with_capacity(len);
+                let mut mark = vec![false; len];
+
+                for i in 0..len {
+                    tclos.push(Vec::with_capacity(
+                        submissions[i].semaphore_dependencies.len(),
+                    ));
+                }
+
+                // since each node has a list of predecessors and not successors, we need to reverse the order of all iteration
+                // in relation to the petgraph implementation, it does actually work
+                for i in 0..len {
+                    for &x in submissions[i].semaphore_dependencies.iter().rev() {
+                        if !mark[x.index()] {
+                            tred[i].push(x);
+                            tclos[i].push(x);
+
+                            for y_i in (0..tclos[x.index()].len()).rev() {
+                                let y = tclos[x.index()][y_i];
+                                if !mark[y.index()] {
+                                    mark[y.index()] = true;
+                                    tclos[i].push(y);
+                                }
                             }
                         }
                     }
+                    for y in &tclos[i] {
+                        mark[y.index()] = false;
+                    }
                 }
-                for y in &tclos[i] {
-                    mark[y.index()] = false;
+
+                for (submission, reduced_dependencies) in
+                    submissions.iter_mut().zip(tred.into_iter())
+                {
+                    submission.semaphore_dependencies = reduced_dependencies;
                 }
             }
+            submissions
+        };
 
-            for (submission, reduced_dependencies) in submissions.iter_mut().zip(tred.into_iter()) {
-                submission.1.dependencies = reduced_dependencies;
-            }
-        }
-
-        #[derive(Clone, PartialEq)]
-        struct SubmitLocation {
-            submission: QueueSubmission,
-            index: u32,
-        }
-
-        // #[derive(Clone, PartialEq)]
-        // enum ImageResourceState {
-        //     Unallocated,
-        //     Written {
-        //         queue: GraphQueue,
-        //         layout: vk::ImageLayout,
-        //         access: vk::AccessFlags,
-        //         producer: QueueSubmission,
-        //         barrier: Option<SubmitLocation>,
-        //     },
+        // impl<T: ResourceMarker> ResourceState<T> {
+        //     fn new_normal(accessor: Access, writing: bool) -> Self {
+        //         if writing {
+        //             ResourceState::Normal {
+        //                 layout: Default::default(),
+        //                 reading: SmallVec::new(),
+        //                 writing: Some(accessor),
+        //             }
+        //         } else {
+        //             ResourceState::Normal {
+        //                 reading: smallvec![accessor],
+        //                 writing: None,
+        //                 layout: Default::default(),
+        //             }
+        //         }
+        //     }
         // }
 
-        // struct PassBarrier {}
+        // fn update_resource_state<T: ResourceMarker>(
+        //     src: &mut ResourceState<T>,
+        //     dst_access: Access,
+        //     layout: T::MaybeLayout,
+        //     data: &mut PassData,
+        // ) {
+        //     match src {
+        //         // no dependency
+        //         ResourceState::Uninit => {
+        //             assert!(
+        //                 dst_access.writes(),
+        //                 "Uninitialized resource first must be written to (Acess: {:?})",
+        //                 dst_access.access
+        //             );
+        //             *src = ResourceState::new_normal(dst_access, true);
+        //         }
+        //         // inherit all dependencies
+        //         ResourceState::MoveDst {
+        //             layouts,
+        //             reading,
+        //             writing,
+        //         } => {}
+        //         ResourceState::Normal { reading, writing } => {
+        //             if let Some(producer) = writing {
+        //                 assert!(reading.is_empty());
+        //                 data.add_dependency(
+        //                     *producer,
+        //                     // src is WRITE, some dependency must occur
+        //                     is_hard(true, dst_writing).unwrap(),
+        //                 );
 
-        // let mut image_state = vec![ImageResourceState::Undefined; self.images.len()];
-        // let mut image_state = vec![ImageResourceState::Undefined; self.images.len()];
-        // let mut out_submissions = Vec::with_capacity(submissions.len());
+        //                 // W W
+        //                 if dst_writing {
+        //                     *writing = Some(p);
+        //                 }
+        //                 // W R
+        //                 else {
+        //                     reading.push(p);
+        //                 }
+        //             } else {
+        //                 // R W
+        //                 if dst_writing {
+        //                     for r in &*reading {
+        //                         data.add_dependency(
+        //                             *r,
+        //                             is_hard(false, /* dst_writing == */ true).unwrap(),
+        //                         );
+        //                     }
+        //                     reading.clear();
+        //                     *writing = Some(p);
+        //                 }
+        //                 // R R - we only append this pass to the current readers, no dependency is created
+        //                 else {
+        //                     if !reading.contains(&p) {
+        //                         reading.push(p);
+        //                     }
+        //                 }
+        //             }
+        //         }
+        //         // TODO perhaps this shouldn't be a hard error and instead delegate access to the move destination
+        //         ResourceState::Moved => panic!("Attempt to access moved resource"),
+        //     }
+        // }
 
-        // for &(q, ref s) in &submissions {
-        //     for p in s.passes {}
+        // let mut image_rw = vec![ResourceState::default(); self.images.len()];
+        // let mut buffer_rw = vec![ResourceState::default(); self.buffers.len()];
+
+        // for &e in &self.timeline {
+        //     match e.get() {
+        //         PassEventData::Pass(p) => {
+        //             let data = &mut self.passes[p.index()];
+
+        //             for i_index in 0..data.images.len() {
+        //                 let image = &data.images[i_index];
+        //                 let dst_writing = image.is_written();
+        //                 let src = &mut image_rw[image.handle.index()];
+
+        //                 update_resource_state(src, p, dst_writing, data);
+        //             }
+
+        //             for b_index in 0..data.buffers.len() {
+        //                 let buffer = &data.buffers[b_index];
+        //                 let dst_writing = buffer.is_written();
+        //                 let src = &mut buffer_rw[buffer.handle.index()];
+
+        //                 update_resource_state(src, p, dst_writing, data);
+        //             }
+        //         }
+        //         PassEventData::Move(m) => {
+        //             let ImageMove { from, to } = self.get_pass_move(m);
+        //             // ResourceState will not have PartialEq, use this to compare varitants
+        //             let ResourceState::Uninit = image_rw[to.index()] else {
+        //                     panic!("Move destinations is not Uninit!");
+        //                 };
+
+        //             // TODO reuse allocations for this from the moved images
+        //             let mut reads = SmallVec::new();
+        //             let mut writes = SmallVec::new();
+
+        //             // collect dependencies from all constituent resources
+        //             for &i in from {
+        //                 let ResourceState::Normal { reading, writing } = std::mem::replace(&mut image_rw[i.index()], ResourceState::Moved) else {
+        //                     panic!("Resource in unsupported state");
+        //                 };
+
+        //                 for r in reading {
+        //                     if !reads.contains(&r) {
+        //                         reads.push(r);
+        //                     }
+        //                 }
+        //                 if let Some(r) = writing {
+        //                     if let Some(found) = reads.iter().position(|&p| p == r) {
+        //                         reads.swap_remove(found);
+        //                     }
+        //                     if !writes.contains(&r) {
+        //                         writes.push(r);
+        //                     }
+        //                 }
+        //             }
+        //             image_rw[to.index()] = ResourceState::MoveDst {
+        //                 reading: reads,
+        //                 writing: writes,
+        //             };
+        //         }
+        //         // flushes constrain scheduling order but do not have any effect on resource state
+        //         PassEventData::Flush(_) => {}
+        //     }
         // }
 
         let mut file = OpenOptions::new()
@@ -870,7 +1613,7 @@ impl Graph {
             .unwrap();
 
         // cargo test --quiet -- graph::test_graph --nocapture && cat target/test.dot | dot -Tpng -o target/out.png
-        self.write_dot_representation(&submissions, &mut file);
+        // self.write_dot_representation(&submissions, &mut file);
         // Self::write_submissions_dot_representation(&submissions, &mut file);
     }
     fn write_dot_representation(
@@ -953,7 +1696,7 @@ impl Graph {
                 let mut heads = heads
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, p)| p.map(|p| (i, p)));
+                    .filter_map(|(i, p)| p.as_ref().map(|p| (i, p)));
 
                 for (q, p) in heads {
                     write!(w, "q{} -> p{};", q, p.index());
@@ -1041,9 +1784,9 @@ impl Graph {
         let clusters = Fun::new(|w| {
             for (i, (q, s)) in submissions.iter().enumerate() {
                 write!(w, r##"s{i}[label="#{i},{}"];"##, q.index());
-                if !s.dependencies.is_empty() {
+                if !s.semaphore_dependencies.is_empty() {
                     write!(w, "{{");
-                    for p in &s.dependencies {
+                    for p in &s.semaphore_dependencies {
                         write!(w, "s{} ", p.index());
                     }
                     write!(w, "}} -> s{i};");
@@ -1104,12 +1847,14 @@ fn test_graph() {
     });
 }
 
+#[derive(Clone)]
 struct PassImageData {
     handle: GraphImage,
     usage: vk::ImageUsageFlags,
+    stages: vk::PipelineStageFlags2KHR,
     access: vk::AccessFlags2KHR,
     start_layout: vk::ImageLayout,
-    end_layout: vk::ImageLayout,
+    end_layout: Option<vk::ImageLayout>,
 }
 
 impl PassImageData {
@@ -1119,9 +1864,10 @@ impl PassImageData {
 }
 
 struct PassBufferData {
-    usage: vk::BufferUsageFlags,
     handle: GraphBuffer,
+    usage: vk::BufferUsageFlags,
     access: vk::AccessFlags2KHR,
+    stages: vk::PipelineStageFlags2KHR,
 }
 
 impl PassBufferData {
@@ -1140,7 +1886,7 @@ struct PassData {
 }
 
 impl PassData {
-    fn try_add_dependency(&mut self, dependency: GraphPass, hard: bool) {
+    fn add_dependency(&mut self, dependency: GraphPass, hard: bool) {
         if let Some(found) = self
             .dependencies
             .iter_mut()
@@ -1168,7 +1914,10 @@ enum ImageData {
     Transient(object::ImageCreateInfo, Option<PhysicalImage>),
     Imported(object::Image),
     Swapchain(object::Swapchain),
-    Moved(GraphImage, u32),
+    // dst image, layer offset, layer count
+    // TODO make GraphImage a Cell and update it when traversing to be a straight reference to the dst image
+    // (if the dst image itself has  been moved, we will have to visit its dst image to get the final layer offset and such)
+    Moved(GraphImage, u16, u16),
 }
 impl ImageData {
     fn get_variant_name(&self) -> &'static str {
@@ -1179,11 +1928,35 @@ impl ImageData {
             ImageData::Moved { .. } => "Moved",
         }
     }
+    fn is_sharing_concurrent(&self) -> bool {
+        match self {
+            ImageData::Transient(info, _) => info.sharing_mode_concurrent,
+            ImageData::Imported(handle) => {
+                unsafe { handle.0.get_header() }
+                    .info
+                    .sharing_mode_concurrent
+            }
+            ImageData::Swapchain(_) => false,
+            ImageData::Moved(..) => panic!(),
+        }
+    }
 }
 enum BufferData {
     Transient(object::BufferCreateInfo, Option<PhysicalBuffer>),
-    TransientRealized(PhysicalBuffer),
     Imported(object::Buffer),
+}
+
+impl BufferData {
+    fn is_sharing_concurrent(&self) -> bool {
+        match self {
+            BufferData::Transient(info, _) => info.sharing_mode_concurrent,
+            BufferData::Imported(handle) => {
+                unsafe { handle.0.get_header() }
+                    .info
+                    .sharing_mode_concurrent
+            }
+        }
+    }
 }
 
 struct GraphObject<T> {
@@ -1352,59 +2125,68 @@ impl GraphBuilder {
         let image = GraphImage::new(self.0.images.len());
 
         let object = images.map_to_object(|a| {
-            let mut usage = vk::ImageUsageFlags::empty();
-            let mut layer_offset = 0;
-
             let images = a.into_iter().collect::<SmallVec<_>>();
 
-            let mut first = None;
+            // TODO perhaps it would be useful to move into already instantiated non-transient images
+            let invalid_data_panic = |image: GraphImage, data: &ImageData| {
+                panic!(
+                    "Only Transient images can be moved, image '{}' has state '{}'",
+                    self.0.get_image_display(image),
+                    data.get_variant_name()
+                )
+            };
+
+            let ImageData::Transient(first_info, ..) = self.0.get_image_data(images[0]).clone() else {
+                invalid_data_panic(images[0], self.0.get_image_data(images[0]))
+            };
+            let mut first_info = first_info.clone();
+
             // check that all of them are transient and that they have the same format and extent
-            for &i in &images {
-                match self.0.get_image_data(i) {
-                    ImageData::Transient(info, _) => {
-                        usage |= info.usage;
-                        if let Some(first) = first {
-                            let ImageData::Transient(first, ..) = self.0.get_image_data(first) else {
-                                unreachable!()
-                            };
+            for &i in &images[1..] {
+                let data = &self.0.get_image_data(i);
+                let ImageData::Transient(info, ..) = data else {
+                    invalid_data_panic(i, data)
+                };
 
-                            assert_eq!(first.size, info.size);
-                            assert_eq!(first.format, info.format);
-                            assert_eq!(first.samples, info.samples);
-                            assert_eq!(first.tiling, info.tiling);
-                        } else {
-                            first = Some(i);
-                        }
+                first_info.usage |= info.usage;
 
-                        let layer_count = info.array_layers;
-                        *self.0.images[i.index()].get_inner_mut() = ImageData::Moved(image, layer_offset);
-                        layer_offset += layer_count;
-                    }
-                    // TODO perhaps it would be useful to move into already instantiated non-transient images
-                    other => panic!(
-                        "Only Transient images can be moved, image '{}' has state '{}'",
-                        self.0.get_image_display(i),
-                        other.get_variant_name()
-                    ),
-                }
+                assert_eq!(first_info.size, info.size);
+                assert_eq!(first_info.format, info.format);
+                assert_eq!(first_info.samples, info.samples);
+                assert_eq!(first_info.tiling, info.tiling);
+                assert_eq!(
+                    first_info.sharing_mode_concurrent,
+                    info.sharing_mode_concurrent
+                );
             }
 
-            let ImageData::Transient(first, ..) = self.0.get_image_data(first.expect("Images cannot be empty")) else {
-                unreachable!()
-            };
+            // update the states of the move sources
+            let mut layer_offset = 0;
+            for &i in &images {
+                let ImageData::Transient(info, _) = self.0.get_image_data(i) else {
+                    unreachable!()
+                };
+
+                let layer_count: u16 = info.array_layers.try_into().unwrap();
+                *self.0.images[i.index()].get_inner_mut() =
+                    ImageData::Moved(image, layer_offset, layer_count);
+                layer_offset += layer_count;
+            }
 
             let mut info = ImageCreateInfo {
-                usage,
-                array_layers: layer_offset,
-                ..first.clone()
+                array_layers: layer_offset as u32,
+                ..first_info
             };
 
-            let moved = GraphPassEvent::new(PassEventKind::Move, self.0.moves.len());
+            self.0
+                .timeline
+                .push(GraphPassEvent::new(PassEventData::Move(
+                    GraphPassMove::new(self.0.moves.len()),
+                )));
             self.0.moves.push(ImageMove {
                 from: images,
                 to: image,
             });
-            self.0.timeline.push(moved);
 
             ImageData::Transient(info, None)
         });
@@ -1426,16 +2208,24 @@ impl GraphBuilder {
             let pass = pass.create(&mut builder, &self.0.device);
             builder.finish(queue, pass)
         };
-        // if the string is empty, we set the name to None
+        // if the string is 0, we set the name to None
         let name = Some(name.into()).filter(|n| !n.is_empty());
         self.0.passes.push(GraphObject { name, inner: data });
+        self.0
+            .timeline
+            .push(GraphPassEvent::new(PassEventData::Pass(handle)));
         handle
     }
     pub fn add_pass_dependency(&mut self, first: GraphPass, then: GraphPass, hard: bool) {
-        self.0.passes[then.index()].try_add_dependency(first, hard);
+        self.0.passes[then.index()].add_dependency(first, hard);
     }
     pub fn force_pass_run(&mut self, pass: GraphPass) {
         self.0.passes[pass.index()].force_run = true;
+    }
+    pub fn add_scheduling_barrier(&mut self, queue: GraphQueue) {
+        self.0
+            .timeline
+            .push(GraphPassEvent::new(PassEventData::Flush(queue)));
     }
 }
 
@@ -1471,13 +2261,16 @@ impl<'a> GraphPassBuilder<'a> {
         &mut self,
         image: GraphImage,
         usage: vk::ImageUsageFlags,
+        stages: vk::PipelineStageFlags2KHR,
         access: vk::AccessFlags2KHR,
         start_layout: vk::ImageLayout,
-        end_layout: vk::ImageLayout,
+        end_layout: Option<vk::ImageLayout>,
     ) {
+        // TODO deduplicate or explicitly forbid multiple entries with the same handle
         self.images.push(PassImageData {
             handle: image,
             usage,
+            stages,
             access,
             start_layout,
             end_layout,
@@ -1487,12 +2280,15 @@ impl<'a> GraphPassBuilder<'a> {
         &mut self,
         buffer: GraphBuffer,
         usage: vk::BufferUsageFlags,
+        stages: vk::PipelineStageFlags2KHR,
         access: vk::AccessFlags2KHR,
     ) {
+        // TODO deduplicate or explicitly forbid multiple entries with the same handle
         self.buffers.push(PassBufferData {
             handle: buffer,
             usage,
             access,
+            stages,
         });
     }
 }
@@ -1513,22 +2309,39 @@ impl GraphExecutor {
 macro_rules! simple_handle {
     ($($visibility:vis $name:ident),+) => {
         $(
-            #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+            #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
             $visibility struct $name(u32);
             impl $name {
                 fn new(index: usize) -> Self {
                     assert!(index <= u32::MAX as usize);
                     Self(index as u32)
                 }
+                #[inline]
                 fn index(&self) -> usize {
                     self.0 as usize
+                }
+                #[inline]
+                fn to_raw(&self) -> RawHandle {
+                    RawHandle(self.0)
+                }
+                #[inline]
+                fn from_raw(raw: RawHandle) -> Self {
+                    Self(raw.0)
                 }
             }
         )+
     };
 }
 
-simple_handle! { pub GraphQueue, pub GraphPass, pub GraphImage, pub GraphBuffer, QueueSubmission, PhysicalImage, PhysicalBuffer, GraphPassMove }
+simple_handle! {
+    RawHandle,
+    pub GraphQueue, pub GraphPass, pub GraphImage, pub GraphBuffer,
+    GraphSubmission, PhysicalImage, PhysicalBuffer, GraphPassMove,
+    // like a GraphPassEvent but only ever points to a pass
+    TimelinePass,
+    // the pass in a submission
+    SubmissionPass
+}
 
 macro_rules! optional_index {
     ($($name:ident),+) => {
@@ -1559,52 +2372,63 @@ impl Config for GraphPassEventConfig {
     const SECOND_BITS: usize = 30;
 }
 
-enum PassEventKind {
-    Pass = 0,
-    Move = 1,
-    Flush = 2,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PassEventData {
+    Pass(GraphPass),
+    Move(GraphPassMove),
+    Flush(GraphQueue),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct GraphPassEvent(PackedUint<GraphPassEventConfig, u32>);
 
 impl GraphPassEvent {
-    fn new(kind: PassEventKind, index: usize) -> Self {
-        Self(PackedUint::new(
-            kind as u32,
-            index.try_into().expect("Index too large"),
-        ))
-    }
-    fn get_kind(&self) -> PassEventKind {
-        match self.0.first() {
-            a if a == PassEventKind::Pass as u32 => PassEventKind::Pass,
-            a if a == PassEventKind::Move as u32 => PassEventKind::Move,
-            a if a == PassEventKind::Flush as u32 => PassEventKind::Flush,
-            _ => unreachable!(),
-        }
+    fn to_timeline_pass(self) -> Option<TimelinePass> {
+        self.get_pass().map(|p| TimelinePass(p.0))
     }
 }
 
 macro_rules! gen_pass_getters {
-    ($($fun:ident, $handle:ident, $disc:expr;)+) => {
-        impl GraphPassEvent {
+    ($name:ident, $data:ident: $($fun:ident, $handle:ident, $disc:tt: $val:expr;)+) => {
+        impl $name {
+            fn new(data: $data) -> Self {
+                let (discriminant, index) = match data {
+                    $(
+                        $data::$disc(handle) => ($val, handle.0),
+                    )+
+                };
+                Self(PackedUint::new(
+                    discriminant,
+                    index
+                ))
+            }
             $(
                 fn $fun (&self) -> Option<$handle> {
-                    if self.0.first() == $disc as _ {
+                    if self.0.first() == $val {
                         Some($handle(self.0.second()))
                     } else {
                         None
                     }
                 }
             )+
+            fn get(&self) -> $data {
+                let second = self.0.second();
+                match self.0.first() {
+                    $(
+                        $val => $data::$disc($handle(second)),
+                    )+
+                    _ => unreachable!("gen_pass_getters! macro is missing enum variants")
+                }
+            }
         }
     };
 }
 
 gen_pass_getters! {
-    get_pass, GraphPass, PassEventKind::Pass;
-    get_move, GraphPassMove, PassEventKind::Move;
-    get_flush, GraphQueue, PassEventKind::Flush;
+    GraphPassEvent, PassEventData:
+    get_pass, GraphPass, Pass: 0;
+    get_move, GraphPassMove, Move: 1;
+    get_flush, GraphQueue, Flush: 2;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1669,5 +2493,502 @@ impl PassDependency {
     }
     fn index(&self) -> usize {
         self.get_pass().index()
+    }
+}
+
+// submission stuff
+
+trait TypeOption<T> {
+    fn get(&self) -> &T;
+    fn get_mut(&mut self) -> &mut T;
+    fn take(self) -> T;
+}
+
+#[derive(Clone)]
+struct TypeSome<T>(T);
+impl<T> TypeOption<T> for TypeSome<T> {
+    #[inline]
+    fn get(&self) -> &T {
+        &self.0
+    }
+    #[inline]
+    fn get_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+    #[inline]
+    fn take(self) -> T {
+        self.0
+    }
+}
+
+#[derive(Clone)]
+struct TypeNone<T>(std::marker::PhantomData<fn() -> T>);
+impl<T> TypeOption<T> for TypeNone<T> {
+    #[inline]
+    fn get(&self) -> &T {
+        unreachable!()
+    }
+    #[inline]
+    fn get_mut(&mut self) -> &mut T {
+        unreachable!()
+    }
+    #[inline]
+    fn take(self) -> T {
+        unreachable!()
+    }
+}
+
+trait ResourceMarker {
+    const IS_IMAGE: bool;
+
+    type IfImage<T: Clone>: TypeOption<T> + Clone;
+    type MaybeLayout: Default + Clone;
+
+    #[inline(always)]
+    fn to_maybe_layout(layout: vk::ImageLayout) -> Self::MaybeLayout;
+    #[inline(always)]
+    fn from_maybe_layout(layout: Self::MaybeLayout) -> vk::ImageLayout;
+
+    type Data;
+    #[inline(always)]
+    fn maybe_extract_start_layout(data: &Self::Data) -> Self::MaybeLayout;
+    #[inline(always)]
+    fn maybe_extract_end_layout(data: &Self::Data) -> Option<Self::MaybeLayout>;
+}
+
+#[derive(Clone, Default)]
+struct ImageMarker;
+impl ResourceMarker for ImageMarker {
+    const IS_IMAGE: bool = true;
+
+    type IfImage<T: Clone> = TypeSome<T>;
+    type MaybeLayout = vk::ImageLayout;
+
+    #[inline(always)]
+    fn to_maybe_layout(layout: vk::ImageLayout) -> Self::MaybeLayout {
+        layout
+    }
+    #[inline(always)]
+    fn from_maybe_layout(layout: Self::MaybeLayout) -> vk::ImageLayout {
+        layout
+    }
+
+    type Data = PassImageData;
+    #[inline(always)]
+    fn maybe_extract_start_layout(data: &Self::Data) -> Self::MaybeLayout {
+        data.start_layout
+    }
+    #[inline(always)]
+    fn maybe_extract_end_layout(data: &Self::Data) -> Option<Self::MaybeLayout> {
+        data.end_layout
+    }
+}
+
+#[derive(Clone, Default)]
+struct BufferMarker;
+impl ResourceMarker for BufferMarker {
+    const IS_IMAGE: bool = false;
+
+    type IfImage<T: Clone> = TypeNone<T>;
+    type MaybeLayout = ();
+
+    #[inline(always)]
+    fn to_maybe_layout(layout: vk::ImageLayout) -> Self::MaybeLayout {}
+    #[inline(always)]
+    fn from_maybe_layout(layout: Self::MaybeLayout) -> vk::ImageLayout {
+        vk::ImageLayout::UNDEFINED
+    }
+
+    type Data = PassImageData;
+    #[inline(always)]
+    fn maybe_extract_start_layout(data: &Self::Data) -> Self::MaybeLayout {}
+    #[inline(always)]
+    fn maybe_extract_end_layout(data: &Self::Data) -> Option<Self::MaybeLayout> {
+        None
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PassTouch {
+    pass: GraphPass,
+    access: vk::AccessFlags2KHR,
+    stages: vk::PipelineStageFlags2KHR,
+}
+
+#[derive(Clone)]
+enum ResourceState<T: ResourceMarker> {
+    Uninit,
+    MoveDst {
+        // (count of image array layers sharing the layout, layout, the move src)
+        parts: T::IfImage<SmallVec<[(PassTouch, T::MaybeLayout, GraphImage); 4]>>,
+    },
+    Normal {
+        // TODO perhaps store whether this resource is SHARING_MODE_CONCURRENT
+        layout: T::MaybeLayout,
+        queue_family: u32,
+        access: SmallVec<[PassTouch; 8]>,
+    },
+    Moved,
+}
+
+impl<T: ResourceMarker> Default for ResourceState<T> {
+    fn default() -> Self {
+        Self::Uninit
+    }
+}
+
+#[derive(Clone)]
+struct PassEffects {
+    access: vk::AccessFlags2KHR,
+    stages: vk::PipelineStageFlags2KHR,
+    last_barrier: OptionalU32,
+}
+
+#[derive(Clone)]
+struct OpenSubmision {
+    queue: GraphQueue,
+    current_pass: Option<TimelinePass>,
+    pass_effects: Vec<PassEffects>,
+    passes: Vec<GraphPass>,
+    semaphore_dependencies: Vec<GraphSubmission>,
+    barriers: Vec<(SubmissionPass, SimpleBarrier)>,
+    special_barriers: Vec<(SubmissionPass, SpecialBarrier)>,
+}
+
+impl OpenSubmision {
+    fn add_pass(&mut self, timeline: TimelinePass, graph: GraphPass, effects: PassEffects) {
+        self.current_pass = Some(timeline);
+        self.passes.push(graph);
+        self.pass_effects.push(effects);
+    }
+    fn get_current_timeline_pass(&self) -> TimelinePass {
+        self.current_pass.unwrap()
+    }
+    fn get_current_submission_pass(&self) -> SubmissionPass {
+        SubmissionPass::new(self.passes.len().checked_sub(1).unwrap())
+    }
+    fn add_dependency(&mut self, dependency: GraphSubmission) {
+        if !self.semaphore_dependencies.contains(&dependency) {
+            self.semaphore_dependencies.push(dependency);
+        }
+    }
+    fn finish(&mut self, queue: GraphQueue) -> Submission {
+        let take = Submission {
+            queue,
+            passes: self.passes.clone(),
+            semaphore_dependencies: self.semaphore_dependencies.clone(),
+            barriers: self.barriers.clone(),
+            special_barriers: self.special_barriers.clone(),
+        };
+
+        self.current_pass.take();
+        self.pass_effects.clear();
+        self.passes.clear();
+        self.semaphore_dependencies.clear();
+        self.barriers.clear();
+        self.special_barriers.clear();
+
+        take
+    }
+}
+
+struct SubmissionRecorder<'a> {
+    graph: &'a Graph,
+    submissions: Vec<Submission>,
+    queues: Vec<OpenSubmision>,
+    current_queue: Option<(u32, GraphQueue)>,
+}
+
+impl<'a> SubmissionRecorder<'a> {
+    fn new(graph: &'a Graph) -> Self {
+        Self {
+            graph,
+            submissions: Default::default(),
+            queues: Default::default(),
+            current_queue: Default::default(),
+        }
+    }
+    fn set_current_queue(&mut self, queue: GraphQueue) {
+        if let Some(found) = self.queues.iter().position(|q| q.queue == queue) {
+            self.current_queue = Some((found.try_into().unwrap(), queue));
+        } else {
+            let index = self.queues.len();
+            self.queues.push(OpenSubmision {
+                queue,
+                current_pass: Default::default(),
+                pass_effects: Default::default(),
+                passes: Default::default(),
+                semaphore_dependencies: Default::default(),
+                barriers: Default::default(),
+                special_barriers: Default::default(),
+            });
+            self.current_queue = Some((index.try_into().unwrap(), queue));
+        }
+    }
+    #[inline]
+    fn get_current_submission(&self) -> &OpenSubmision {
+        &self.queues[self.current_queue.unwrap().0 as usize]
+    }
+    #[inline]
+    fn get_current_submission_mut(&mut self) -> &mut OpenSubmision {
+        &mut self.queues[self.current_queue.unwrap().0 as usize]
+    }
+    fn get_current_pass(&self) -> SubmissionPass {
+        SubmissionPass::new(
+            self.get_current_submission()
+                .passes
+                .len()
+                .checked_sub(1)
+                .unwrap(),
+        )
+    }
+    fn get_closed_submission_mut(&mut self, submission: GraphSubmission) -> &mut Submission {
+        &mut self.submissions[submission.index()]
+    }
+    fn find_queue_with_family(&self, family: u32) -> Option<GraphQueue> {
+        self.queues
+            .iter()
+            .find(|q| self.graph.get_queue_family(q.queue) == family)
+            .map(|found| found.queue)
+    }
+    fn add_submission_sneaky(&mut self, submission: Submission) -> GraphSubmission {
+        // TODO is this neccessary?
+        assert!(self.current_queue.map(|q| q.1) != Some(submission.queue));
+        let index = self.submissions.len();
+        self.submissions.push(submission);
+        GraphSubmission::new(index)
+    }
+    fn begin_pass<F: FnOnce(&mut Self)>(
+        &mut self,
+        timeline: TimelinePass,
+        graph: GraphPass,
+        on_prev_end: F,
+    ) -> SubmissionPass {
+        let data = self.graph.get_pass_data(graph);
+        let mut access = vk::AccessFlags2KHR::default();
+        let mut stages = vk::PipelineStageFlags2KHR::default();
+
+        // either we've started emitting passes into a different queue, or the user flushed the previously open queue
+        if (self.current_queue.is_some() && self.current_queue.unwrap().1 != data.queue)
+            || (!self.submissions.is_empty() && self.current_queue.is_none())
+        {
+            on_prev_end(self);
+        }
+        if self.current_queue.is_some() && self.current_queue.unwrap().1 != data.queue {
+            self.__close_submission(self.current_queue.unwrap().1);
+        }
+        self.set_current_queue(data.queue);
+
+        for i in &data.images {
+            if i.access.contains_write() {
+                access |= i.access;
+                stages |= i.stages;
+            }
+        }
+        for b in &data.buffers {
+            if b.access.contains_write() {
+                access |= b.access;
+                stages |= b.stages;
+            }
+        }
+        let effects = PassEffects {
+            stages: stages.translate_special_bits(),
+            access: access & vk::AccessFlags2KHR::WRITE_FLAGS,
+            last_barrier: OptionalU32::NONE,
+        };
+
+        let submission = self.get_current_submission_mut();
+        submission.add_pass(timeline, graph, effects);
+
+        self.get_current_pass()
+    }
+    fn add_special_barrier(&mut self, barrier: SpecialBarrier) {
+        let pass = self.get_current_pass();
+        self.get_current_submission_mut()
+            .special_barriers
+            .push((pass, barrier));
+    }
+    fn add_semaphore_dependency(&mut self, dependency: GraphSubmission) {
+        self.get_current_submission_mut().add_dependency(dependency);
+    }
+    fn add_dependency(
+        &mut self,
+        src_pass: GraphPass,
+        src_access: vk::AccessFlags2KHR,
+        src_stages: vk::PipelineStageFlags2KHR,
+        dst_access: vk::AccessFlags2KHR,
+        dst_stages: vk::PipelineStageFlags2KHR,
+    ) {
+        let (_, queue) = self.current_queue.unwrap();
+
+        let data = self.graph.get_pass_data(src_pass);
+        let meta = self.graph.get_pass_meta(src_pass);
+
+        let scheduled = meta.scheduled_submission.get();
+
+        // the pass is on another queue in an open submission, close it for the next step
+        if data.queue != queue && scheduled.is_none() {
+            let submission = self
+                .__close_submission(data.queue)
+                .expect("Dependency must be scheduled before the dependee");
+        }
+
+        let submission = self.get_current_submission_mut();
+
+        // the pass has already been submitted, ignore barrier stuff and create a semaphore dependency
+        if let Some(scheduled) = scheduled.get() {
+            submission.add_dependency(GraphSubmission(scheduled));
+            return;
+        }
+
+        // at this point we know the src is within the current submissions, so we can use a barrier
+        let src = meta.scheduled_submission_position.get().get().unwrap() as usize;
+
+        let src_pass = SubmissionPass::new(src);
+        let dst_pass = submission.get_current_submission_pass();
+        let effects = &mut submission.pass_effects[src];
+
+        if src_pass == dst_pass {
+            panic!("The pass cannot synchronize to itself!");
+        }
+
+        let dst_stages = dst_stages.translate_special_bits();
+
+        let access_overlap = effects.access & src_access;
+        let stages_overlap = effects.stages & src_stages;
+
+        if !access_overlap.is_empty() || !stages_overlap.is_empty() {
+            let dst_index;
+            let mut barrier_index = None;
+            // TODO some heuristic where we replace inefficient barriers with events?
+            if let Some(barrier) = effects.last_barrier.get() {
+                let (dst_end, barrier) = &mut submission.barriers[barrier as usize];
+                barrier.src_stages |= stages_overlap;
+                barrier.src_access |= access_overlap;
+                barrier.dst_stages |= dst_stages;
+                barrier.dst_access |= dst_access;
+
+                dst_index = *dst_end;
+            } else {
+                let index: u32 = submission.barriers.len().try_into().unwrap();
+                effects.last_barrier.set(Some(index));
+                submission.barriers.push((
+                    dst_pass,
+                    SimpleBarrier {
+                        src_stages: stages_overlap,
+                        src_access: access_overlap,
+                        dst_stages,
+                        dst_access,
+                    },
+                ));
+                barrier_index = Some(index);
+                dst_index = dst_pass;
+            }
+
+            // TODO verify this logic, it seems flaky
+            // update unsynchronized effects masks
+            for effect in &mut submission.pass_effects[0..dst_index.index()] {
+                if effect.access.intersects(access_overlap)
+                    || effect.stages.intersects(stages_overlap)
+                {
+                    effect.access &= !access_overlap;
+                    effect.stages &= !stages_overlap;
+                    // do we want to always overwrite barriers?
+                    if let Some(index) = barrier_index {
+                        effect.last_barrier.set(Some(index));
+                    }
+                }
+            }
+        }
+    }
+    fn layout_transition(&mut self, image: GraphImage, src_dst_layout: Range<vk::ImageLayout>) {
+        let submission = self.get_current_submission_mut();
+        let dst_pass = submission.get_current_submission_pass();
+        submission.special_barriers.push((
+            dst_pass,
+            SpecialBarrier::LayoutTransition {
+                image,
+                src_layout: src_dst_layout.start,
+                dst_layout: src_dst_layout.end,
+            },
+        ));
+    }
+    // we require finer handling than this function
+    // fn ownership_transition<T: ResourceMarker>(
+    //     &mut self,
+    //     src_submission: GraphSubmission,
+    //     src_submission_pass: SubmissionPass,
+    //     raw_resource_handle: RawHandle,
+    // ) {
+    //     let current_queue = self.current_queue.unwrap().1;
+    //     let dst_submission = &mut self.queues[current_queue.index()];
+    //     let dst_queue_family = self.graph.get_queue_family(current_queue);
+    //     let dst_pass = dst_submission.get_current_submission_pass();
+
+    //     let src_submission = &mut self.submissions[src_submission.index()];
+    //     let src_queue_family = self.graph.get_queue_family(src_submission.queue);
+    //     let src_pass = SubmissionPass(
+    //         // we add one to this, because we want the ownership to be released after the src pass
+    //         src_submission_pass.0 + 1,
+    //     );
+
+    //     if T::IS_IMAGE {
+    //         let barrier = SpecialBarrier::ImageOwnershipTransition {
+    //             image: GraphImage::from_raw(raw_resource_handle),
+    //             src_family: src_queue_family,
+    //             dst_family: dst_queue_family,
+    //         };
+    //         dst_submission
+    //             .special_barriers
+    //             .push((dst_pass, barrier.clone()));
+    //         src_submission.special_barriers.push((src_pass, barrier));
+    //     } else {
+    //         let barrier = SpecialBarrier::BufferOwnershipTransition {
+    //             buffer: GraphBuffer::from_raw(raw_resource_handle),
+    //             src_family: src_queue_family,
+    //             dst_family: dst_queue_family,
+    //         };
+    //         dst_submission
+    //             .special_barriers
+    //             .push((dst_pass, barrier.clone()));
+    //         src_submission.special_barriers.push((src_pass, barrier));
+    //     }
+    // }
+    fn close_current_submission(&mut self) {
+        self.__close_submission(self.current_queue.unwrap().1);
+        self.current_queue = None;
+    }
+    fn __close_submission(&mut self, queue: GraphQueue) -> Option<GraphSubmission> {
+        let submission = &mut self.queues[queue.index()];
+        if submission.passes.is_empty() {
+            // sanity check
+            assert!(submission.barriers.is_empty());
+            assert!(submission.special_barriers.is_empty());
+            assert!(submission.semaphore_dependencies.is_empty());
+
+            None
+        } else {
+            let index: u32 = self.submissions.len().try_into().unwrap();
+            let submission_index = OptionalU32::new_some(index);
+            for (i, &p) in (0u32..).zip(&submission.passes) {
+                let meta = self.graph.get_pass_meta(p);
+                assert!(meta.scheduled_submission.get().is_none());
+                meta.scheduled_submission.set(submission_index);
+                meta.scheduled_submission_position
+                    .set(OptionalU32::new_some(i));
+            }
+
+            let finished = submission.finish(self.current_queue.unwrap().1);
+            self.submissions.push(finished);
+
+            Some(GraphSubmission(index))
+        }
+    }
+    fn finish(mut self) -> Vec<Submission> {
+        // cleanup all open submissions, order doesn't matter since they're leaf nodes
+        for queue in 0..self.queues.len() {
+            self.__close_submission(GraphQueue::new(queue));
+        }
+        self.submissions
     }
 }
