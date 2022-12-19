@@ -941,13 +941,6 @@ impl Graph {
 
             let mut recorder = RefCell::new(SubmissionRecorder::new(self));
 
-            // TODO pack this into 32 bits
-            #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-            enum GraphResource {
-                Image(GraphImage),
-                Buffer(GraphBuffer),
-            }
-
             // some random buffers extracted here to keep the allocations
             let mut waitfor_submissions: Vec<GraphSubmission> = Vec::new();
             let mut waitfor_resources: Vec<GraphResource> = Vec::new();
@@ -1145,223 +1138,36 @@ impl Graph {
                             }
                         };
                         let timeline_pass = e.to_timeline_pass().unwrap();
-                        let dst_pass = recorder.borrow_mut().begin_pass(timeline_pass, p, on_end);
+                        let submission_pass =
+                            recorder.borrow_mut().begin_pass(timeline_pass, p, on_end);
 
                         let pass_position = TimelinePass::new(timeline_i);
                         let data = self.get_pass_data(p);
                         let queue = data.queue;
-                        let dst_queue_family = self.get_queue_family(queue);
+                        let queue_family = self.get_queue_family(queue);
 
                         for (i, img) in data.images.iter().enumerate() {
-                            let raw_image = img.handle.to_raw();
-                            let resource_handle = GraphResource::Image(img.handle);
-                            let &mut (ref mut state, concurrent) = &mut image_rw[i];
+                            self.emit_barriers::<ImageMarker>(
+                                p,
+                                submission_pass,
+                                queue_family,
+                                img,
+                                &recorder,
+                                &mut *image_rw,
+                                &mut queue_family_accesses,
+                            );
+                        }
 
-                            let mut dst_writes = img.access.contains_write();
-                            let dst_touch = PassTouch {
-                                pass: p,
-                                access: img.access,
-                                stages: img.stages,
-                            };
-                            let dst_layout = ImageMarker::maybe_extract_start_layout(img);
-
-                            let normal_state = || ResourceState::Normal {
-                                layout: dst_layout,
-                                queue_family: dst_queue_family,
-                                access: smallvec![dst_touch],
-                            };
-
-                            match state {
-                                // no dependency
-                                ResourceState::Uninit => {
-                                    *state = normal_state();
-                                }
-                                // if the current access only needs to read, add it to the readers (and handle layout transitions)
-                                // otherwise synchronize against all passes and transition to normal state
-                                ResourceState::MoveDst { parts } => {
-                                    assert!(ImageMarker::IS_IMAGE, "Only images  can be moved");
-
-                                    let parts = parts.get_mut();
-                                    for (part, part_i) in parts.iter_mut().zip(0u32..) {
-                                        let (src_touch, src_layout, move_src) = part.clone();
-
-                                        let mut synchronized = false;
-                                        let mut synchronize = || {
-                                            if !synchronized {
-                                                let (touch, src_layout, move_src) = part;
-                                                // we need the previous access to finish before we can transition the layout
-                                                recorder.borrow_mut().add_dependency(
-                                                    touch.pass,
-                                                    touch.access,
-                                                    touch.stages,
-                                                    img.access,
-                                                    img.stages,
-                                                );
-                                                synchronized = true;
-                                                touch.access = vk::AccessFlags2KHR::empty();
-                                            }
-                                        };
-
-                                        if dst_writes {
-                                            synchronize();
-                                            dst_writes = true;
-                                        }
-
-                                        if dst_layout != vk::ImageLayout::UNDEFINED
-                                            && dst_layout != src_layout
-                                        {
-                                            synchronize();
-                                            dst_writes = true;
-                                            recorder.borrow_mut().layout_transition(
-                                                move_src,
-                                                src_layout..dst_layout,
-                                            );
-                                        }
-
-                                        // queue family ownership transition
-                                        let data = self.get_pass_data(src_touch.pass);
-                                        let src_queue_family = self.get_queue_family(data.queue);
-                                        // 1. concurrent images do not need ownership transition
-                                        // 2. if we do not need the contents of the resource (=layout UNDEFINED), we can simply ignore the transfer
-                                        //   https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#synchronization-queue-transfers
-                                        // 3. no transfer is neccessary if both accesses are on the same queue
-                                        if !concurrent
-                                            && dst_layout != vk::ImageLayout::UNDEFINED
-                                            && src_queue_family != dst_queue_family
-                                        {
-                                            synchronize();
-                                            dst_writes = true;
-                                            // ownership release and acquire is handled when the current submission is closed, push some data that
-                                            // we want to acquire ownership from src_queue_family
-
-                                            // find the vector of pending acquires for the src queue
-                                            let (_, entry) = queue_family_accesses
-                                                .iter_mut()
-                                                .find(|(f, _)| *f == src_queue_family)
-                                                .unwrap();
-
-                                            let src_meta = self.get_pass_meta(src_touch.pass);
-                                            let submission = GraphSubmission(
-                                                src_meta.scheduled_submission.get().get().unwrap(),
-                                            );
-                                            let pass = SubmissionPass(
-                                                src_meta
-                                                    .scheduled_submission_position
-                                                    .get()
-                                                    .get()
-                                                    .unwrap(),
-                                            );
-
-                                            entry.push((
-                                                submission,
-                                                pass,
-                                                dst_pass,
-                                                GraphResource::Image(move_src),
-                                            ));
-                                        }
-                                    }
-
-                                    let mut recorder = recorder.borrow_mut();
-
-                                    // ???
-                                    if dst_writes {
-                                        *state = normal_state();
-                                    } else {
-                                        // TODO verify this, seems flaky
-                                        parts.retain(|p| !p.0.access.is_empty());
-                                        // using img.handle is dubious
-                                        parts.push((dst_touch, dst_layout, img.handle));
-                                    }
-                                }
-                                &mut ResourceState::Normal {
-                                    layout: ref mut src_layout,
-                                    queue_family: ref mut src_queue_family,
-                                    ref mut access,
-                                } => {
-                                    let mut synchronized = false;
-                                    let mut synchronize = || {
-                                        if !synchronized {
-                                            for touch in &*access {
-                                                // we need the previous access to finish before we can transition the layout
-                                                recorder.borrow_mut().add_dependency(
-                                                    touch.pass,
-                                                    touch.access,
-                                                    touch.stages,
-                                                    img.access,
-                                                    img.stages,
-                                                );
-                                                synchronized = true;
-                                            }
-                                        }
-                                    };
-
-                                    if dst_writes {
-                                        synchronize();
-                                    }
-
-                                    let image_undefined = ImageMarker::IS_IMAGE
-                                        && dst_layout == vk::ImageLayout::UNDEFINED;
-
-                                    // layout transition
-                                    if !image_undefined && dst_layout != *src_layout {
-                                        synchronize();
-                                        dst_writes = true;
-                                        recorder
-                                            .borrow_mut()
-                                            .layout_transition(img.handle, *src_layout..dst_layout);
-                                        *src_layout = dst_layout;
-                                    }
-
-                                    // queue family ownership transition
-                                    if !image_undefined
-                                        && !concurrent
-                                        && *src_queue_family != self.get_queue_family(data.queue)
-                                    {
-                                        synchronize();
-                                        dst_writes = true;
-
-                                        // ownership release and acquire is handled when the current submission is closed, push some data that
-                                        // we want to acquire ownership from src_queue_family
-
-                                        // find the vector of pending acquires for the src queue
-                                        let (_, entry) = queue_family_accesses
-                                            .iter_mut()
-                                            .find(|(f, _)| *f == *src_queue_family)
-                                            .unwrap();
-
-                                        for src_touch in &*access {
-                                            let src_meta = self.get_pass_meta(src_touch.pass);
-                                            let submission = GraphSubmission(
-                                                src_meta.scheduled_submission.get().get().unwrap(),
-                                            );
-                                            let pass = SubmissionPass(
-                                                src_meta
-                                                    .scheduled_submission_position
-                                                    .get()
-                                                    .get()
-                                                    .unwrap(),
-                                            );
-
-                                            entry.push((
-                                                submission,
-                                                pass,
-                                                dst_pass,
-                                                resource_handle,
-                                            ));
-
-                                            *src_queue_family = dst_queue_family;
-                                        }
-                                    }
-
-                                    if dst_writes {
-                                        // already synchronized
-                                        access.clear();
-                                    }
-                                    access.push(dst_touch);
-                                }
-                                // TODO perhaps this shouldn't be a hard error and instead delegate access to the move destination
-                                ResourceState::Moved => panic!("Attempt to access moved resource"),
-                            }
+                        for (i, buf) in data.buffers.iter().enumerate() {
+                            self.emit_barriers::<BufferMarker>(
+                                p,
+                                submission_pass,
+                                queue_family,
+                                buf,
+                                &recorder,
+                                &mut *buffer_rw,
+                                &mut queue_family_accesses,
+                            );
                         }
 
                         // apply image moves
@@ -1372,7 +1178,7 @@ impl Graph {
                             let data = &self.moves[mov.index()];
 
                             let mut new_parts: SmallVec<
-                                [(PassTouch, vk::ImageLayout, GraphImage); 4],
+                                [(PassTouch, TypeSome<vk::ImageLayout>, GraphImage); 4],
                             > = SmallVec::new();
 
                             for &i in &data.from {
@@ -1615,6 +1421,217 @@ impl Graph {
         // cargo test --quiet -- graph::test_graph --nocapture && cat target/test.dot | dot -Tpng -o target/out.png
         // self.write_dot_representation(&submissions, &mut file);
         // Self::write_submissions_dot_representation(&submissions, &mut file);
+    }
+
+    fn emit_barriers<T: ResourceMarker>(
+        &self,
+        pass: GraphPass,
+        dst_pass: SubmissionPass,
+        dst_queue_family: u32,
+        resource_data: &T::Data,
+        recorder: &RefCell<SubmissionRecorder>,
+        resource_rw: &mut [(ResourceState<T>, bool)],
+        queue_family_accesses: &mut [(
+            u32,
+            Vec<(
+                GraphSubmission,
+                SubmissionPass,
+                SubmissionPass,
+                GraphResource,
+            )>,
+        )],
+    ) where
+        T::IfImage<vk::ImageLayout>: Copy,
+    {
+        let raw_resource_handle = resource_data.raw_resource_handle();
+        let resource_handle = if T::IS_IMAGE {
+            GraphResource::Image(GraphImage(raw_resource_handle.0))
+        } else {
+            GraphResource::Buffer(GraphBuffer(raw_resource_handle.0))
+        };
+        let &mut (ref mut state, concurrent) = &mut resource_rw[raw_resource_handle.index()];
+        let dst_touch = PassTouch {
+            pass,
+            access: resource_data.access(),
+            stages: resource_data.stages(),
+        };
+        let mut dst_writes = dst_touch.access.contains_write();
+        let dst_layout = T::when_image(|| resource_data.start_layout());
+        let normal_state = || ResourceState::Normal {
+            layout: dst_layout.clone(),
+            queue_family: dst_queue_family,
+            access: smallvec![dst_touch],
+        };
+        match state {
+            // no dependency
+            ResourceState::Uninit => {
+                *state = normal_state();
+            }
+            // if the current access only needs to read, add it to the readers (and handle layout transitions)
+            // otherwise synchronize against all passes and transition to normal state
+            ResourceState::MoveDst { parts } => {
+                assert!(ImageMarker::IS_IMAGE, "Only images  can be moved");
+                let dst_layout = dst_layout.take();
+                let parts = parts.get_mut();
+                for (part, part_i) in parts.iter_mut().zip(0u32..) {
+                    let (src_touch, src_layout, move_src) = (part.0, part.1.take(), part.2);
+
+                    let mut synchronized = false;
+                    let mut synchronize = || {
+                        if !synchronized {
+                            let (touch, src_layout, move_src) = part;
+                            // we need the previous access to finish before we can transition the layout
+                            recorder.borrow_mut().add_dependency(
+                                touch.pass,
+                                touch.access,
+                                touch.stages,
+                                dst_touch.access,
+                                dst_touch.stages,
+                            );
+                            synchronized = true;
+                            touch.access = vk::AccessFlags2KHR::empty();
+                        }
+                    };
+
+                    if dst_writes {
+                        synchronize();
+                        dst_writes = true;
+                    }
+
+                    if dst_layout != vk::ImageLayout::UNDEFINED && dst_layout != src_layout {
+                        synchronize();
+                        dst_writes = true;
+                        recorder
+                            .borrow_mut()
+                            .layout_transition(move_src, src_layout..dst_layout);
+                    }
+
+                    // queue family ownership transition
+                    let data = self.get_pass_data(src_touch.pass);
+                    let src_queue_family = self.get_queue_family(data.queue);
+                    // 1. concurrent images do not need ownership transition
+                    // 2. if we do not need the contents of the resource (=layout UNDEFINED), we can simply ignore the transfer
+                    //   https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#synchronization-queue-transfers
+                    // 3. no transfer is neccessary if both accesses are on the same queue
+                    if !concurrent
+                        && dst_layout != vk::ImageLayout::UNDEFINED
+                        && src_queue_family != dst_queue_family
+                    {
+                        synchronize();
+                        dst_writes = true;
+                        // ownership release and acquire is handled when the current submission is closed, push some data that
+                        // we want to acquire ownership from src_queue_family
+
+                        // find the vector of pending acquires for the src queue
+                        let (_, entry) = queue_family_accesses
+                            .iter_mut()
+                            .find(|(f, _)| *f == src_queue_family)
+                            .unwrap();
+
+                        let src_meta = self.get_pass_meta(src_touch.pass);
+                        let submission =
+                            GraphSubmission(src_meta.scheduled_submission.get().get().unwrap());
+                        let pass = SubmissionPass(
+                            src_meta.scheduled_submission_position.get().get().unwrap(),
+                        );
+
+                        entry.push((submission, pass, dst_pass, GraphResource::Image(move_src)));
+                    }
+                }
+
+                let mut recorder = recorder.borrow_mut();
+
+                // ???
+                if dst_writes {
+                    *state = normal_state();
+                } else {
+                    // TODO verify this, seems flaky
+                    parts.retain(|p| !p.0.access.is_empty());
+                    // using img.handle is dubious
+                    parts.push((
+                        dst_touch,
+                        T::when_image(|| dst_layout),
+                        GraphImage(raw_resource_handle.0),
+                    ));
+                }
+            }
+            &mut ResourceState::Normal {
+                layout: ref mut src_layout,
+                queue_family: ref mut src_queue_family,
+                ref mut access,
+            } => {
+                let mut synchronized = false;
+                let mut synchronize = || {
+                    if !synchronized {
+                        for touch in &*access {
+                            // we need the previous access to finish before we can transition the layout
+                            recorder.borrow_mut().add_dependency(
+                                touch.pass,
+                                touch.access,
+                                touch.stages,
+                                dst_touch.access,
+                                dst_touch.stages,
+                            );
+                            synchronized = true;
+                        }
+                    }
+                };
+
+                if dst_writes {
+                    synchronize();
+                }
+
+                let image_undefined =
+                    ImageMarker::IS_IMAGE && dst_layout.take() == vk::ImageLayout::UNDEFINED;
+
+                // layout transition
+                if !image_undefined && dst_layout.take() != src_layout.take() {
+                    synchronize();
+                    dst_writes = true;
+                    recorder.borrow_mut().layout_transition(
+                        GraphImage(raw_resource_handle.0),
+                        src_layout.take()..dst_layout.take(),
+                    );
+                    *src_layout = dst_layout;
+                }
+
+                // queue family ownership transition
+                if !image_undefined && !concurrent && *src_queue_family != dst_queue_family {
+                    synchronize();
+                    dst_writes = true;
+
+                    // ownership release and acquire is handled when the current submission is closed, push some data that
+                    // we want to acquire ownership from src_queue_family
+
+                    // find the vector of pending acquires for the src queue
+                    let (_, entry) = queue_family_accesses
+                        .iter_mut()
+                        .find(|(f, _)| *f == *src_queue_family)
+                        .unwrap();
+
+                    for src_touch in &*access {
+                        let src_meta = self.get_pass_meta(src_touch.pass);
+                        let submission =
+                            GraphSubmission(src_meta.scheduled_submission.get().get().unwrap());
+                        let pass = SubmissionPass(
+                            src_meta.scheduled_submission_position.get().get().unwrap(),
+                        );
+
+                        entry.push((submission, pass, dst_pass, resource_handle));
+
+                        *src_queue_family = dst_queue_family;
+                    }
+                }
+
+                if dst_writes {
+                    // already synchronized
+                    access.clear();
+                }
+                access.push(dst_touch);
+            }
+            // TODO perhaps this shouldn't be a hard error and instead delegate access to the move destination
+            ResourceState::Moved => panic!("Attempt to access moved resource"),
+        }
     }
     fn write_dot_representation(
         &mut self,
@@ -2504,56 +2521,110 @@ trait TypeOption<T> {
     fn take(self) -> T;
 }
 
-#[derive(Clone)]
 struct TypeSome<T>(T);
 impl<T> TypeOption<T> for TypeSome<T> {
-    #[inline]
+    #[inline(always)]
     fn get(&self) -> &T {
         &self.0
     }
-    #[inline]
+    #[inline(always)]
     fn get_mut(&mut self) -> &mut T {
         &mut self.0
     }
-    #[inline]
+    #[inline(always)]
     fn take(self) -> T {
         self.0
     }
 }
+impl<T: Clone> Clone for TypeSome<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+impl<T: Copy> Copy for TypeSome<T> {}
 
-#[derive(Clone)]
 struct TypeNone<T>(std::marker::PhantomData<fn() -> T>);
 impl<T> TypeOption<T> for TypeNone<T> {
-    #[inline]
+    #[inline(always)]
     fn get(&self) -> &T {
         unreachable!()
     }
-    #[inline]
+    #[inline(always)]
     fn get_mut(&mut self) -> &mut T {
         unreachable!()
     }
-    #[inline]
+    #[inline(always)]
     fn take(self) -> T {
         unreachable!()
+    }
+}
+impl<T> Clone for TypeNone<T> {
+    fn clone(&self) -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+impl<T> Copy for TypeNone<T> {}
+
+trait ResourceData {
+    fn access(&self) -> vk::AccessFlags2KHR;
+    fn stages(&self) -> vk::PipelineStageFlags2KHR;
+    fn start_layout(&self) -> vk::ImageLayout;
+    fn raw_resource_handle(&self) -> RawHandle;
+    fn end_layout(&self) -> Option<vk::ImageLayout>;
+}
+
+impl ResourceData for PassImageData {
+    #[inline(always)]
+    fn access(&self) -> vk::AccessFlags2KHR {
+        self.access
+    }
+    #[inline(always)]
+    fn stages(&self) -> vk::PipelineStageFlags2KHR {
+        self.stages
+    }
+    #[inline(always)]
+    fn start_layout(&self) -> vk::ImageLayout {
+        self.start_layout
+    }
+    #[inline(always)]
+    fn raw_resource_handle(&self) -> RawHandle {
+        self.handle.to_raw()
+    }
+    #[inline(always)]
+    fn end_layout(&self) -> Option<vk::ImageLayout> {
+        self.end_layout
+    }
+}
+
+impl ResourceData for PassBufferData {
+    #[inline(always)]
+    fn access(&self) -> vk::AccessFlags2KHR {
+        self.access
+    }
+    #[inline(always)]
+    fn stages(&self) -> vk::PipelineStageFlags2KHR {
+        self.stages
+    }
+    #[inline(always)]
+    fn start_layout(&self) -> vk::ImageLayout {
+        unreachable!("This code path should never be taken!")
+    }
+    #[inline(always)]
+    fn raw_resource_handle(&self) -> RawHandle {
+        self.handle.to_raw()
+    }
+    #[inline(always)]
+    fn end_layout(&self) -> Option<vk::ImageLayout> {
+        unreachable!("This code path should never be taken!")
     }
 }
 
 trait ResourceMarker {
     const IS_IMAGE: bool;
 
-    type IfImage<T: Clone>: TypeOption<T> + Clone;
-    type MaybeLayout: Default + Clone;
-
-    #[inline(always)]
-    fn to_maybe_layout(layout: vk::ImageLayout) -> Self::MaybeLayout;
-    #[inline(always)]
-    fn from_maybe_layout(layout: Self::MaybeLayout) -> vk::ImageLayout;
-
-    type Data;
-    #[inline(always)]
-    fn maybe_extract_start_layout(data: &Self::Data) -> Self::MaybeLayout;
-    #[inline(always)]
-    fn maybe_extract_end_layout(data: &Self::Data) -> Option<Self::MaybeLayout>;
+    type IfImage<T>: TypeOption<T>;
+    fn when_image<T, F: FnOnce() -> T>(fun: F) -> Self::IfImage<T>;
+    type Data: ResourceData;
 }
 
 #[derive(Clone, Default)]
@@ -2561,26 +2632,11 @@ struct ImageMarker;
 impl ResourceMarker for ImageMarker {
     const IS_IMAGE: bool = true;
 
-    type IfImage<T: Clone> = TypeSome<T>;
-    type MaybeLayout = vk::ImageLayout;
-
-    #[inline(always)]
-    fn to_maybe_layout(layout: vk::ImageLayout) -> Self::MaybeLayout {
-        layout
-    }
-    #[inline(always)]
-    fn from_maybe_layout(layout: Self::MaybeLayout) -> vk::ImageLayout {
-        layout
-    }
-
+    type IfImage<T> = TypeSome<T>;
     type Data = PassImageData;
-    #[inline(always)]
-    fn maybe_extract_start_layout(data: &Self::Data) -> Self::MaybeLayout {
-        data.start_layout
-    }
-    #[inline(always)]
-    fn maybe_extract_end_layout(data: &Self::Data) -> Option<Self::MaybeLayout> {
-        data.end_layout
+
+    fn when_image<T, F: FnOnce() -> T>(fun: F) -> Self::IfImage<T> {
+        TypeSome(fun())
     }
 }
 
@@ -2589,22 +2645,11 @@ struct BufferMarker;
 impl ResourceMarker for BufferMarker {
     const IS_IMAGE: bool = false;
 
-    type IfImage<T: Clone> = TypeNone<T>;
-    type MaybeLayout = ();
+    type IfImage<T> = TypeNone<T>;
+    type Data = PassBufferData;
 
-    #[inline(always)]
-    fn to_maybe_layout(layout: vk::ImageLayout) -> Self::MaybeLayout {}
-    #[inline(always)]
-    fn from_maybe_layout(layout: Self::MaybeLayout) -> vk::ImageLayout {
-        vk::ImageLayout::UNDEFINED
-    }
-
-    type Data = PassImageData;
-    #[inline(always)]
-    fn maybe_extract_start_layout(data: &Self::Data) -> Self::MaybeLayout {}
-    #[inline(always)]
-    fn maybe_extract_end_layout(data: &Self::Data) -> Option<Self::MaybeLayout> {
-        None
+    fn when_image<T, F: FnOnce() -> T>(fun: F) -> Self::IfImage<T> {
+        TypeNone(std::marker::PhantomData)
     }
 }
 
@@ -2620,11 +2665,11 @@ enum ResourceState<T: ResourceMarker> {
     Uninit,
     MoveDst {
         // (count of image array layers sharing the layout, layout, the move src)
-        parts: T::IfImage<SmallVec<[(PassTouch, T::MaybeLayout, GraphImage); 4]>>,
+        parts: T::IfImage<SmallVec<[(PassTouch, T::IfImage<vk::ImageLayout>, GraphImage); 4]>>,
     },
     Normal {
         // TODO perhaps store whether this resource is SHARING_MODE_CONCURRENT
-        layout: T::MaybeLayout,
+        layout: T::IfImage<vk::ImageLayout>,
         queue_family: u32,
         access: SmallVec<[PassTouch; 8]>,
     },
@@ -2635,6 +2680,13 @@ impl<T: ResourceMarker> Default for ResourceState<T> {
     fn default() -> Self {
         Self::Uninit
     }
+}
+
+// TODO pack this into 32 bits
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum GraphResource {
+    Image(GraphImage),
+    Buffer(GraphBuffer),
 }
 
 #[derive(Clone)]
