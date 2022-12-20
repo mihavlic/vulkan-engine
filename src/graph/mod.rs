@@ -1,3 +1,5 @@
+mod reverse_edges;
+
 use std::{
     borrow::{Borrow, Cow},
     cell::{Cell, RefCell},
@@ -18,10 +20,13 @@ use smallvec::{smallvec, SmallVec};
 use crate::{
     arena::uint::{Config, OptionalU32, PackedUint},
     context::device::{Device, OwnedDevice, __test_init_device},
+    graph::reverse_edges::{reverse_edges_into, ChildRelativeKey, NodeKey},
     object::{self, ImageCreateInfo, Object},
     submission, token_abuse,
     util::{self, format_utils::Fun, macro_abuse::WeirdFormatter},
 };
+
+use self::reverse_edges::{ImmutableGraph, NodeGraph};
 
 pub trait RenderPass: 'static {
     fn prepare(&mut self);
@@ -65,8 +70,6 @@ impl<T: RenderPass> ObjectSafePass for StoredPass<T> {
 #[derive(Clone)]
 struct PassMeta {
     alive: Cell<bool>,
-    children_start: Cell<u32>,
-    children_end: Cell<u32>,
     scheduled_submission: Cell<OptionalU32>,
     scheduled_submission_position: Cell<OptionalU32>,
     queue_intervals: Cell<QueueIntervals>,
@@ -193,10 +196,11 @@ pub struct Graph {
     image_meta: Vec<ImageMeta>,
     buffer_meta: Vec<BufferMeta>,
 
+    pass_children: ImmutableGraph,
+
     physical_images: Vec<PhysicalImage>,
     physical_buffers: Vec<PhysicalBufferData>,
 
-    pass_children: Vec<GraphPass>,
     device: OwnedDevice,
 }
 
@@ -212,9 +216,9 @@ impl Graph {
             pass_meta: Vec::new(),
             image_meta: Vec::new(),
             buffer_meta: Vec::new(),
+            pass_children: Default::default(),
             physical_images: Vec::new(),
             physical_buffers: Vec::new(),
-            pass_children: Vec::new(),
             device,
         }
     }
@@ -265,7 +269,6 @@ impl Graph {
         self.passes.clear();
         self.images.clear();
         self.buffers.clear();
-        self.pass_children.clear();
     }
     fn prepare_meta(&mut self) {
         self.pass_meta.clear();
@@ -278,8 +281,6 @@ impl Graph {
             len,
             PassMeta {
                 alive: Cell::new(false),
-                children_start: Cell::new(0),
-                children_end: Cell::new(0),
                 scheduled_submission_position: Cell::new(OptionalU32::NONE),
                 scheduled_submission: Cell::new(OptionalU32::NONE),
                 queue_intervals: Cell::new(QueueIntervals::NONE),
@@ -350,7 +351,14 @@ impl Graph {
     }
     fn get_children(&self, pass: GraphPass) -> &[GraphPass] {
         let meta = &self.pass_meta[pass.index()];
-        &self.pass_children[meta.children_start.get() as usize..meta.children_end.get() as usize]
+        let children = self.pass_children.get_children(pass.0);
+        // sound because handles are repr(transparent)
+        unsafe {
+            std::slice::from_raw_parts::<'_, GraphPass>(
+                children.as_ptr() as *const GraphPass,
+                children.len(),
+            )
+        }
     }
     fn get_dependencies(&self, pass: GraphPass) -> &[PassDependency] {
         &self.passes[pass.index()].dependencies
@@ -612,51 +620,37 @@ impl Graph {
             }
         }
 
-        // collect the dependees of alive passes in 3 phases:
-        // 1. iterate over all passes, extract their dependencies, and from this count the number of dependees (kept in the dependees_start field)
-        // 2. prefix sum over the passes, allocating space in a single vector, offset into which is stored in dependees_start,
-        //    dependees_end now serves as the counter of pushed dependees (the previous count in dependees_start is not needed anymore)
-        // 3. iterate over all passes, extract their dependencies, and store them in the allocated space, dependees_end now points at the end
-        {
-            // 1.
-            for p in self.get_alive_passes() {
-                let pass = &self.passes[p.index()];
-                for d in &pass.dependencies {
-                    let dependees_start = &self.pass_meta[d.index()].children_start;
-                    dependees_start.set(dependees_start.get() + 1);
-                }
+        struct GraphFacade<'a>(&'a Graph, ());
+        impl<'a> NodeGraph for GraphFacade<'a> {
+            type NodeData = ();
+
+            fn node_count(&self) -> usize {
+                self.0.passes.len()
             }
-
-            // 2.
-            let mut offset = 0;
-            for p in self.get_alive_passes() {
-                // dependees_start currently stores the count of dependees
-                let meta = &self.pass_meta[p.index()];
-                let end = offset + meta.children_start.get();
-
-                // start and end are the same on purpose
-                meta.children_start.set(offset);
-                meta.children_end.set(offset);
-
-                offset = end;
+            fn nodes(&self) -> Range<NodeKey> {
+                0..self.0.passes.len() as u32
             }
-
-            // borrowchk woes
-            let mut dependees = std::mem::take(&mut self.pass_children);
-            dependees.resize(offset as usize, GraphPass::new(0));
-
-            // 3.
-            for p in self.get_alive_passes() {
-                let pass = &self.passes[p.index()];
-                for d in &pass.dependencies {
-                    let offset = &self.pass_meta[d.index()].children_end;
-                    dependees[offset.get() as usize] = p;
-                    offset.set(offset.get() + 1);
-                }
+            fn children(&self, this: NodeKey) -> Range<ChildRelativeKey> {
+                0..self.0.passes[this as usize].dependencies.len() as u32
             }
-
-            let _ = std::mem::replace(&mut self.pass_children, dependees);
+            fn get_child(&self, this: NodeKey, child: ChildRelativeKey) -> NodeKey {
+                self.0.passes[this as usize].dependencies[child as usize]
+                    .get_pass()
+                    .0
+            }
+            fn get_node_data(&self, this: NodeKey) -> &Self::NodeData {
+                &()
+            }
+            fn get_node_data_mut(&mut self, this: NodeKey) -> &mut Self::NodeData {
+                &mut self.1
+            }
         }
+
+        // collect the dependees of alive passes (edges going other way than dependencies)
+        let mut graph = std::mem::take(&mut self.pass_children);
+        let facade = GraphFacade(self, ());
+        reverse_edges_into(&facade, &mut graph);
+        std::mem::replace(&mut self.pass_children, graph);
 
         // do a greedy graph traversal where nodes with a larger priority will be selected first
         // at this point this is essentially just a bfs
@@ -1217,14 +1211,14 @@ impl Graph {
             self.get_last_resource_usage(&buffer_last_state, &mut scratch);
 
         let mut file = OpenOptions::new()
-            .write(true) // <--------- this
+            .write(true)
             .create(true)
             .truncate(true)
             .open("target/test.dot")
             .unwrap();
 
         // cargo test --quiet -- graph::test_graph --nocapture && cat target/test.dot | dot -Tpng -o target/out.png
-        // self.write_dot_representation(&submissions, &mut file);
+        self.write_dot_representation(&submissions, &mut file);
         // Self::write_submissions_dot_representation(&submissions, &mut file);
     }
 
@@ -1500,7 +1494,7 @@ impl Graph {
     }
     fn write_dot_representation(
         &mut self,
-        submissions: &Vec<(GraphQueue, Submission)>,
+        submissions: &Vec<Submission>,
         writer: &mut dyn std::io::Write,
     ) {
         let clusters = Fun::new(|w| {
@@ -1521,8 +1515,8 @@ impl Graph {
             let queue_submitions = |queue_index: usize| {
                 submissions
                     .iter()
-                    .filter(move |(qr, _)| qr.index() == queue_index)
-                    .flat_map(|(_, s)| &s.passes)
+                    .filter(move |sub| sub.queue.index() == queue_index)
+                    .flat_map(|sub| &sub.passes)
                     .cloned()
             };
 
@@ -1531,9 +1525,9 @@ impl Graph {
             //     p0[label="#0"];
             //     p1[label="#1"];
             // }
-            for (i, (q, s)) in submissions.iter().enumerate() {
+            for (i, sub) in submissions.iter().enumerate() {
                 let nodes = Fun::new(|w| {
-                    for &p in &s.passes {
+                    for &p in &sub.passes {
                         write!(
                             w,
                             r#"p{}[label="{}"];"#,
@@ -1636,7 +1630,7 @@ impl Graph {
                         if !dep.is_hard() {
                             write!(w, "[color=darkgray]");
                         }
-                        writeln!(w, ";");
+                        write!(w, ";");
                     }
                 }
             }
@@ -2192,6 +2186,7 @@ macro_rules! simple_handle {
     ($($visibility:vis $name:ident),+) => {
         $(
             #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+            #[repr(transparent)]
             $visibility struct $name(u32);
             impl $name {
                 fn new(index: usize) -> Self {
