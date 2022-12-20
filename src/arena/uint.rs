@@ -77,6 +77,14 @@ impl<T: UInt> Optional<T> {
         }
     }
     #[inline]
+    pub fn unwrap(&self) -> T {
+        if self.0 == T::MAX {
+            panic!("Tried unwrapping a None value")
+        } else {
+            self.0
+        }
+    }
+    #[inline]
     pub fn is_some(&self) -> bool {
         self.0 != T::MAX
     }

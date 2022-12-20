@@ -855,7 +855,7 @@ impl Graph {
 
         // separate the scheduled passes into specific submissions
         // this is a greedy process, but due to the previous scheduling it should yield somewhat decent results
-        let submissions = {
+        let (submissions, image_last_state, buffer_last_state) = {
             let mut image_rw: Vec<(ResourceState<ImageMarker>, bool)> =
                 vec![(ResourceState::default(), false); self.images.len()];
             let mut buffer_rw: Vec<(ResourceState<BufferMarker>, bool)> =
@@ -1193,8 +1193,29 @@ impl Graph {
                     submission.semaphore_dependencies = reduced_dependencies;
                 }
             }
-            submissions
+
+            (submissions, image_rw, buffer_rw)
         };
+
+        // now we start assigning physical resources to those we've just created
+        // we only own the backing memory of transient resources, so we only need to consider those
+        // moved source-resources do not count
+
+        // the ResourceState objects should track the last relevant access to the resources, after a pass
+        // has synchronized with all of these accesses, we can safely reuse their memory
+
+        // the assignment will have multiple phases:
+        // 1. try to find a dead resource with a compatible format/extent/usage...
+        // 2. pick a piece of free memory (including that which backs dead resources), remove the dead resource completely, and use its memory
+        // 3. if we've exhausted some memory limit, abort, free all resources, and allocate linearly without fragmentation
+        //    TODO do better than a hungry allocation strategy, simulated annealing? backtracking? async bruteforce?
+
+        let mut scratch = Vec::new();
+        let image_last_touch: Vec<ResourceLastUse> =
+            self.get_last_resource_usage(&image_last_state, &mut scratch);
+        let buffer_last_touch: Vec<ResourceLastUse> =
+            self.get_last_resource_usage(&buffer_last_state, &mut scratch);
+
         let mut file = OpenOptions::new()
             .write(true) // <--------- this
             .create(true)
@@ -1205,6 +1226,67 @@ impl Graph {
         // cargo test --quiet -- graph::test_graph --nocapture && cat target/test.dot | dot -Tpng -o target/out.png
         // self.write_dot_representation(&submissions, &mut file);
         // Self::write_submissions_dot_representation(&submissions, &mut file);
+    }
+
+    fn get_last_resource_usage<T: ResourceMarker>(
+        &self,
+        image_last_state: &[(ResourceState<T>, bool)],
+        scratch: &mut Vec<(GraphSubmission, SubmissionPass)>,
+    ) -> Vec<ResourceLastUse> {
+        image_last_state
+            .iter()
+            .map(|(state, _)| {
+                fn add(
+                    from: impl Iterator<Item = PassTouch> + ExactSizeIterator + Clone,
+                    to: &mut Vec<(GraphSubmission, SubmissionPass)>,
+                    graph: &Graph,
+                ) {
+                    let parts = from.map(|touch| {
+                        let meta = graph.get_pass_meta(touch.pass);
+                        let submission = GraphSubmission(meta.scheduled_submission.get().unwrap());
+                        let pass =
+                            SubmissionPass(meta.scheduled_submission_position.get().unwrap());
+                        (submission, pass)
+                    });
+                    to.extend(parts);
+                };
+                scratch.clear();
+                match state {
+                    ResourceState::Uninit | ResourceState::Moved => {
+                        return ResourceLastUse::None;
+                    }
+                    ResourceState::MoveDst { parts } => {
+                        add(
+                            parts.get().iter().map(|(touch, ..)| touch.clone()),
+                            scratch,
+                            self,
+                        );
+                    }
+                    ResourceState::Normal {
+                        layout,
+                        queue_family,
+                        access,
+                    } => add(access.iter().cloned(), scratch, self),
+                }
+                match scratch.len() {
+                    0 => ResourceLastUse::None,
+                    1 => ResourceLastUse::Single(scratch[0].0, smallvec![scratch[0].1]),
+                    _ => {
+                        if scratch[1..].iter().all(|(sub, _)| *sub == scratch[0].0) {
+                            ResourceLastUse::Single(
+                                scratch[0].0,
+                                scratch.iter().map(|(_, pass)| *pass).collect(),
+                            )
+                        } else {
+                            use slice_group_by::GroupBy;
+                            scratch.sort_unstable_by_key(|(sub, _)| *sub);
+                            let groups = scratch.binary_group_by_key(|(sub, _)| *sub);
+                            ResourceLastUse::Multiple(groups.map(|slice| slice[0].0).collect())
+                        }
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
     }
 
     fn emit_barriers<T: ResourceMarker>(
@@ -1225,6 +1307,7 @@ impl Graph {
             )>,
         )],
     ) where
+        // hack because without this the typechecker is not cooperating
         T::IfImage<vk::ImageLayout>: Copy,
     {
         let raw_resource_handle = resource_data.raw_resource_handle();
@@ -1314,10 +1397,9 @@ impl Graph {
 
                         let src_meta = self.get_pass_meta(src_touch.pass);
                         let submission =
-                            GraphSubmission(src_meta.scheduled_submission.get().get().unwrap());
-                        let pass = SubmissionPass(
-                            src_meta.scheduled_submission_position.get().get().unwrap(),
-                        );
+                            GraphSubmission(src_meta.scheduled_submission.get().unwrap());
+                        let pass =
+                            SubmissionPass(src_meta.scheduled_submission_position.get().unwrap());
 
                         entry.push((submission, pass, dst_pass, GraphResource::Image(move_src)));
                     }
@@ -1396,10 +1478,9 @@ impl Graph {
                     for src_touch in &*access {
                         let src_meta = self.get_pass_meta(src_touch.pass);
                         let submission =
-                            GraphSubmission(src_meta.scheduled_submission.get().get().unwrap());
-                        let pass = SubmissionPass(
-                            src_meta.scheduled_submission_position.get().get().unwrap(),
-                        );
+                            GraphSubmission(src_meta.scheduled_submission.get().unwrap());
+                        let pass =
+                            SubmissionPass(src_meta.scheduled_submission_position.get().unwrap());
 
                         entry.push((submission, pass, dst_pass, resource_handle));
 
@@ -2786,4 +2867,10 @@ impl<'a> SubmissionRecorder<'a> {
         }
         self.submissions
     }
+}
+
+enum ResourceLastUse {
+    None,
+    Single(GraphSubmission, SmallVec<[SubmissionPass; 4]>),
+    Multiple(SmallVec<[GraphSubmission; 4]>),
 }
