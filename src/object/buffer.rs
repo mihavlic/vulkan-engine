@@ -4,7 +4,7 @@ use crate::{
     arena::uint::OptionalU32, context::device::Device, storage::nostore::SimpleStorage,
     submission::ReaderWriterState,
 };
-use pumice::{util::result::VulkanResult, vk};
+use pumice::{vk, VulkanResult};
 use smallvec::SmallVec;
 
 use super::{ArcHandle, Object};
@@ -74,7 +74,7 @@ impl Object for Buffer {
         &(allocation, _): &Self::ObjectData,
     ) -> VulkanResult<()> {
         ctx.allocator.destroy_buffer(handle, allocation);
-        VulkanResult::new_ok(())
+        VulkanResult::Ok(())
     }
 
     unsafe fn get_storage(parent: &Self::Parent) -> &Self::Storage {

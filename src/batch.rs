@@ -5,10 +5,11 @@ use std::{
 };
 
 use ahash::{HashSet, RandomState};
-use pumice::{try_vk, util::result::VulkanResult};
+use pumice::VulkanResult;
 
 use crate::{
     context::device::Device,
+    storage::{constant_ahash_hasher, constant_ahash_randomstate},
     submission::{QueueSubmission, WaitResult},
 };
 
@@ -24,13 +25,13 @@ impl Generation {
     fn new() -> Self {
         Self {
             id: GenerationId(0),
-            submissions: HashSet::with_hasher(RandomState::new()),
+            submissions: HashSet::with_hasher(constant_ahash_randomstate()),
         }
     }
     fn next(prev: GenerationId) -> Self {
         Self {
             id: GenerationId(prev.0 + 1),
-            submissions: HashSet::with_hasher(RandomState::new()),
+            submissions: HashSet::with_hasher(constant_ahash_randomstate()),
         }
     }
 }
@@ -60,9 +61,8 @@ impl GenerationManager {
         head.submissions.extend(submissions);
     }
     pub fn end_generation(&mut self, device: &Device) -> VulkanResult<()> {
-        // we currently have
         if self.batches.len() as u32 == self.max_in_flight {
-            try_vk!(self.wait_for_generation(self.batches.front().unwrap().id, u64::MAX, device));
+            self.wait_for_generation(self.batches.front().unwrap().id, u64::MAX, device)?;
         }
 
         let head = self.batches.back_mut().unwrap();
@@ -71,7 +71,7 @@ impl GenerationManager {
             self.batches.push_back(Generation::next(id));
         }
 
-        VulkanResult::new_ok(())
+        VulkanResult::Ok(())
     }
     pub fn get_current_generation(&self) -> GenerationId {
         self.batches.back().unwrap().id
@@ -91,14 +91,11 @@ impl GenerationManager {
                 break;
             }
 
-            let res = try_vk!(device.wait_for_submissions(
-                next.submissions.iter().cloned(),
-                timeout_ns,
-                false
-            ));
+            let res =
+                device.wait_for_submissions(next.submissions.iter().cloned(), timeout_ns, false)?;
 
             match res {
-                WaitResult::Timeout => return VulkanResult::new_ok(WaitResult::Timeout),
+                WaitResult::Timeout => return VulkanResult::Ok(WaitResult::Timeout),
                 WaitResult::AllFinished => {}
                 WaitResult::AnyFinished => unreachable!(),
             }
@@ -110,7 +107,7 @@ impl GenerationManager {
             }
         }
 
-        VulkanResult::new_ok(WaitResult::AllFinished)
+        VulkanResult::Ok(WaitResult::AllFinished)
     }
 }
 

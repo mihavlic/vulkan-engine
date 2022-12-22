@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use pumice::{try_vk, util::result::VulkanResult, vk, DeviceWrapper};
+use pumice::{vk, DeviceWrapper, VulkanResult};
 use smallvec::SmallVec;
 
 use crate::{
@@ -141,9 +141,9 @@ impl SubmissionManager {
                     ..Default::default()
                 };
 
-                let result = unsafe { device.device().wait_semaphores_khr(&info, timeout_ns) };
+                let result = unsafe { device.device().wait_semaphores_khr(&info, timeout_ns)? };
 
-                match result.raw {
+                match result {
                     vk::Result::SUCCESS => {
                         data.finished.store(true, Ordering::Relaxed);
                         true
@@ -152,12 +152,12 @@ impl SubmissionManager {
                         timeout = true;
                         false
                     }
-                    _ => return VulkanResult::new_err(result.raw),
+                    _ => unreachable!("wait_semaphores_khr cannot return other success codes"),
                 }
             };
 
             if wait_any && finished {
-                return VulkanResult::new_ok(WaitResult::AnyFinished);
+                return VulkanResult::Ok(WaitResult::AnyFinished);
             }
 
             if timeout_ns > 0 {
@@ -173,9 +173,9 @@ impl SubmissionManager {
         }
 
         if timeout {
-            return VulkanResult::new_ok(WaitResult::Timeout);
+            return VulkanResult::Ok(WaitResult::Timeout);
         } else {
-            return VulkanResult::new_ok(WaitResult::AllFinished);
+            return VulkanResult::Ok(WaitResult::AllFinished);
         }
     }
     fn allocate(&mut self, queue: Queue, device: &Device) -> QueueSubmission {

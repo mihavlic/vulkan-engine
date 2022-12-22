@@ -3,9 +3,9 @@ use std::ptr;
 use super::{ArcHandle, Object};
 use crate::context::device::Device;
 use crate::{storage::nostore::SimpleStorage, submission::ReaderWriterState};
-use pumice::util::impl_macros::ObjectHandle;
-use pumice::util::result::VulkanResult;
+use pumice::util::ObjectHandle;
 use pumice::vk;
+use pumice::VulkanResult;
 use smallvec::SmallVec;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -77,7 +77,7 @@ impl Object for Swapchain {
     ) -> VulkanResult<()> {
         ctx.device
             .destroy_swapchain_khr(handle, ctx.instance.allocator_callbacks());
-        VulkanResult::new_ok(())
+        VulkanResult::Ok(())
     }
 
     unsafe fn get_storage(parent: &Self::Parent) -> &Self::Storage {

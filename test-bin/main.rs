@@ -3,7 +3,7 @@
 use graph::context::device::{DeviceCreateInfo, QueueFamilySelection};
 use graph::context::instance::{Instance, InstanceCreateInfo};
 use graph::object::{self, SwapchainCreateInfo};
-use pumice::{util::config::ApiLoadConfig, vk};
+use pumice::{util::ApiLoadConfig, vk};
 use pumice_vma::{AllocationCreateFlags, AllocationCreateInfo};
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::EventLoop;

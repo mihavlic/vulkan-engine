@@ -16,10 +16,10 @@ use pumice::{
         tables::{DeviceTable, EntryTable, InstanceTable},
         DeviceLoader, InstanceLoader,
     },
-    util::{config::ApiLoadConfig, result::VulkanResult},
+    util::ApiLoadConfig,
     vk,
     vk10::QueueFamilyProperties,
-    DeviceWrapper,
+    DeviceWrapper, VulkanResult,
 };
 use pumice_vma::{Allocator, AllocatorCreateInfo};
 use smallvec::{smallvec, SmallVec};
@@ -458,7 +458,7 @@ unsafe fn select_device(
 
         // extension criteria
         {
-            let extensions = instance
+            let (extensions, _) = instance
                 .enumerate_device_extension_properties(physical_device, None, None)
                 .expect("enumerate_device_extension_properties error");
 

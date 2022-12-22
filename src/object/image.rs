@@ -6,7 +6,7 @@ use std::{
     ptr,
 };
 
-use pumice::{try_vk, util::result::VulkanResult, vk};
+use pumice::{vk, VulkanResult};
 use smallvec::SmallVec;
 
 use crate::{
@@ -174,7 +174,7 @@ impl ImageMutableState {
 
         if let Some(found) = self.views.iter_mut().find(|v| v.info_hash == hash) {
             found.last_use = batch_id;
-            VulkanResult::new_ok(found.handle)
+            VulkanResult::Ok(found.handle)
         } else {
             let raw = vk::ImageViewCreateInfo {
                 image: self_handle,
@@ -185,9 +185,9 @@ impl ImageMutableState {
                 ..Default::default()
             };
 
-            let view = try_vk!(device
+            let view = device
                 .device()
-                .create_image_view(&raw, device.allocator_callbacks()));
+                .create_image_view(&raw, device.allocator_callbacks())?;
 
             let entry = ImageViewEntry {
                 handle: view,
@@ -197,7 +197,7 @@ impl ImageMutableState {
 
             self.views.push(entry);
 
-            VulkanResult::new_ok(view)
+            VulkanResult::Ok(view)
         }
     }
 }
@@ -239,7 +239,7 @@ impl Object for Image {
         &(allocation, _): &Self::ObjectData,
     ) -> VulkanResult<()> {
         ctx.allocator.destroy_image(handle, allocation);
-        VulkanResult::new_ok(())
+        VulkanResult::Ok(())
     }
 
     unsafe fn get_storage(parent: &Self::Parent) -> &Self::Storage {

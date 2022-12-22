@@ -1,7 +1,7 @@
 pub mod nostore;
 
 use crate::object::{ArcHandle, Object};
-use pumice::util::result::VulkanResult;
+use pumice::VulkanResult;
 use std::{
     cell::{RefCell, RefMut, UnsafeCell},
     hash::BuildHasher,

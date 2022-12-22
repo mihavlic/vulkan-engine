@@ -11,10 +11,7 @@ use std::{
     ops::{ControlFlow, Deref, DerefMut, Not, Range},
 };
 
-use pumice::{
-    util::{impl_macros::ObjectHandle, result::VulkanResult},
-    vk,
-};
+use pumice::{util::ObjectHandle, vk, VulkanResult};
 use smallvec::{smallvec, SmallVec};
 
 use crate::{
@@ -22,6 +19,7 @@ use crate::{
     context::device::{Device, OwnedDevice, __test_init_device},
     graph::reverse_edges::{reverse_edges_into, ChildRelativeKey, NodeKey},
     object::{self, ImageCreateInfo, Object},
+    storage::constant_ahash_randomstate,
     submission, token_abuse,
     util::{self, format_utils::Fun, macro_abuse::WeirdFormatter},
 };
@@ -38,7 +36,7 @@ impl RenderPass for () {
         {}
     }
     fn execute(self, executor: &GraphExecutor, device: &Device) -> VulkanResult<()> {
-        VulkanResult::new_ok(())
+        VulkanResult::Ok(())
     }
 }
 
@@ -478,12 +476,12 @@ impl Graph {
                     ResourceState::MoveDst { reading, writing } => {
                         if let Some(is_hard) = is_hard(false, dst_writing) {
                             for r in reading {
-                                data.add_dependency(*r, is_hard);
+                                data.add_dependency(*r, is_hard, false);
                             }
                         }
                         if let Some(is_hard) = is_hard(true, dst_writing) {
                             for r in writing {
-                                data.add_dependency(*r, is_hard);
+                                data.add_dependency(*r, is_hard, false);
                             }
                         }
                     }
@@ -497,6 +495,7 @@ impl Graph {
                                 *producer,
                                 // src is WRITE, some dependency must occur
                                 is_hard(true, dst_writing).unwrap(),
+                                false,
                             );
 
                             // W W
@@ -514,6 +513,7 @@ impl Graph {
                                 data.add_dependency(
                                     *r,
                                     is_hard(false, /* dst_writing == */ true).unwrap(),
+                                    false,
                                 );
                             }
                             reading.clear();
@@ -1025,7 +1025,6 @@ impl Graph {
 
                                     let barrier_iter = waitfor_resources.iter().map(|&res| {
                                         (
-                                            // possibl
                                             SubmissionPass(0),
                                             match res {
                                                 GraphResource::Image(image) => {
@@ -1096,6 +1095,19 @@ impl Graph {
                             );
                         }
 
+                        let mut recorder_ref = recorder.borrow_mut();
+                        for dep in &data.dependencies {
+                            if dep.is_real() {
+                                recorder_ref.add_dependency(
+                                    dep.get_pass(),
+                                    vk::AccessFlags2KHR::all(),
+                                    vk::PipelineStageFlags2KHR::ALL_COMMANDS,
+                                    data.access,
+                                    data.stages,
+                                )
+                            }
+                        }
+
                         // apply image moves
                         for (_, mov) in image_moves
                             .iter()
@@ -1147,6 +1159,11 @@ impl Graph {
             // perform transitive reduction on the submissions
             // lifted from petgraph, https://docs.rs/petgraph/latest/petgraph/algo/tred/fn.dag_transitive_reduction_closure.html
             {
+                // make sure that the dependencies are in topological order (ie are sorted)
+                for sub in &mut submissions {
+                    sub.semaphore_dependencies.sort_unstable();
+                }
+
                 let len = submissions.len();
 
                 let mut tred = vec![Vec::new(); len];
@@ -1204,11 +1221,35 @@ impl Graph {
         // 3. if we've exhausted some memory limit, abort, free all resources, and allocate linearly without fragmentation
         //    TODO do better than a hungry allocation strategy, simulated annealing? backtracking? async bruteforce?
 
-        let mut scratch = Vec::new();
-        let image_last_touch: Vec<ResourceLastUse> =
-            self.get_last_resource_usage(&image_last_state, &mut scratch);
-        let buffer_last_touch: Vec<ResourceLastUse> =
-            self.get_last_resource_usage(&buffer_last_state, &mut scratch);
+        {
+            let mut submission_children = ImmutableGraph::new();
+            let graph = SubmissionFacade(&submissions, ());
+            reverse_edges_into(&graph, &mut submission_children);
+
+            let mut scratch = Vec::new();
+
+            let mut submission_reuse =
+                vec![<SubmissionResourceReuse as Default>::default(); submissions.len()];
+            // TODO profile how many children submissions usually have
+            // a vector may be faster here
+            let mut intersection_hashmap: ahash::HashMap<GraphSubmission, u32> =
+                ahash::HashMap::with_hasher(constant_ahash_randomstate());
+
+            let image_last_touch = self.get_last_resource_usage(&image_last_state, &mut scratch);
+            submission_fill_reuse::<ImageMarker>(
+                image_last_touch,
+                &mut submission_reuse,
+                &mut intersection_hashmap,
+                &submission_children,
+            );
+            let buffer_last_touch = self.get_last_resource_usage(&buffer_last_state, &mut scratch);
+            submission_fill_reuse::<BufferMarker>(
+                buffer_last_touch,
+                &mut submission_reuse,
+                &mut intersection_hashmap,
+                &submission_children,
+            );
+        }
 
         let mut file = OpenOptions::new()
             .write(true)
@@ -1218,69 +1259,65 @@ impl Graph {
             .unwrap();
 
         // cargo test --quiet -- graph::test_graph --nocapture && cat target/test.dot | dot -Tpng -o target/out.png
-        self.write_dot_representation(&submissions, &mut file);
-        // Self::write_submissions_dot_representation(&submissions, &mut file);
+        // self.write_dot_representation(&submissions, &mut file);
+        Self::write_submissions_dot_representation(&submissions, &mut file);
     }
 
-    fn get_last_resource_usage<T: ResourceMarker>(
-        &self,
-        image_last_state: &[(ResourceState<T>, bool)],
-        scratch: &mut Vec<(GraphSubmission, SubmissionPass)>,
-    ) -> Vec<ResourceLastUse> {
-        image_last_state
-            .iter()
-            .map(|(state, _)| {
-                fn add(
-                    from: impl Iterator<Item = PassTouch> + ExactSizeIterator + Clone,
-                    to: &mut Vec<(GraphSubmission, SubmissionPass)>,
-                    graph: &Graph,
-                ) {
-                    let parts = from.map(|touch| {
-                        let meta = graph.get_pass_meta(touch.pass);
-                        let submission = GraphSubmission(meta.scheduled_submission.get().unwrap());
-                        let pass =
-                            SubmissionPass(meta.scheduled_submission_position.get().unwrap());
-                        (submission, pass)
-                    });
-                    to.extend(parts);
-                };
-                scratch.clear();
-                match state {
-                    ResourceState::Uninit | ResourceState::Moved => {
-                        return ResourceLastUse::None;
-                    }
-                    ResourceState::MoveDst { parts } => {
-                        add(
-                            parts.get().iter().map(|(touch, ..)| touch.clone()),
-                            scratch,
-                            self,
-                        );
-                    }
-                    ResourceState::Normal {
-                        layout,
-                        queue_family,
-                        access,
-                    } => add(access.iter().cloned(), scratch, self),
+    fn get_last_resource_usage<'a, T: ResourceMarker>(
+        &'a self,
+        resource_last_state: &'a [(ResourceState<T>, bool)],
+        scratch: &'a mut Vec<(GraphSubmission, SubmissionPass)>,
+    ) -> impl Iterator<Item = ResourceLastUse> + 'a {
+        resource_last_state.iter().map(|(state, _)| {
+            fn add(
+                from: impl Iterator<Item = PassTouch> + ExactSizeIterator + Clone,
+                to: &mut Vec<(GraphSubmission, SubmissionPass)>,
+                graph: &Graph,
+            ) {
+                let parts = from.map(|touch| {
+                    let meta = graph.get_pass_meta(touch.pass);
+                    let submission = GraphSubmission(meta.scheduled_submission.get().unwrap());
+                    let pass = SubmissionPass(meta.scheduled_submission_position.get().unwrap());
+                    (submission, pass)
+                });
+                to.extend(parts);
+            };
+            scratch.clear();
+            match state {
+                ResourceState::Uninit | ResourceState::Moved => {
+                    return ResourceLastUse::None;
                 }
-                match scratch.len() {
-                    0 => ResourceLastUse::None,
-                    1 => ResourceLastUse::Single(scratch[0].0, smallvec![scratch[0].1]),
-                    _ => {
-                        if scratch[1..].iter().all(|(sub, _)| *sub == scratch[0].0) {
-                            ResourceLastUse::Single(
-                                scratch[0].0,
-                                scratch.iter().map(|(_, pass)| *pass).collect(),
-                            )
-                        } else {
-                            use slice_group_by::GroupBy;
-                            scratch.sort_unstable_by_key(|(sub, _)| *sub);
-                            let groups = scratch.binary_group_by_key(|(sub, _)| *sub);
-                            ResourceLastUse::Multiple(groups.map(|slice| slice[0].0).collect())
-                        }
+                ResourceState::MoveDst { parts } => {
+                    add(
+                        parts.get().iter().map(|(touch, ..)| touch.clone()),
+                        scratch,
+                        self,
+                    );
+                }
+                ResourceState::Normal {
+                    layout,
+                    queue_family,
+                    access,
+                } => add(access.iter().cloned(), scratch, self),
+            }
+            match scratch.len() {
+                0 => ResourceLastUse::None,
+                1 => ResourceLastUse::Single(scratch[0].0, smallvec![scratch[0].1]),
+                _ => {
+                    if scratch[1..].iter().all(|(sub, _)| *sub == scratch[0].0) {
+                        ResourceLastUse::Single(
+                            scratch[0].0,
+                            scratch.iter().map(|(_, pass)| *pass).collect(),
+                        )
+                    } else {
+                        use slice_group_by::GroupBy;
+                        scratch.sort_unstable_by_key(|(sub, _)| *sub);
+                        let groups = scratch.binary_group_by_key(|(sub, _)| *sub);
+                        ResourceLastUse::Multiple(groups.map(|slice| slice[0].0).collect())
                     }
                 }
-            })
-            .collect::<Vec<_>>()
+            }
+        })
     }
 
     fn emit_barriers<T: ResourceMarker>(
@@ -1654,15 +1691,15 @@ impl Graph {
         );
     }
     fn write_submissions_dot_representation(
-        submissions: &Vec<(GraphQueue, Submission)>,
+        submissions: &Vec<Submission>,
         writer: &mut dyn std::io::Write,
     ) {
         let clusters = Fun::new(|w| {
-            for (i, (q, s)) in submissions.iter().enumerate() {
-                write!(w, r##"s{i}[label="#{i},{}"];"##, q.index());
-                if !s.semaphore_dependencies.is_empty() {
+            for (i, sub) in submissions.iter().enumerate() {
+                write!(w, r##"s{i}[label="{i} (q{})"];"##, sub.queue.index());
+                if !sub.semaphore_dependencies.is_empty() {
                     write!(w, "{{");
-                    for p in &s.semaphore_dependencies {
+                    for p in &sub.semaphore_dependencies {
                         write!(w, "s{} ", p.index());
                     }
                     write!(w, "}} -> s{i};");
@@ -1688,6 +1725,55 @@ impl Graph {
     }
 }
 
+fn submission_fill_reuse<T: ResourceMarker>(
+    resource_last_touch: impl Iterator<Item = ResourceLastUse>,
+    submission_reuse: &mut [SubmissionResourceReuse],
+    intersection_hashmap: &mut ahash::HashMap<GraphSubmission, u32>,
+    submission_children: &ImmutableGraph,
+) {
+    // we are (ab)using ResourceMarker to be generic over images
+    // using branches on T::IS_IMAGE which will get constant folded
+    for (i, reuse) in resource_last_touch.enumerate() {
+        let handle = RawHandle::new(i);
+        match reuse {
+            ResourceLastUse::None => {}
+            ResourceLastUse::Single(sub, passes) => {
+                let sub = &mut submission_reuse[sub.index()];
+                if T::IS_IMAGE {
+                    sub.dead_images_local
+                        .push((GraphImage::from_raw(handle), passes));
+                } else {
+                    sub.dead_buffers_local
+                        .push((GraphBuffer::from_raw(handle), passes));
+                }
+            }
+            ResourceLastUse::Multiple(submissions) => {
+                // we need to find nodes that (directly!) depend on all of these submissions
+                intersection_hashmap.clear();
+                for sub in &submissions {
+                    for &child in submission_children.get_children(sub.0) {
+                        *intersection_hashmap
+                            .entry(GraphSubmission(child))
+                            .or_insert(0) += 1;
+                    }
+                }
+                let len = submissions.len() as u32;
+                for (&sub, &count) in intersection_hashmap.iter() {
+                    // every submission inserted the node as its child, this means that all of the submissions share it
+                    if count == len {
+                        let sub = &mut submission_reuse[sub.index()];
+                        if T::IS_IMAGE {
+                            sub.dead_images.push(GraphImage::from_raw(handle));
+                        } else {
+                            sub.dead_buffers.push(GraphBuffer::from_raw(handle));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn test_graph() {
     let device = unsafe { __test_init_device(true) };
@@ -1709,12 +1795,12 @@ fn test_graph() {
 
         let p4 = b.add_pass(q2, |_: &mut GraphPassBuilder, _: &Device| {}, "p4");
 
-        b.add_pass_dependency(p0, p1, true);
-        b.add_pass_dependency(p0, p2, true);
-        b.add_pass_dependency(p2, p3, true);
+        b.add_pass_dependency(p0, p1, true, true);
+        b.add_pass_dependency(p0, p2, true, true);
+        b.add_pass_dependency(p2, p3, true, true);
 
-        b.add_pass_dependency(p0, p4, true);
-        b.add_pass_dependency(p3, p4, true);
+        b.add_pass_dependency(p0, p4, true, true);
+        b.add_pass_dependency(p3, p4, true, true);
 
         b.force_pass_run(p1);
         b.force_pass_run(p2);
@@ -1757,12 +1843,14 @@ struct PassData {
     force_run: bool,
     images: Vec<PassImageData>,
     buffers: Vec<PassBufferData>,
+    stages: vk::PipelineStageFlags2KHR,
+    access: vk::AccessFlags2KHR,
     dependencies: Vec<PassDependency>,
     pass: Box<dyn ObjectSafePass>,
 }
 
 impl PassData {
-    fn add_dependency(&mut self, dependency: GraphPass, hard: bool) {
+    fn add_dependency(&mut self, dependency: GraphPass, hard: bool, real: bool) {
         if let Some(found) = self
             .dependencies
             .iter_mut()
@@ -1772,9 +1860,12 @@ impl PassData {
             if hard {
                 found.set_hard(true);
             }
+            if real {
+                found.set_real(true);
+            }
         } else {
             self.dependencies
-                .push(PassDependency::new(dependency, hard));
+                .push(PassDependency::new(dependency, hard, real));
         }
     }
 }
@@ -2092,8 +2183,14 @@ impl GraphBuilder {
             .push(GraphPassEvent::new(PassEventData::Pass(handle)));
         handle
     }
-    pub fn add_pass_dependency(&mut self, first: GraphPass, then: GraphPass, hard: bool) {
-        self.0.passes[then.index()].add_dependency(first, hard);
+    pub fn add_pass_dependency(
+        &mut self,
+        first: GraphPass,
+        then: GraphPass,
+        hard: bool,
+        real: bool,
+    ) {
+        self.0.passes[then.index()].add_dependency(first, hard, real);
     }
     pub fn force_pass_run(&mut self, pass: GraphPass) {
         self.0.passes[pass.index()].force_run = true;
@@ -2124,11 +2221,28 @@ impl<'a> GraphPassBuilder<'a> {
         }
     }
     fn finish<T: RenderPass>(self, queue: GraphQueue, pass: T) -> PassData {
+        let mut access = vk::AccessFlags2KHR::default();
+        let mut stages = vk::PipelineStageFlags2KHR::default();
+        for i in &self.images {
+            if i.access.contains_write() {
+                access |= i.access;
+                stages |= i.stages;
+            }
+        }
+        for b in &self.buffers {
+            if b.access.contains_write() {
+                access |= b.access;
+                stages |= b.stages;
+            }
+        }
+
         PassData {
             queue: queue,
             force_run: false,
             images: self.images,
             buffers: self.buffers,
+            stages,
+            access,
             dependencies: self.dependencies,
             pass: Box::new(StoredPass(Some(pass))),
         }
@@ -2344,10 +2458,13 @@ impl CombinedResourceHandle {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PassDependencyConfig;
 impl Config for PassDependencyConfig {
-    const FIRST_BITS: usize = 31;
-    const SECOND_BITS: usize = 1;
+    const FIRST_BITS: usize = 30;
+    const SECOND_BITS: usize = 2;
 }
 
+// there are two "meta" bits
+//   hard - specifies that the dependency producing some results for the consumer
+//   real - the dependency is also translated into dependencies between passes when emitted into submission
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PassDependency(PackedUint<PassDependencyConfig, u32>);
 
@@ -2356,14 +2473,26 @@ struct PassDependency(PackedUint<PassDependencyConfig, u32>);
 //   soft means it guards a Write After Read
 // this is important because soft dependencies do not propagate "pass is alive" status
 impl PassDependency {
-    fn new(pass: GraphPass, hard: bool) -> Self {
-        Self(PackedUint::new(pass.0, hard as u32))
+    fn new(pass: GraphPass, hard: bool, real: bool) -> Self {
+        Self(PackedUint::new(pass.0, hard as u32 + (real as u32 * 2)))
     }
     fn is_hard(&self) -> bool {
-        self.0.second() == 1
+        self.0.second() & 1 == 1
     }
     fn set_hard(&self, hard: bool) -> Self {
-        Self(PackedUint::new(self.0.first(), hard as u32))
+        Self(PackedUint::new(
+            self.0.first(),
+            (self.0.second() & !1) | hard as u32,
+        ))
+    }
+    fn is_real(&self) -> bool {
+        self.0.second() & 2 == 2
+    }
+    fn set_real(&self, real: bool) -> Self {
+        Self(PackedUint::new(
+            self.0.first(),
+            (self.0.second() & !2) | (real as u32 * 2),
+        ))
     }
     fn get_pass(&self) -> GraphPass {
         GraphPass(self.0.first())
@@ -2677,8 +2806,6 @@ impl<'a> SubmissionRecorder<'a> {
         on_prev_end: F,
     ) -> SubmissionPass {
         let data = self.graph.get_pass_data(graph);
-        let mut access = vk::AccessFlags2KHR::default();
-        let mut stages = vk::PipelineStageFlags2KHR::default();
 
         // either we've started emitting passes into a different queue, or the user flushed the previously open queue
         if (self.current_queue.is_some() && self.current_queue.unwrap().1 != data.queue)
@@ -2691,21 +2818,9 @@ impl<'a> SubmissionRecorder<'a> {
         }
         self.set_current_queue(data.queue);
 
-        for i in &data.images {
-            if i.access.contains_write() {
-                access |= i.access;
-                stages |= i.stages;
-            }
-        }
-        for b in &data.buffers {
-            if b.access.contains_write() {
-                access |= b.access;
-                stages |= b.stages;
-            }
-        }
         let effects = PassEffects {
-            stages: stages.translate_special_bits(),
-            access: access & vk::AccessFlags2KHR::WRITE_FLAGS,
+            stages: data.stages.translate_special_bits(),
+            access: data.access & vk::AccessFlags2KHR::WRITE_FLAGS,
             last_barrier: OptionalU32::NONE,
         };
 
@@ -2767,7 +2882,7 @@ impl<'a> SubmissionRecorder<'a> {
         let dst_stages = dst_stages.translate_special_bits();
 
         let access_overlap = effects.access & src_access;
-        let stages_overlap = effects.stages & src_stages;
+        let stages_overlap = effects.stages & src_stages.translate_special_bits();
 
         if !access_overlap.is_empty() || !stages_overlap.is_empty() {
             let dst_index;
@@ -2868,4 +2983,42 @@ enum ResourceLastUse {
     None,
     Single(GraphSubmission, SmallVec<[SubmissionPass; 4]>),
     Multiple(SmallVec<[GraphSubmission; 4]>),
+}
+
+// a thin graph impl for the graph of queue submissions
+struct SubmissionFacade<'a>(&'a Vec<Submission>, ());
+impl<'a> NodeGraph for SubmissionFacade<'a> {
+    type NodeData = ();
+
+    fn node_count(&self) -> usize {
+        self.0.len()
+    }
+    fn nodes(&self) -> Range<NodeKey> {
+        0..self.0.len() as u32
+    }
+    fn children(&self, this: NodeKey) -> Range<ChildRelativeKey> {
+        0..self.0[this as usize].semaphore_dependencies.len() as u32
+    }
+    fn get_child(&self, this: NodeKey, child: ChildRelativeKey) -> NodeKey {
+        self.0[this as usize].semaphore_dependencies[child as usize].0
+    }
+    fn get_node_data(&self, this: NodeKey) -> &Self::NodeData {
+        &()
+    }
+    fn get_node_data_mut(&mut self, this: NodeKey) -> &mut Self::NodeData {
+        &mut self.1
+    }
+}
+
+// TODO think of a better name
+// keeps track of which resources become available in a submission
+#[derive(Default, Clone)]
+struct SubmissionResourceReuse {
+    // these are available imediatelly after a submission starts
+    // because the previous users ended in its dependency submissions
+    dead_images: Vec<GraphImage>,
+    dead_buffers: Vec<GraphBuffer>,
+    // these become available only after all of the passes have ended in the submission
+    dead_images_local: Vec<(GraphImage, SmallVec<[SubmissionPass; 4]>)>,
+    dead_buffers_local: Vec<(GraphBuffer, SmallVec<[SubmissionPass; 4]>)>,
 }

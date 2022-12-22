@@ -8,7 +8,7 @@ pub use image::*;
 pub use surface::*;
 pub use swapchain::*;
 
-use pumice::util::result::VulkanResult;
+use pumice::VulkanResult;
 use std::{hash::Hash, mem::ManuallyDrop, ptr::NonNull};
 
 use crate::storage::{ArcHeader, ObjectHeader, ObjectStorage};

@@ -1,7 +1,7 @@
 use std::{hash::BuildHasher, mem::ManuallyDrop, ptr::NonNull, sync::atomic::Ordering};
 
 use ahash::{HashSet, RandomState};
-use pumice::util::result::VulkanResult;
+use pumice::VulkanResult;
 
 use super::{
     constant_ahash_randomstate, create_header, ArcHeader, MutableShared, ObjectStorage,

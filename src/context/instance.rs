@@ -10,8 +10,8 @@ use pumice::{
         tables::{DeviceTable, EntryTable, InstanceTable},
         EntryLoader, InstanceLoader,
     },
-    util::{config::ApiLoadConfig, result::VulkanResult},
-    vk, InstanceWrapper,
+    util::ApiLoadConfig,
+    vk, InstanceWrapper, VulkanResult,
 };
 use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
 
@@ -103,7 +103,7 @@ impl Instance {
 
         // instance extension check
         {
-            let available_instance_extensions = entry
+            let (available_instance_extensions, _) = entry
                 .enumerate_instance_extension_properties(None, None)
                 .expect("enumerate_instance_extension_properties error");
 
@@ -126,7 +126,7 @@ impl Instance {
 
         // instance layer check
         {
-            let available_layers = entry
+            let (available_layers, _) = entry
                 .enumerate_instance_layer_properties(None)
                 .expect("enumerate_instance_extension_properties error");
 
@@ -147,7 +147,7 @@ impl Instance {
             }
         }
 
-        let instance_layer_properties = entry
+        let (instance_layer_properties, _) = entry
             .enumerate_instance_layer_properties(None)
             .expect("enumerate_instance_layer_properties error");
 
@@ -221,7 +221,7 @@ impl Instance {
             None
         };
 
-        let physical_devices = instance
+        let (physical_devices, _) = instance
             .enumerate_physical_devices(None)
             .expect("enumerate_physical_devices error");
         let physical_device_properties = physical_devices
