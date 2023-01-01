@@ -11,7 +11,7 @@ name = "test-bin"
 
 [dependencies]
 pumice = {path = "../pumice", features = ["wrappers"]}
-pumice-vma = {path = "../pumice-vma"}
+pumice-vma = {path = "../pumice-vma/pumice-vma"}
 
 ahash = {version = "0.8.2", default-features = false, features = ["std"]}
 smallvec = {version = "1.10.0", features = ["union", "const_generics"]}

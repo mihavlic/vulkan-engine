@@ -215,8 +215,19 @@ impl Device {
         };
 
         let allocator = {
-            let create_info = AllocatorCreateInfo::new(&instance_handle, &device, &physical_device);
-            Allocator::new(create_info).unwrap()
+            let info = pumice_vma::AllocatorCreateInfo2 {
+                instance: instance.handle(),
+                device: &device,
+                physical_device: physical_device,
+                flags: pumice_vma::AllocatorCreateFlags::empty(),
+                preferred_large_heap_block_size: 0,
+                allocation_callbacks,
+                device_memory_callbacks: None,
+                heap_size_limit: None,
+                vulkan_api_version: conf.get_api_version(),
+                external_memory_handle_types: None,
+            };
+            Allocator::new(&info).unwrap()
         };
 
         let inner = Device {
@@ -331,12 +342,13 @@ fn test_device() {
             sharing_mode_concurrent: false,
             initial_layout: vk::ImageLayout::UNDEFINED,
         };
-        let allocation_info = AllocationCreateInfo::new()
-            .required_flags(vk::MemoryPropertyFlags::HOST_VISIBLE)
-            .preferred_flags(
-                vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_CACHED,
-            )
-            .flags(AllocationCreateFlags::MAPPED);
+        let allocation_info = AllocationCreateInfo {
+            flags: AllocationCreateFlags::MAPPED,
+            required_flags: vk::MemoryPropertyFlags::HOST_VISIBLE,
+            preferred_flags: vk::MemoryPropertyFlags::HOST_COHERENT
+                | vk::MemoryPropertyFlags::HOST_CACHED,
+            ..Default::default()
+        };
         let image = device.create_image(info, allocation_info);
 
         // explicit drop order due to my crimes
