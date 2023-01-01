@@ -1,3 +1,4 @@
+mod allocator;
 mod reverse_edges;
 
 use std::{
@@ -2296,6 +2297,7 @@ impl GraphExecutor {
     }
 }
 
+#[macro_export]
 macro_rules! simple_handle {
     ($($visibility:vis $name:ident),+) => {
         $(
@@ -2312,17 +2314,19 @@ macro_rules! simple_handle {
                     self.0 as usize
                 }
                 #[inline]
-                fn to_raw(&self) -> RawHandle {
-                    RawHandle(self.0)
+                fn to_raw(&self) -> $crate::graph::RawHandle {
+                    $crate::graph::RawHandle(self.0)
                 }
                 #[inline]
-                fn from_raw(raw: RawHandle) -> Self {
+                fn from_raw(raw: $crate::graph::RawHandle) -> Self {
                     Self(raw.0)
                 }
             }
         )+
     };
 }
+
+pub use simple_handle;
 
 simple_handle! {
     RawHandle,
