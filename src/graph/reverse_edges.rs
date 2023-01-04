@@ -3,6 +3,13 @@ use std::ops::Range;
 pub type NodeKey = u32;
 pub type ChildRelativeKey = u32;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DFSCommand {
+    Continue,
+    Ascend,
+    End,
+}
+
 pub trait NodeGraph {
     type NodeData;
 
@@ -14,6 +21,33 @@ pub trait NodeGraph {
 
     fn get_node_data(&self, this: NodeKey) -> &Self::NodeData;
     fn get_node_data_mut(&mut self, this: NodeKey) -> &mut Self::NodeData;
+
+    fn dfs_visit<F: FnMut(NodeKey) -> DFSCommand>(&self, start: NodeKey, fun: F) {
+        dfs_visit_inner(self, start, fun);
+    }
+}
+
+fn dfs_visit_inner<T: NodeGraph + ?Sized, F: FnMut(NodeKey) -> DFSCommand>(
+    graph: &T,
+    root: NodeKey,
+    fun: F,
+) -> DFSCommand {
+    match fun(root) {
+        DFSCommand::Continue => {}
+        DFSCommand::End => return DFSCommand::End,
+        DFSCommand::Ascend => return DFSCommand::Ascend,
+    }
+
+    for c in graph.children(root) {
+        let node = graph.get_child(root, c);
+        match dfs_visit_inner(graph, root, fun) {
+            DFSCommand::Continue => {}
+            DFSCommand::Ascend => return DFSCommand::Continue,
+            DFSCommand::End => return DFSCommand::End,
+        }
+    }
+
+    DFSCommand::Continue
 }
 
 #[derive(Default, Clone)]

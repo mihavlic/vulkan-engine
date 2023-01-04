@@ -163,7 +163,7 @@ impl ImageMutableState {
             synchronization: ImageSynchronizationState::with_initial_layout(layout),
         }
     }
-    unsafe fn get_view(
+    pub unsafe fn get_view(
         &mut self,
         self_handle: vk::Image,
         info: &ImageViewCreateInfo,
@@ -198,6 +198,13 @@ impl ImageMutableState {
             self.views.push(entry);
 
             VulkanResult::Ok(view)
+        }
+    }
+    pub unsafe fn destroy(self, device: &Device) {
+        for view in self.views {
+            device
+                .device()
+                .destroy_image_view(view.handle, device.allocator_callbacks());
         }
     }
 }

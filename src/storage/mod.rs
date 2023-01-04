@@ -139,3 +139,7 @@ pub(crate) fn constant_ahash_randomstate() -> ahash::RandomState {
 pub(crate) fn constant_ahash_hasher() -> ahash::AHasher {
     constant_ahash_randomstate().build_hasher()
 }
+
+pub(crate) fn constant_ahash_hashmap<K, V>() -> ahash::HashMap<K, V> {
+    ahash::HashMap::with_hasher(constant_ahash_randomstate())
+}

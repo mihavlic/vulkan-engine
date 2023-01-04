@@ -6,6 +6,7 @@ pub mod util;
 pub mod arena;
 pub mod batch;
 pub mod context;
+mod freer;
 pub mod graph;
 pub mod object;
 pub mod storage;

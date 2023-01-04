@@ -1,19 +1,20 @@
+use std::{
+    cell::{Cell, RefCell, RefMut},
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+};
+
 use crate::simple_handle;
 
-struct MemoryBlock {
-    allocation: pumice_vma::Allocation,
-    // info: pumice_vma::,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum MemoryKind {
+pub enum MemoryKind {
     Linear,
     NonLinear,
     None,
 }
 
 #[derive(Clone, Copy)]
-struct MemoryChunk {
+pub struct MemoryChunk {
     // Some means allocation, None free space
     allocation: Option<BlockAllocation>,
     // start is always the end of the previous block
@@ -21,18 +22,17 @@ struct MemoryChunk {
     kind: MemoryKind,
 }
 
-struct Block {
-    /* memory_heap: u32,
-    memory_type: u32, */
+pub struct MemoryBlock<T> {
     size: u64,
     align: u64,
     chunks: Vec<MemoryChunk>,
     total_free: u64,
     allocations_counter: u32,
+    data: T,
 }
 
-impl Block {
-    fn new(size: u64, align: u64 /* memory_heap: u32, memory_type: u32 */) -> Self {
+impl<T> MemoryBlock<T> {
+    pub fn new(size: u64, align: u64, data: T) -> Self {
         Self {
             size,
             align,
@@ -43,9 +43,10 @@ impl Block {
             }],
             total_free: size,
             allocations_counter: u32::MAX,
+            data,
         }
     }
-    fn new_used(size: u64, align: u64, kind: MemoryKind) -> (Self, BlockAllocation) {
+    pub fn new_used(size: u64, align: u64, kind: MemoryKind, data: T) -> (Self, BlockAllocation) {
         (
             Self {
                 size,
@@ -57,11 +58,12 @@ impl Block {
                 }],
                 total_free: 0,
                 allocations_counter: 1,
+                data,
             },
             BlockAllocation(0),
         )
     }
-    fn free(&mut self, allocation: BlockAllocation) {
+    pub fn free(&mut self, allocation: BlockAllocation) {
         let chunks = &self.chunks;
 
         let pos = chunks
@@ -109,7 +111,7 @@ impl Block {
         (start, self.chunks[chunk].end)
     }
     // returns a handle which may be used to later allocate the best matching block or memory, with the amount of memory remaining on the right side after the would-be allocation
-    fn consider_allocate(
+    pub fn consider_allocate(
         &self,
         size: u64,
         align: u64,
@@ -208,7 +210,7 @@ impl Block {
         self.allocations_counter = self.allocations_counter.wrapping_add(1);
         BlockAllocation(self.allocations_counter)
     }
-    fn allocate_considered(
+    pub fn allocate_considered(
         &mut self,
         considered: ConsiderAllocation,
         size: u64,
@@ -258,7 +260,7 @@ impl Block {
 
         allocation
     }
-    fn allocate(
+    pub fn allocate(
         &mut self,
         size: u64,
         align: u64,
@@ -269,13 +271,42 @@ impl Block {
             self.consider_allocate(size, align, kind, linear_nonlinear_granularity, true)?;
         Some(self.allocate_considered(considered, size, align, kind, linear_nonlinear_granularity))
     }
+    // returns the largest size of free blocks, this is without any alignment so may still be insuficient for an allocation of the same size
+    pub fn compute_max_free_size(&self) -> Option<u64> {
+        let mut max = 0;
+        for (i, c) in self.chunks.iter().enumerate() {
+            if c.allocation.is_some() {
+                continue;
+            }
+            let (start, end) = self.get_chunk_start_end(i);
+            let size = end - start;
+            max = max.max(size);
+        }
+        (max != 0).then_some(max)
+    }
+    pub fn compute_min_free_size(&self) -> Option<u64> {
+        let mut max = u64::MAX;
+        for (i, c) in self.chunks.iter().enumerate() {
+            if c.allocation.is_some() {
+                continue;
+            }
+            let (start, end) = self.get_chunk_start_end(i);
+            let size = end - start;
+            max = max.max(size);
+        }
+        (max != u64::MAX).then_some(max)
+    }
+    pub fn get_allocation_size(&self, allocation: BlockAllocation) -> u64 {
+        let (start, end) = self.get_chunk_start_end(allocation.index());
+        end - start
+    }
 }
 
-fn round_up_pow2(number: u64, multiple: u64) -> u64 {
+pub fn round_up_pow2(number: u64, multiple: u64) -> u64 {
     number.wrapping_add(multiple).wrapping_sub(1) & !multiple.wrapping_sub(1)
 }
 
-fn round_down_pow2(number: u64, multiple: u64) -> u64 {
+pub fn round_down_pow2(number: u64, multiple: u64) -> u64 {
     number & !multiple.wrapping_sub(1)
 }
 
@@ -285,12 +316,149 @@ simple_handle! {
 }
 
 #[test]
-fn test_block_allocator() {
-    let mut block = Block::new(64, 64);
+pub fn test_block_allocator() {
+    let mut block = MemoryBlock::new(64, 64, ());
     let (_, rem) = block
         .consider_allocate(64, 64, MemoryKind::Linear, 1, true)
         .unwrap();
     assert_eq!(rem, 0);
     let alloc = block.allocate(64, 64, MemoryKind::Linear, 1);
     assert!(alloc.is_some());
+}
+
+// structure managing multiple blocks, allowing to efficiently make allocations into them
+
+struct AllocatorAllocation<T> {
+    allocation: BlockAllocation,
+    node: Rc<BlockAllocatorNode<T>>,
+}
+
+struct BlockAllocatorNode<T> {
+    min_size: Cell<u64>,
+    // always increasing, only used to give blocks a unique identity that isn't dependant on their min_size
+    id: u32,
+    // generally always Some(), Option is only used to construct a dummy node to iterate over larger actual nodes
+    block: RefCell<Option<MemoryBlock<T>>>,
+}
+
+impl<T> PartialOrd for BlockAllocatorNode<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match self.min_size.partial_cmp(&other.min_size) {
+            Some(core::cmp::Ordering::Equal) => {}
+            ord => return ord,
+        }
+        self.id.partial_cmp(&other.id)
+        // ignore self.block
+    }
+}
+
+impl<T> Ord for BlockAllocatorNode<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.min_size
+            .cmp(&other.min_size)
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+impl<T> PartialEq for BlockAllocatorNode<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.min_size == other.min_size && self.id == other.id
+    }
+}
+
+impl<T> Eq for BlockAllocatorNode<T> {}
+
+pub struct BlockAllocator<T> {
+    // crimes
+    // we're putting all the state in the key because reasons
+    // don't be afraid we'll be careful not to modify the ordering while inserted within the map
+    // we need a BTreeMap rather than *Set because we need the remove_entry function
+    blocks: BTreeMap<Rc<BlockAllocatorNode<T>>, ()>,
+    monotonic: u32,
+}
+
+impl<T> BlockAllocator<T> {
+    fn free(&mut self, allocation: AllocatorAllocation<T>) {
+        let AllocatorAllocation { allocation, node } = allocation;
+        let block = RefMut::map(node.block.borrow_mut(), |opt| opt.as_mut().unwrap());
+        let size = block.get_allocation_size(allocation);
+        block.free(allocation);
+
+        if size > node.min_size.get() {
+            // we have not decreased the min_size of the block
+            // thus the ordering is unchanged and we don't need to reinstert the node
+        } else {
+            self.update_node_ordering(&node, &*block);
+        }
+    }
+    fn allocate<F: FnOnce(u64, u64, MemoryKind, u64) -> MemoryBlock<T>>(
+        &mut self,
+        size: u64,
+        align: u64,
+        kind: MemoryKind,
+        linear_nonlinear_granularity: u64,
+        new_block_fun: F,
+    ) -> AllocatorAllocation<T> {
+        let dummy = BlockAllocatorNode {
+            min_size: Cell::new(size),
+            id: 0,
+            block: RefCell::new(None),
+        };
+
+        // even though the blocks have a sufficient min_size, the allocation may still not fit due to alignment padding and such
+        for (node, _) in self.blocks.range(dummy..) {
+            let block = RefMut::map(node.block.borrow_mut(), |opt| opt.as_mut().unwrap());
+            // TODO maybe do something fancier than first-fit
+            if let Some(alloc) = block.allocate(size, align, kind, linear_nonlinear_granularity) {
+                if size > node.min_size.get() {
+                    // we have not decreased the min_size of the block
+                    // thus the ordering is unchanged and we don't need to reinstert the node
+                } else {
+                    self.update_node_ordering(node, &*block);
+                }
+
+                return AllocatorAllocation {
+                    allocation: alloc,
+                    node: node.clone(),
+                };
+            }
+        }
+
+        // we've failed to find any space in the existing blocks, we need to make another one
+        let block = new_block_fun(size, align, kind, linear_nonlinear_granularity);
+        let alloc = block
+            .allocate(size, align, kind, linear_nonlinear_granularity)
+            .expect("new_block_fun must create a sufficient memory block");
+
+        let size = block.compute_min_free_size().unwrap_or(0);
+        let node = Rc::new(BlockAllocatorNode {
+            min_size: Cell::new(size),
+            id: self.monotonic,
+            block: RefCell::new(Some(block)),
+        });
+
+        let none = self.blocks.insert(node.clone(), ());
+        assert!(none.is_none(), "Nodes must be unique");
+        let handle = AllocatorAllocation {
+            allocation: alloc,
+            node: node,
+        };
+
+        self.monotonic = self
+            .monotonic
+            .checked_add(1)
+            .expect("Allocation counter has overflowed, TODO handle this?");
+
+        handle
+    }
+    fn update_node_ordering(&mut self, node: &Rc<BlockAllocatorNode<T>>, block: &MemoryBlock<T>) {
+        // we need to remove the entry, modify its ordering and then reinsert it, perfectly safe!
+        let (data, _) = self
+            .blocks
+            .remove_entry(node)
+            .expect("The memory block is not withing the allocator!");
+        let size = block.compute_min_free_size().unwrap_or(0);
+        data.min_size.set(size);
+        self.blocks.insert(data, ());
+    }
 }

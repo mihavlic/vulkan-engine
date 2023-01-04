@@ -12,20 +12,30 @@ use std::{
     ops::{ControlFlow, Deref, DerefMut, Not, Range},
 };
 
+use ahash::HashMap;
 use pumice::{util::ObjectHandle, vk, VulkanResult};
+use pumice_vma::{Allocation, AllocationCreateInfo};
 use smallvec::{smallvec, SmallVec};
 
 use crate::{
     arena::uint::{Config, OptionalU32, PackedUint},
     context::device::{Device, OwnedDevice, __test_init_device},
-    graph::reverse_edges::{reverse_edges_into, ChildRelativeKey, NodeKey},
-    object::{self, ImageCreateInfo, Object},
-    storage::constant_ahash_randomstate,
+    graph::{
+        allocator::MemoryBlock,
+        reverse_edges::{reverse_edges_into, ChildRelativeKey, NodeKey},
+    },
+    object::{
+        self, BufferCreateInfo, BufferMutableState, ImageCreateInfo, ImageMutableState, Object,
+    },
+    storage::{constant_ahash_hasher, constant_ahash_hashmap, constant_ahash_randomstate},
     submission, token_abuse,
     util::{self, format_utils::Fun, macro_abuse::WeirdFormatter},
 };
 
-use self::reverse_edges::{ImmutableGraph, NodeGraph};
+use self::{
+    allocator::BlockAllocation,
+    reverse_edges::{DFSCommand, ImmutableGraph, NodeGraph},
+};
 
 pub trait RenderPass: 'static {
     fn prepare(&mut self);
@@ -104,12 +114,6 @@ impl BufferMeta {
     }
 }
 
-struct PhysicalImageData {
-    info: object::ImageCreateInfo,
-    handle: vk::Image,
-    state: object::ImageMutableState,
-}
-
 #[derive(Clone)]
 struct ImageBarrier {
     pub image: GraphImage,
@@ -140,10 +144,6 @@ struct MemoryBarrier {
     pub dst_access_mask: vk::AccessFlags2KHR,
 }
 
-struct PhysicalBufferData {
-    info: object::ImageCreateInfo,
-}
-
 #[derive(Clone)]
 struct SimpleBarrier {
     pub src_stages: vk::PipelineStageFlags2KHR,
@@ -169,6 +169,28 @@ enum SpecialBarrier {
         src_family: u32,
         dst_family: u32,
     },
+}
+
+struct GraphAllocationData {
+    vma_allocation: Allocation,
+    memory_type: u32,
+    refcount: u32,
+}
+
+struct PhysicalImageData {
+    info: ImageCreateInfo,
+    allocation: GraphAllocation,
+    suballocation: BlockAllocation,
+    vkhandle: vk::Image,
+    state: ImageMutableState,
+}
+
+struct PhysicalBufferData {
+    info: BufferCreateInfo,
+    allocation: GraphAllocation,
+    suballocation: BlockAllocation,
+    vkhandle: vk::Buffer,
+    state: BufferMutableState,
 }
 
 #[derive(Clone)]
@@ -197,7 +219,9 @@ pub struct Graph {
 
     pass_children: ImmutableGraph,
 
-    physical_images: Vec<PhysicalImage>,
+    // allocation, memory type, refcount
+    allocations: Vec<GraphAllocationData>,
+    physical_images: Vec<PhysicalImageData>,
     physical_buffers: Vec<PhysicalBufferData>,
 
     device: OwnedDevice,
@@ -216,6 +240,7 @@ impl Graph {
             image_meta: Vec::new(),
             buffer_meta: Vec::new(),
             pass_children: Default::default(),
+            allocations: Vec::new(),
             physical_images: Vec::new(),
             physical_buffers: Vec::new(),
             device,
@@ -301,29 +326,43 @@ impl Graph {
     }
     fn is_image_external<'a>(&'a self, image: GraphImage) -> bool {
         match self.get_concrete_image_data(image) {
-            ImageData::Transient(..) => false,
+            ImageData::TransientPrototype(..) => false,
             ImageData::Imported(_) => true,
             ImageData::Swapchain(_) => true,
+            ImageData::Transient(..) => unreachable!(),
             ImageData::Moved(..) => unreachable!(),
         }
     }
     fn is_buffer_external(&self, mut buffer: GraphBuffer) -> bool {
         match self.get_buffer_data(buffer) {
-            BufferData::Transient(..) => false,
+            BufferData::TransientPrototype(..) => false,
+            BufferData::Transient(..) => unreachable!(),
             BufferData::Imported(_) => true,
         }
     }
     fn is_pass_alive(&self, pass: GraphPass) -> bool {
         self.pass_meta[pass.index()].alive.get()
     }
+    fn get_allocation(&self, allocation: GraphAllocation) -> &GraphAllocationData {
+        &self.allocations[allocation.index()]
+    }
+    fn get_allocation_mut(&mut self, allocation: GraphAllocation) -> &mut GraphAllocationData {
+        &mut self.allocations[allocation.index()]
+    }
     fn get_image_data(&self, image: GraphImage) -> &ImageData {
         &self.images[image.index()]
+    }
+    fn get_image_meta(&self, image: GraphImage) -> &ImageMeta {
+        &self.image_meta[image.index()]
     }
     fn get_image_data_mut(&mut self, image: GraphImage) -> &mut ImageData {
         &mut self.images[image.index()]
     }
     fn get_buffer_data(&self, buffer: GraphBuffer) -> &BufferData {
         &self.buffers[buffer.index()]
+    }
+    fn get_buffer_meta(&self, buffer: GraphBuffer) -> &BufferMeta {
+        &self.buffer_meta[buffer.index()]
     }
     fn get_pass_data(&self, pass: GraphPass) -> &PassData {
         &self.passes[pass.0 as usize]
@@ -553,6 +592,8 @@ impl Graph {
                             let dst_writing = buffer.is_written();
                             let src = &mut buffer_rw[buffer.handle.index()];
 
+                            let resource = GraphResource::Buffer(buffer.handle);
+
                             update_resource_state(src, p, dst_writing, data);
                         }
                     }
@@ -596,7 +637,7 @@ impl Graph {
                     PassEventData::Flush(_) => {}
                 }
             }
-        }
+        };
 
         // find any pass that writes to external resources, thus being considered to have side effects
         // outside of the graph and mark all of its dependencies as alive, any passes that don't get touched
@@ -888,6 +929,12 @@ impl Graph {
                 .map(|f| (*f, Vec::new()))
                 .collect();
 
+            // set of accesses is the first that occurs in the timeline
+            // becomes "closed" (bool = true) when the first write occurs
+            // this will be used during graph execution to synchronize with external resources
+            let mut accessors: HashMap<GraphResource, (bool, SmallVec<[TimelinePass; 2]>)> =
+                constant_ahash_hashmap();
+
             for (timeline_i, &e) in scheduled.iter().enumerate() {
                 match e.get() {
                     PassEventData::Pass(p) => {
@@ -1067,13 +1114,12 @@ impl Graph {
                         let submission_pass =
                             recorder.borrow_mut().begin_pass(timeline_pass, p, on_end);
 
-                        let pass_position = TimelinePass::new(timeline_i);
                         let data = self.get_pass_data(p);
                         let queue = data.queue;
                         let queue_family = self.get_queue_family(queue);
 
                         for (i, img) in data.images.iter().enumerate() {
-                            self.emit_barriers::<ImageMarker>(
+                            let writes = self.emit_barriers::<ImageMarker>(
                                 p,
                                 submission_pass,
                                 queue_family,
@@ -1082,10 +1128,24 @@ impl Graph {
                                 &mut *image_rw,
                                 &mut queue_family_accesses,
                             );
+                            if let ImageData::Imported(_) = self.get_image_data(img.handle) {
+                                let resource = GraphResource::Image(img.handle);
+                                let (closed, entry) = accessors.entry(resource).or_default();
+                                if !*closed {
+                                    if !writes || entry.is_empty() {
+                                        if !entry.contains(&timeline_pass) {
+                                            entry.push(timeline_pass);
+                                        }
+                                    }
+                                    if writes {
+                                        *closed = true;
+                                    }
+                                }
+                            }
                         }
 
                         for (i, buf) in data.buffers.iter().enumerate() {
-                            self.emit_barriers::<BufferMarker>(
+                            let writes = self.emit_barriers::<BufferMarker>(
                                 p,
                                 submission_pass,
                                 queue_family,
@@ -1094,6 +1154,21 @@ impl Graph {
                                 &mut *buffer_rw,
                                 &mut queue_family_accesses,
                             );
+                            // TODO deduplicate this code
+                            if let BufferData::Imported(_) = self.get_buffer_data(buf.handle) {
+                                let resource = GraphResource::Buffer(buf.handle);
+                                let (closed, entry) = accessors.entry(resource).or_default();
+                                if !*closed {
+                                    if !writes || entry.is_empty() {
+                                        if !entry.contains(&timeline_pass) {
+                                            entry.push(timeline_pass);
+                                        }
+                                    }
+                                    if writes {
+                                        *closed = true;
+                                    }
+                                }
+                            }
                         }
 
                         let mut recorder_ref = recorder.borrow_mut();
@@ -1229,12 +1304,11 @@ impl Graph {
 
             let mut scratch = Vec::new();
 
-            let mut submission_reuse =
-                vec![<SubmissionResourceReuse as Default>::default(); submissions.len()];
+            let mut submission_reuse = vec![SubmissionResourceReuse::default(); submissions.len()];
             // TODO profile how many children submissions usually have
             // a vector may be faster here
-            let mut intersection_hashmap: ahash::HashMap<GraphSubmission, u32> =
-                ahash::HashMap::with_hasher(constant_ahash_randomstate());
+            let mut intersection_hashmap: ahash::HashMap<GraphSubmission, (GraphSubmission, u32)> =
+                constant_ahash_hashmap();
 
             let image_last_touch = self.get_last_resource_usage(&image_last_state, &mut scratch);
             submission_fill_reuse::<ImageMarker>(
@@ -1250,6 +1324,163 @@ impl Graph {
                 &mut intersection_hashmap,
                 &submission_children,
             );
+
+            struct FreeResource {
+                block: MemoryBlock<()>,
+                memory_type: u32,
+            }
+
+            fn image_info_compatible(a: &ImageCreateInfo, b: &ImageCreateInfo) -> bool {
+                a.flags == b.flags
+                    && a.size == b.size
+                    && a.format == b.format
+                    && a.samples == b.samples
+                    && a.mip_levels == b.mip_levels
+                    && a.array_layers == b.array_layers
+                    && a.tiling == b.tiling
+                    && a.usage == b.usage
+                    && a.sharing_mode_concurrent == b.sharing_mode_concurrent
+                // initial layout is disregarded since resources always start out unitialized
+            }
+
+            let physical_images = std::mem::take(&mut self.physical_images);
+
+            // first try to straight out reuse previously created resources
+            for (i, img) in self.images.iter_mut().enumerate() {
+                let meta = self.get_image_meta(GraphImage::new(i));
+                if !meta.alive.get() {
+                    continue;
+                }
+                match img.deref_mut() {
+                    transient @ ImageData::TransientPrototype(info, allocation_info) => {
+                        let allocator = self.device.allocator();
+                        let memory_type = unsafe {
+                            allocator
+                                .find_memory_type_index(!0, allocation_info)
+                                .unwrap()
+                        };
+                        // FIXME incredibly unefficient, at least accelerate it with an initial hash comparison
+                        for (i, data) in physical_images.iter().enumerate() {
+                            let r_memory_type = self.get_allocation(data.allocation).memory_type;
+                            if memory_type == r_memory_type
+                                && image_info_compatible(info, &data.info)
+                            {
+                                let data = physical_images.swap_remove(i);
+                                let handle = PhysicalImage::new(self.physical_images.len());
+                                self.physical_images.push(data);
+                                *transient = ImageData::Transient(handle);
+                                break;
+                            }
+                        }
+                    }
+                    ImageData::Transient(_) => {
+                        unreachable!("Transient images are just getting assigned")
+                    }
+                    ImageData::Imported(_) => {}
+                    ImageData::Swapchain(_) => {}
+                    ImageData::Moved(_, _, _) => {}
+                }
+            }
+
+            fn buffer_info_compatible(a: &BufferCreateInfo, b: &BufferCreateInfo) -> bool {
+                a.eq(b)
+            }
+
+            let physical_buffers = std::mem::take(&mut self.physical_buffers);
+
+            // first try to straight out reuse previously created resources
+            for (i, buf) in self.buffers.iter_mut().enumerate() {
+                let meta = self.get_buffer_meta(GraphBuffer::new(i));
+                if !meta.alive.get() {
+                    continue;
+                }
+                match buf.deref_mut() {
+                    transient @ BufferData::TransientPrototype(info, allocation_info) => {
+                        let allocator = self.device.allocator();
+                        let memory_type = unsafe {
+                            allocator
+                                .find_memory_type_index(!0, allocation_info)
+                                .unwrap()
+                        };
+                        // FIXME incredibly unefficient, at least accelerate it with an initial hash comparison
+                        for (i, data) in physical_buffers.iter().enumerate() {
+                            let r_memory_type = self.get_allocation(data.allocation).memory_type;
+                            if memory_type == r_memory_type
+                                && buffer_info_compatible(info, &data.info)
+                            {
+                                let data = physical_buffers.swap_remove(i);
+                                let handle = PhysicalBuffer::new(self.physical_buffers.len());
+                                self.physical_buffers.push(data);
+                                *transient = BufferData::Transient(handle);
+                                break;
+                            }
+                        }
+                    }
+                    BufferData::Transient(_) => {
+                        unreachable!("Transient buffers are just getting assigned")
+                    }
+                    BufferData::Imported(_) => {}
+                }
+            }
+
+            let mut memory_chunks: Vec<(u32, Vec<MemoryBlock>)> = Vec::new();
+
+            enum ScheduledResourceFree {
+                Image {
+                    vkhandle: vk::Image,
+                    state: ImageMutableState,
+                },
+            }
+            let mut free_resources = Vec::new();
+            // scheduled the remaining images to be freed, we can't do this now since we've not waited for the possibly pending submissions to complete
+            // though in aliasing we will consider them unused as command buffers are filled only after such synchronization has happened
+            for img in physical_images {
+                let PhysicalImageData {
+                    info,
+                    allocation,
+                    suballocation,
+                    vkhandle,
+                    state,
+                } = img;
+                unsafe {
+                    state.destroy(&self.device);
+                    self.device
+                        .device()
+                        .destroy_image(vkhandle, self.device.allocator_callbacks());
+                    let alloc = self.get_allocation_mut(allocation);
+                    alloc.refcount -= 1;
+                }
+            }
+
+            // free the remaining buffers
+            for buf in physical_buffers {
+                let PhysicalBufferData {
+                    info,
+                    allocation,
+                    suballocation,
+                    vkhandle,
+                    state,
+                } = buf;
+                unsafe {
+                    state.destroy(&self.device);
+                    self.device
+                        .device()
+                        .destroy_buffer(vkhandle, self.device.allocator_callbacks());
+                    let alloc = self.get_allocation_mut(allocation);
+                    alloc.refcount -= 1;
+                }
+            }
+
+            let mut free_resources = Vec::new();
+            for (submission, reuse) in submissions.iter().zip(submission_reuse) {}
+
+            // for (timeline_i, &e) in scheduled.iter().enumerate() {
+            //     match e.get() {
+            //         PassEventData::Pass(_) => todo!(),
+            //         PassEventData::Move(_) => todo!(),
+            //         PassEventData::Flush(_) => todo!(),
+            //     }
+            // }
         }
 
         let mut file = OpenOptions::new()
@@ -1338,7 +1569,8 @@ impl Graph {
                 GraphResource,
             )>,
         )],
-    ) where
+    ) -> bool
+    where
         // hack because without this the typechecker is not cooperating
         T::IfImage<vk::ImageLayout>: Copy,
     {
@@ -1357,7 +1589,7 @@ impl Graph {
         let mut dst_writes = dst_touch.access.contains_write();
         let dst_layout = T::when_image(|| resource_data.start_layout());
         let normal_state = || ResourceState::Normal {
-            layout: dst_layout.clone(),
+            layout: dst_layout,
             queue_family: dst_queue_family,
             access: smallvec![dst_touch],
         };
@@ -1529,6 +1761,7 @@ impl Graph {
             // TODO perhaps this shouldn't be a hard error and instead delegate access to the move destination
             ResourceState::Moved => panic!("Attempt to access moved resource"),
         }
+        dst_writes
     }
     fn write_dot_representation(
         &mut self,
@@ -1729,7 +1962,8 @@ impl Graph {
 fn submission_fill_reuse<T: ResourceMarker>(
     resource_last_touch: impl Iterator<Item = ResourceLastUse>,
     submission_reuse: &mut [SubmissionResourceReuse],
-    intersection_hashmap: &mut ahash::HashMap<GraphSubmission, u32>,
+    // <the asociated submission, (number of parents currently counted by dfs, latest parent submission so that it isn't countet twice)>
+    intersection_hashmap: &mut ahash::HashMap<GraphSubmission, (GraphSubmission, u32)>,
     submission_children: &ImmutableGraph,
 ) {
     // we are (ab)using ResourceMarker to be generic over images
@@ -1751,15 +1985,28 @@ fn submission_fill_reuse<T: ResourceMarker>(
             ResourceLastUse::Multiple(submissions) => {
                 // we need to find nodes that (directly!) depend on all of these submissions
                 intersection_hashmap.clear();
-                for sub in &submissions {
-                    for &child in submission_children.get_children(sub.0) {
-                        *intersection_hashmap
-                            .entry(GraphSubmission(child))
-                            .or_insert(0) += 1;
-                    }
-                }
                 let len = submissions.len() as u32;
-                for (&sub, &count) in intersection_hashmap.iter() {
+                for &sub in &submissions {
+                    submission_children.dfs_visit(sub.0, |node| {
+                        let (current_parent, entry) = intersection_hashmap
+                            .entry(GraphSubmission(node))
+                            .or_insert((sub, 0));
+
+                        // we've already visited it, entry 0 if this is the first time we've encountered it
+                        if *current_parent == sub && *entry != 0 {
+                            return DFSCommand::Ascend;
+                        }
+
+                        *entry += 1;
+                        *current_parent = sub;
+                        if *entry == len {
+                            return DFSCommand::Ascend;
+                        }
+
+                        DFSCommand::Continue
+                    });
+                }
+                for (&sub, &(_, count)) in intersection_hashmap.iter() {
                     // every submission inserted the node as its child, this means that all of the submissions share it
                     if count == len {
                         let sub = &mut submission_reuse[sub.index()];
@@ -1879,7 +2126,8 @@ struct ImageMove {
 }
 enum ImageData {
     // FIXME ImageCreateInfo is large and this scheme is weird
-    Transient(object::ImageCreateInfo, Option<PhysicalImage>),
+    TransientPrototype(object::ImageCreateInfo, AllocationCreateInfo),
+    Transient(PhysicalImage),
     Imported(object::Image),
     Swapchain(object::Swapchain),
     // dst image, layer offset, layer count
@@ -1890,6 +2138,7 @@ enum ImageData {
 impl ImageData {
     fn get_variant_name(&self) -> &'static str {
         match self {
+            ImageData::TransientPrototype(..) => "TransientPrototype",
             ImageData::Transient(..) => "Transient",
             ImageData::Imported(_) => "Imported",
             ImageData::Swapchain(_) => "Swapchain",
@@ -1898,26 +2147,29 @@ impl ImageData {
     }
     fn is_sharing_concurrent(&self) -> bool {
         match self {
-            ImageData::Transient(info, _) => info.sharing_mode_concurrent,
+            ImageData::TransientPrototype(info, _) => info.sharing_mode_concurrent,
             ImageData::Imported(handle) => {
                 unsafe { handle.0.get_header() }
                     .info
                     .sharing_mode_concurrent
             }
             ImageData::Swapchain(_) => false,
-            ImageData::Moved(..) => panic!(),
+            ImageData::Transient(_) => unreachable!(),
+            ImageData::Moved(..) => unreachable!(),
         }
     }
 }
 enum BufferData {
-    Transient(object::BufferCreateInfo, Option<PhysicalBuffer>),
+    TransientPrototype(object::BufferCreateInfo, AllocationCreateInfo),
+    Transient(PhysicalBuffer),
     Imported(object::Buffer),
 }
 
 impl BufferData {
     fn is_sharing_concurrent(&self) -> bool {
         match self {
-            BufferData::Transient(info, _) => info.sharing_mode_concurrent,
+            BufferData::TransientPrototype(info, _) => info.sharing_mode_concurrent,
+            BufferData::Transient(_) => unreachable!(),
             BufferData::Imported(handle) => {
                 unsafe { handle.0.get_header() }
                     .info
@@ -2074,7 +2326,7 @@ impl GraphBuilder {
         self.0.image_meta.push(ImageMeta::new());
         self.0
             .images
-            .push(info.map_to_object(|a| ImageData::Transient(a, None)));
+            .push(info.map_to_object(|a| ImageData::TransientPrototype(a, None)));
         handle
     }
     pub fn create_buffer(&mut self, info: object::BufferCreateInfo) -> GraphBuffer {
@@ -2104,7 +2356,7 @@ impl GraphBuilder {
                 )
             };
 
-            let ImageData::Transient(first_info, ..) = self.0.get_image_data(images[0]).clone() else {
+            let ImageData::TransientPrototype(first_info, ..) = self.0.get_image_data(images[0]).clone() else {
                 invalid_data_panic(images[0], self.0.get_image_data(images[0]))
             };
             let mut first_info = first_info.clone();
@@ -2112,7 +2364,7 @@ impl GraphBuilder {
             // check that all of them are transient and that they have the same format and extent
             for &i in &images[1..] {
                 let data = &self.0.get_image_data(i);
-                let ImageData::Transient(info, ..) = data else {
+                let ImageData::TransientPrototype(info, ..) = data else {
                     invalid_data_panic(i, data)
                 };
 
@@ -2131,7 +2383,7 @@ impl GraphBuilder {
             // update the states of the move sources
             let mut layer_offset = 0;
             for &i in &images {
-                let ImageData::Transient(info, _) = self.0.get_image_data(i) else {
+                let ImageData::TransientPrototype(info, _) = self.0.get_image_data(i) else {
                     unreachable!()
                 };
 
@@ -2156,7 +2408,7 @@ impl GraphBuilder {
                 to: image,
             });
 
-            ImageData::Transient(info, None)
+            ImageData::TransientPrototype(info, None)
         });
 
         self.0.images.push(object);
@@ -2335,8 +2587,13 @@ simple_handle! {
     // like a GraphPassEvent but only ever points to a pass
     TimelinePass,
     // the pass in a submission
-    SubmissionPass
+    SubmissionPass,
+    // vma allocations
+    GraphAllocation
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MemoryTypeIndex(u32);
 
 macro_rules! optional_index {
     ($($name:ident),+) => {
@@ -2676,7 +2933,7 @@ impl<T: ResourceMarker> Default for ResourceState<T> {
 }
 
 // TODO pack this into 32 bits
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum GraphResource {
     Image(GraphImage),
     Buffer(GraphBuffer),
