@@ -1,10 +1,12 @@
 use std::{
-    cell::{Cell, RefCell, RefMut},
+    cell::{Cell, Ref, RefCell, RefMut},
     collections::{BTreeMap, BTreeSet},
     rc::Rc,
 };
 
 use crate::simple_handle;
+
+use super::GraphResource;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum MemoryKind {
@@ -22,17 +24,17 @@ pub struct MemoryChunk {
     kind: MemoryKind,
 }
 
-pub struct MemoryBlock<T> {
+pub struct MemoryBlock {
     size: u64,
     align: u64,
     chunks: Vec<MemoryChunk>,
     total_free: u64,
     allocations_counter: u32,
-    data: T,
+    allocation: pumice_vma::Allocation,
 }
 
-impl<T> MemoryBlock<T> {
-    pub fn new(size: u64, align: u64, data: T) -> Self {
+impl MemoryBlock {
+    pub fn new(size: u64, align: u64, allocation: pumice_vma::Allocation) -> Self {
         Self {
             size,
             align,
@@ -43,26 +45,25 @@ impl<T> MemoryBlock<T> {
             }],
             total_free: size,
             allocations_counter: u32::MAX,
-            data,
+            allocation,
         }
     }
-    pub fn new_used(size: u64, align: u64, kind: MemoryKind, data: T) -> (Self, BlockAllocation) {
-        (
-            Self {
-                size,
-                align,
-                chunks: vec![MemoryChunk {
-                    allocation: Some(BlockAllocation(0)),
-                    end: size,
-                    kind,
-                }],
-                total_free: 0,
-                allocations_counter: 1,
-                data,
-            },
-            BlockAllocation(0),
-        )
-    }
+    // pub fn new_used(size: u64, align: u64, kind: MemoryKind) -> (Self, BlockAllocation) {
+    //     (
+    //         Self {
+    //             size,
+    //             align,
+    //             chunks: vec![MemoryChunk {
+    //                 allocation: Some(BlockAllocation(0)),
+    //                 end: size,
+    //                 kind,
+    //             }],
+    //             total_free: 0,
+    //             allocations_counter: 1,
+    //         },
+    //         BlockAllocation(0),
+    //     )
+    // }
     pub fn free(&mut self, allocation: BlockAllocation) {
         let chunks = &self.chunks;
 
@@ -317,7 +318,7 @@ simple_handle! {
 
 #[test]
 pub fn test_block_allocator() {
-    let mut block = MemoryBlock::new(64, 64, ());
+    let mut block = MemoryBlock::new(64, 64, pumice_vma::Allocation::null());
     let (_, rem) = block
         .consider_allocate(64, 64, MemoryKind::Linear, 1, true)
         .unwrap();
@@ -328,20 +329,21 @@ pub fn test_block_allocator() {
 
 // structure managing multiple blocks, allowing to efficiently make allocations into them
 
-struct AllocatorAllocation<T> {
+pub struct AllocatorAllocation {
     allocation: BlockAllocation,
-    node: Rc<BlockAllocatorNode<T>>,
+    node: Rc<BlockAllocatorNode>,
+    resource: GraphResource,
 }
 
-struct BlockAllocatorNode<T> {
+pub struct BlockAllocatorNode {
     min_size: Cell<u64>,
     // always increasing, only used to give blocks a unique identity that isn't dependant on their min_size
     id: u32,
     // generally always Some(), Option is only used to construct a dummy node to iterate over larger actual nodes
-    block: RefCell<Option<MemoryBlock<T>>>,
+    block: RefCell<Option<MemoryBlock>>,
 }
 
-impl<T> PartialOrd for BlockAllocatorNode<T> {
+impl PartialOrd for BlockAllocatorNode {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match self.min_size.partial_cmp(&other.min_size) {
             Some(core::cmp::Ordering::Equal) => {}
@@ -352,7 +354,7 @@ impl<T> PartialOrd for BlockAllocatorNode<T> {
     }
 }
 
-impl<T> Ord for BlockAllocatorNode<T> {
+impl Ord for BlockAllocatorNode {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.min_size
             .cmp(&other.min_size)
@@ -360,26 +362,36 @@ impl<T> Ord for BlockAllocatorNode<T> {
     }
 }
 
-impl<T> PartialEq for BlockAllocatorNode<T> {
+impl PartialEq for BlockAllocatorNode {
     fn eq(&self, other: &Self) -> bool {
         self.min_size == other.min_size && self.id == other.id
     }
 }
 
-impl<T> Eq for BlockAllocatorNode<T> {}
+impl Eq for BlockAllocatorNode {}
 
-pub struct BlockAllocator<T> {
+pub struct BlockAllocator {
     // crimes
     // we're putting all the state in the key because reasons
     // don't be afraid we'll be careful not to modify the ordering while inserted within the map
     // we need a BTreeMap rather than *Set because we need the remove_entry function
-    blocks: BTreeMap<Rc<BlockAllocatorNode<T>>, ()>,
+    blocks: BTreeMap<Rc<BlockAllocatorNode>, ()>,
     monotonic: u32,
 }
 
-impl<T> BlockAllocator<T> {
-    fn free(&mut self, allocation: AllocatorAllocation<T>) {
-        let AllocatorAllocation { allocation, node } = allocation;
+impl BlockAllocator {
+    pub fn new() -> Self {
+        Self {
+            blocks: BTreeMap::new(),
+            monotonic: 0,
+        }
+    }
+    pub fn free(&mut self, allocation: AllocatorAllocation) {
+        let AllocatorAllocation {
+            allocation,
+            node,
+            resource: _,
+        } = allocation;
         let block = RefMut::map(node.block.borrow_mut(), |opt| opt.as_mut().unwrap());
         let size = block.get_allocation_size(allocation);
         block.free(allocation);
@@ -391,14 +403,19 @@ impl<T> BlockAllocator<T> {
             self.update_node_ordering(&node, &*block);
         }
     }
-    fn allocate<F: FnOnce(u64, u64, MemoryKind, u64) -> MemoryBlock<T>>(
+    pub fn allocate<
+        F1: FnOnce(u64, u64, MemoryKind, u64) -> MemoryBlock,
+        F2: FnMut(&AllocatorAllocation) -> bool,
+    >(
         &mut self,
         size: u64,
         align: u64,
         kind: MemoryKind,
         linear_nonlinear_granularity: u64,
-        new_block_fun: F,
-    ) -> AllocatorAllocation<T> {
+        new_block_fun: F1,
+        block_filter: F2,
+        resource: GraphResource,
+    ) -> AllocatorAllocation {
         let dummy = BlockAllocatorNode {
             min_size: Cell::new(size),
             id: 0,
@@ -406,7 +423,9 @@ impl<T> BlockAllocator<T> {
         };
 
         // even though the blocks have a sufficient min_size, the allocation may still not fit due to alignment padding and such
-        for (node, _) in self.blocks.range(dummy..) {
+        for (node, _) in self.blocks.range(dummy..).filter(|&(b, _)| {
+            block_filter(&*Ref::map(b.block.borrow(), |opt| opt.as_ref().unwrap()))
+        }) {
             let block = RefMut::map(node.block.borrow_mut(), |opt| opt.as_mut().unwrap());
             // TODO maybe do something fancier than first-fit
             if let Some(alloc) = block.allocate(size, align, kind, linear_nonlinear_granularity) {
@@ -420,6 +439,7 @@ impl<T> BlockAllocator<T> {
                 return AllocatorAllocation {
                     allocation: alloc,
                     node: node.clone(),
+                    resource,
                 };
             }
         }
@@ -442,6 +462,7 @@ impl<T> BlockAllocator<T> {
         let handle = AllocatorAllocation {
             allocation: alloc,
             node: node,
+            resource,
         };
 
         self.monotonic = self
@@ -451,7 +472,7 @@ impl<T> BlockAllocator<T> {
 
         handle
     }
-    fn update_node_ordering(&mut self, node: &Rc<BlockAllocatorNode<T>>, block: &MemoryBlock<T>) {
+    fn update_node_ordering(&mut self, node: &Rc<BlockAllocatorNode>, block: &MemoryBlock) {
         // we need to remove the entry, modify its ordering and then reinsert it, perfectly safe!
         let (data, _) = self
             .blocks
@@ -460,5 +481,11 @@ impl<T> BlockAllocator<T> {
         let size = block.compute_min_free_size().unwrap_or(0);
         data.min_size.set(size);
         self.blocks.insert(data, ());
+    }
+}
+
+impl Default for BlockAllocator {
+    fn default() -> Self {
+        Self::new()
     }
 }
