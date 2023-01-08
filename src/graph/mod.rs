@@ -27,13 +27,16 @@ use crate::{
     object::{
         self, BufferCreateInfo, BufferMutableState, ImageCreateInfo, ImageMutableState, Object,
     },
-    storage::{constant_ahash_hasher, constant_ahash_hashmap, constant_ahash_randomstate},
+    storage::{
+        constant_ahash_hasher, constant_ahash_hashmap, constant_ahash_hashset,
+        constant_ahash_randomstate,
+    },
     submission, token_abuse,
     util::{self, format_utils::Fun, macro_abuse::WeirdFormatter},
 };
 
 use self::{
-    allocator::BlockAllocation,
+    allocator::{AllocatorAllocation, BlockAllocation, BlockAllocator},
     reverse_edges::{DFSCommand, ImmutableGraph, NodeGraph},
 };
 
@@ -170,27 +173,27 @@ enum SpecialBarrier {
         dst_family: u32,
     },
 }
-
-struct GraphAllocationData {
-    vma_allocation: Allocation,
+struct GraphMemoryType {
+    allocator: BlockAllocator,
     memory_type: u32,
-    refcount: u32,
 }
 
 struct PhysicalImageData {
     info: ImageCreateInfo,
-    allocation: GraphAllocation,
+    allocation: AllocatorAllocation,
     suballocation: BlockAllocation,
     vkhandle: vk::Image,
     state: ImageMutableState,
+    memory_type: u32
 }
 
 struct PhysicalBufferData {
     info: BufferCreateInfo,
-    allocation: GraphAllocation,
+    allocation: AllocatorAllocation,
     suballocation: BlockAllocation,
     vkhandle: vk::Buffer,
     state: BufferMutableState,
+    memory_type: u32
 }
 
 #[derive(Clone)]
@@ -219,8 +222,7 @@ pub struct Graph {
 
     pass_children: ImmutableGraph,
 
-    // allocation, memory type, refcount
-    allocations: Vec<GraphAllocationData>,
+    memory: Box<[GraphMemoryType; vk::MAX_MEMORY_TYPES as usize]>,
     physical_images: Vec<PhysicalImageData>,
     physical_buffers: Vec<PhysicalBufferData>,
 
@@ -240,7 +242,7 @@ impl Graph {
             image_meta: Vec::new(),
             buffer_meta: Vec::new(),
             pass_children: Default::default(),
-            allocations: Vec::new(),
+            memory: Vec::new(),
             physical_images: Vec::new(),
             physical_buffers: Vec::new(),
             device,
@@ -342,12 +344,6 @@ impl Graph {
     }
     fn is_pass_alive(&self, pass: GraphPass) -> bool {
         self.pass_meta[pass.index()].alive.get()
-    }
-    fn get_allocation(&self, allocation: GraphAllocation) -> &GraphAllocationData {
-        &self.allocations[allocation.index()]
-    }
-    fn get_allocation_mut(&mut self, allocation: GraphAllocation) -> &mut GraphAllocationData {
-        &mut self.allocations[allocation.index()]
     }
     fn get_image_data(&self, image: GraphImage) -> &ImageData {
         &self.images[image.index()]
@@ -911,7 +907,7 @@ impl Graph {
 
             // some random buffers extracted here to keep the allocations
             let mut waitfor_submissions: Vec<GraphSubmission> = Vec::new();
-            let mut waitfor_resources: Vec<GraphResource> = Vec::new();
+            let mut waitfor_resources: Vec = Vec::new();
             // (src queue family, src pass, dst pass, resource in question)
             let mut queue_family_accesses: SmallVec<
                 [(
@@ -1325,11 +1321,6 @@ impl Graph {
                 &submission_children,
             );
 
-            struct FreeResource {
-                block: MemoryBlock<()>,
-                memory_type: u32,
-            }
-
             fn image_info_compatible(a: &ImageCreateInfo, b: &ImageCreateInfo) -> bool {
                 a.flags == b.flags
                     && a.size == b.size
@@ -1359,7 +1350,7 @@ impl Graph {
                                 .find_memory_type_index(!0, allocation_info)
                                 .unwrap()
                         };
-                        // FIXME incredibly unefficient, at least accelerate it with an initial hash comparison
+                        // FIXME incredibly unefficient, at least accelerate it with an initial hash comparison or a bloom filter
                         for (i, data) in physical_images.iter().enumerate() {
                             let r_memory_type = self.get_allocation(data.allocation).memory_type;
                             if memory_type == r_memory_type
@@ -1402,8 +1393,10 @@ impl Graph {
                                 .find_memory_type_index(!0, allocation_info)
                                 .unwrap()
                         };
+
                         // FIXME incredibly unefficient, at least accelerate it with an initial hash comparison
                         for (i, data) in physical_buffers.iter().enumerate() {
+                            data.allocation
                             let r_memory_type = self.get_allocation(data.allocation).memory_type;
                             if memory_type == r_memory_type
                                 && buffer_info_compatible(info, &data.info)
@@ -1422,8 +1415,6 @@ impl Graph {
                     BufferData::Imported(_) => {}
                 }
             }
-
-            let mut memory_chunks: Vec<(u32, Vec<MemoryBlock>)> = Vec::new();
 
             enum ScheduledResourceFree {
                 Image {
@@ -2334,7 +2325,7 @@ impl GraphBuilder {
         self.0.buffer_meta.push(BufferMeta::new());
         self.0
             .buffers
-            .push(info.map_to_object(|a| BufferData::Transient(a, None)));
+            .push(info.map_to_object(|a| BufferData::TransientPrototype(a, None)));
         handle
     }
     #[track_caller]
@@ -2589,7 +2580,8 @@ simple_handle! {
     // the pass in a submission
     SubmissionPass,
     // vma allocations
-    GraphAllocation
+    GraphAllocation,
+    GraphMemoryTypeHandle
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3273,7 +3265,7 @@ impl<'a> NodeGraph for SubmissionFacade<'a> {
 
 // TODO think of a better name
 // keeps track of which resources become available in a submission
-#[derive(Default, Clone)]
+#[derive(Clone)]
 struct SubmissionResourceReuse {
     // these are available imediatelly after a submission starts
     // because the previous users ended in its dependency submissions
@@ -3282,4 +3274,35 @@ struct SubmissionResourceReuse {
     // these become available only after all of the passes have ended in the submission
     dead_images_local: Vec<(GraphImage, SmallVec<[SubmissionPass; 4]>)>,
     dead_buffers_local: Vec<(GraphBuffer, SmallVec<[SubmissionPass; 4]>)>,
+    // hashmap which holds handles of all resources which are currently verifiably dead / eligible for reuse
+    // this is filled as passes are processed when replaying the timeline
+    current_available_resources: ahash::HashSet,
+}
+
+impl SubmissionResourceReuse {
+    // merges all current_available_resources resources from dependencies which have now been closed
+    fn open(
+        &mut self,
+        this: GraphSubmission,
+        submissions: &[Submission],
+        reuses: &[SubmissionResourceReuse],
+    ) {
+        let set = &mut self.current_available_resources;
+        let this = &submissions[this.index()];
+        for d in this.semaphore_dependencies {
+            set.extend(&reuses[d.index()].current_available_resources);
+        }
+    }
+}
+
+impl Default for SubmissionResourceReuse {
+    fn default() -> Self {
+        Self {
+            dead_images: Default::default(),
+            dead_buffers: Default::default(),
+            dead_images_local: Default::default(),
+            dead_buffers_local: Default::default(),
+            current_available_resources: constant_ahash_hashset(),
+        }
+    }
 }

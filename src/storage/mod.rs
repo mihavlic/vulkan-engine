@@ -143,3 +143,7 @@ pub(crate) fn constant_ahash_hasher() -> ahash::AHasher {
 pub(crate) fn constant_ahash_hashmap<K, V>() -> ahash::HashMap<K, V> {
     ahash::HashMap::with_hasher(constant_ahash_randomstate())
 }
+
+pub(crate) fn constant_ahash_hashset<K>() -> ahash::HashSet<K> {
+    ahash::HashSet::with_hasher(constant_ahash_randomstate())
+}
