@@ -25,7 +25,7 @@ pub struct SwapchainCreateInfo {
 }
 
 impl SwapchainCreateInfo {
-    pub fn as_raw(&self) -> vk::SwapchainCreateInfoKHR {
+    pub fn to_vk(&self) -> vk::SwapchainCreateInfoKHR {
         vk::SwapchainCreateInfoKHR {
             p_next: ptr::null(),
             flags: self.flags,
@@ -49,6 +49,7 @@ impl SwapchainCreateInfo {
     }
 }
 
+#[derive(Clone)]
 pub struct Swapchain(pub(crate) ArcHandle<Self>);
 impl Object for Swapchain {
     type CreateInfo = SwapchainCreateInfo;
@@ -64,7 +65,7 @@ impl Object for Swapchain {
         info: &Self::CreateInfo,
         allocation_info: &Self::SupplementalInfo,
     ) -> VulkanResult<(Self::Handle, Self::ObjectData)> {
-        let info = info.as_raw();
+        let info = info.to_vk();
         ctx.device
             .create_swapchain_khr(&info, ctx.instance.allocator_callbacks())
             .map(|handle| (handle, ()))
