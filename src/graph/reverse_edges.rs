@@ -30,7 +30,7 @@ pub trait NodeGraph {
 fn dfs_visit_inner<T: NodeGraph + ?Sized, F: FnMut(NodeKey) -> DFSCommand>(
     graph: &T,
     root: NodeKey,
-    fun: F,
+    mut fun: F,
 ) -> DFSCommand {
     match fun(root) {
         DFSCommand::Continue => {}
@@ -40,7 +40,7 @@ fn dfs_visit_inner<T: NodeGraph + ?Sized, F: FnMut(NodeKey) -> DFSCommand>(
 
     for c in graph.children(root) {
         let node = graph.get_child(root, c);
-        match dfs_visit_inner(graph, root, fun) {
+        match dfs_visit_inner(graph, root, &mut fun) {
             DFSCommand::Continue => {}
             DFSCommand::Ascend => return DFSCommand::Continue,
             DFSCommand::End => return DFSCommand::End,

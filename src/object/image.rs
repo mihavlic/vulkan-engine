@@ -86,7 +86,7 @@ pub struct ImageCreateInfo {
 }
 
 impl ImageCreateInfo {
-    pub fn as_raw(&self) -> vk::ImageCreateInfo {
+    pub fn to_vk(&self) -> vk::ImageCreateInfo {
         vk::ImageCreateInfo {
             p_next: ptr::null(),
             flags: self.flags,
@@ -209,6 +209,7 @@ impl ImageMutableState {
     }
 }
 
+#[derive(Clone)]
 pub struct Image(pub(crate) ArcHandle<Self>);
 impl Object for Image {
     type CreateInfo = ImageCreateInfo;
@@ -224,7 +225,7 @@ impl Object for Image {
         info: &Self::CreateInfo,
         allocation_info: &Self::SupplementalInfo,
     ) -> VulkanResult<(Self::Handle, Self::ObjectData)> {
-        let image_info = info.as_raw();
+        let image_info = info.to_vk();
         ctx.allocator
             .create_image(&image_info, allocation_info)
             .map(|(handle, allocation, _)| {

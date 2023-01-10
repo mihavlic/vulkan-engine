@@ -24,7 +24,7 @@ pub struct BufferCreateInfo {
 }
 
 impl BufferCreateInfo {
-    pub fn as_raw(&self) -> vk::BufferCreateInfo {
+    pub fn to_vk(&self) -> vk::BufferCreateInfo {
         vk::BufferCreateInfo {
             p_next: ptr::null(),
             flags: self.flags,
@@ -134,6 +134,7 @@ impl BufferMutableState {
     }
 }
 
+#[derive(Clone)]
 pub struct Buffer(pub(crate) ArcHandle<Self>);
 impl Object for Buffer {
     type CreateInfo = BufferCreateInfo;
@@ -149,7 +150,7 @@ impl Object for Buffer {
         info: &Self::CreateInfo,
         allocation_info: &Self::SupplementalInfo,
     ) -> VulkanResult<(Self::Handle, Self::ObjectData)> {
-        let image_info = info.as_raw();
+        let image_info = info.to_vk();
         ctx.allocator
             .create_buffer(&image_info, allocation_info)
             .map(|(handle, allocation, _)| {
