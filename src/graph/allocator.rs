@@ -98,7 +98,7 @@ impl Suballocator {
             id_counter: 0,
         }
     }
-    pub(crate) fn reset(&mut self, keep: &[(SuballocationUgh, AvailabilityToken)]) {
+    pub(crate) fn reset(&mut self) {
         let mut memory_blocks = constant_ahash_hashset();
         for (key, (alloc, memory)) in &self.allocations {
             memory_blocks.insert(RcPtrComparator(memory.clone()));

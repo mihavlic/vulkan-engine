@@ -388,6 +388,9 @@ impl Graph {
     fn get_buffer_data(&self, buffer: GraphBuffer) -> &BufferData {
         &self.buffers[buffer.index()]
     }
+    fn get_buffer_data_mut(&mut self, buffer: GraphBuffer) -> &mut BufferData {
+        &mut self.buffers[buffer.index()]
+    }
     fn get_physical_buffer_data(&self, buffer: PhysicalBuffer) -> &PhysicalBufferData {
         &self.physical_buffers[buffer.index()]
     }
@@ -1262,6 +1265,12 @@ impl Graph {
 
             let mut submissions = RefCell::into_inner(recorder).finish();
 
+            for sub in &mut submissions {
+                // may not be sorted due to later submissions possibly adding barriers willy nilly
+                sub.barriers.sort_unstable_by_key(|(pass, _)| *pass);
+                sub.special_barriers.sort_unstable_by_key(|(pass, _)| *pass);
+            }
+
             // perform transitive reduction on the submissions
             // lifted from petgraph, https://docs.rs/petgraph/latest/petgraph/algo/tred/fn.dag_transitive_reduction_closure.html
             {
@@ -1365,131 +1374,167 @@ impl Graph {
                 &mut availibility_interner,
             );
 
-            macro_rules! generate_hash_eq {
-                ($hash_fun:ident, $cmp_fun:ident, ($state_ty1:ty, $state_ty2:ty); $($field1:ident)+ + $($field2:ident)*) => {
-                    fn $hash_fun(data1: $state_ty1, data2: $state_ty2) -> u64 {
-                        let mut hasher = constant_ahash_hasher();
-                        $(
-                            data1.$field1.hash(&mut hasher);
-                        )+
-                        $(
-                            data2.$field2.hash(&mut hasher);
-                        )*
-                        hasher.finish()
-                    }
-                    fn $cmp_fun((data1_1, data2_1): ($state_ty1, $state_ty2), (data1_2, data2_2): ($state_ty1, $state_ty2)) -> bool {
-                        $(
-                            data1_1.$field1 == data1_2.$field1
-                        )&&+
-                        $(
-                            && data2_1.$field2 == data2_2.$field2
-                        )*
-                    }
-                };
+            for a in self.memory.borrow_mut().iter_mut() {
+                a.allocator.reset();
             }
 
-            struct Dummy<T> {
-                i: T,
-            }
+            // Resource reuse is currently not implemented since we will need a more extensive liveness tracking scheme
+            // the current idea is to represent the lifetime of each resource as two "edges" - two sets of nodes of all the passes which use the resource
+            // that serve as the roots of the graph:
+            //
+            //  [X] [X] [X]     start_edge_nodes marked with []
+            //    \ /   /
+            //     X   X
+            //     |\ / \
+            //     | X   \
+            //     |/     \
+            //    (X)     (X)   end_edge_nodes with ()
+            //
+            // We will also precompute all passes (use submissions for external passes instead) which are "observed" to end or or which can observe end edge nodes
+            // on a simpler case:
+            //
+            //   S   S    -- start_nodes which all [X] passes can observe to end
+            //    \ /
+            //    [X]     -- start_edge_nodes
+            //     |
+            //     X
+            //     |
+            //    (X)     -- end_edge_nodes
+            //    / \
+            //   E   E    -- end_nodes which can observe all (X) passes end
+            //
+            // When checking where two ranges are disjoint and safe to alias, we'll return whether end_nodes are all observable from start_edge_nodes
+            // we will perform this check two times for both permutations of the two ranges, if none return true, the ranges aren't disjoint
+            // as an optimization, we seemingly only need to store end_nodes and start_edge_nodes to do this.
+            //
+            // We will also need to actually build a dependency graph for passes within a submission, we cannot reuse the existing one since the use of barriers
+            // may create more dependencies and it would be useful to track / exploit them.
 
-            impl<T> Dummy<T> {
-                fn new(i: T) -> Self {
-                    Self { i }
-                }
-            }
+            // macro_rules! generate_hash_eq {
+            //     ($hash_fun:ident, $cmp_fun:ident, ($state_ty1:ty, $state_ty2:ty); $($field1:ident)+ + $($field2:ident)*) => {
+            //         fn $hash_fun(data1: $state_ty1, data2: $state_ty2) -> u64 {
+            //             let mut hasher = constant_ahash_hasher();
+            //             $(
+            //                 data1.$field1.hash(&mut hasher);
+            //             )+
+            //             $(
+            //                 data2.$field2.hash(&mut hasher);
+            //             )*
+            //             hasher.finish()
+            //         }
+            //         fn $cmp_fun((data1_1, data2_1): ($state_ty1, $state_ty2), (data1_2, data2_2): ($state_ty1, $state_ty2)) -> bool {
+            //             $(
+            //                 data1_1.$field1 == data1_2.$field1
+            //             )&&+
+            //             $(
+            //                 && data2_1.$field2 == data2_2.$field2
+            //             )*
+            //         }
+            //     };
+            // }
 
-            // image reuse
+            // struct Dummy<T> {
+            //     i: T,
+            // }
 
-            generate_hash_eq! {
-                image_info_hash, image_info_eq, (&ImageCreateInfo, Dummy<u32>);
-                flags
-                size
-                format
-                samples
-                mip_levels
-                array_layers
-                tiling
-                usage
-                sharing_mode_concurrent
-                +
-                i
-            }
+            // impl<T> Dummy<T> {
+            //     fn new(i: T) -> Self {
+            //         Self { i }
+            //     }
+            // }
+
+            // // image reuse
+
+            // generate_hash_eq! {
+            //     image_info_hash, image_info_eq, (&ImageCreateInfo, Dummy<u32>);
+            //     flags
+            //     size
+            //     format
+            //     samples
+            //     mip_levels
+            //     array_layers
+            //     tiling
+            //     usage
+            //     sharing_mode_concurrent
+            //     +
+            //     i
+            // }
 
             let mut physical_images = self.physical_images.drain(..).map(Some).collect::<Vec<_>>();
 
-            let mut image_reuse = self
-                .physical_images
-                .iter()
-                .enumerate()
-                .map(|(i, data)| {
-                    let hash = image_info_hash(&data.info, Dummy::new(data.get_memory_type()));
-                    let handle = PhysicalImage::new(i);
-                    (hash, handle)
-                })
-                .collect::<Vec<_>>();
+            // let mut image_reuse = self
+            //     .physical_images
+            //     .iter()
+            //     .enumerate()
+            //     .map(|(i, data)| {
+            //         let hash = image_info_hash(&data.info, Dummy::new(data.get_memory_type()));
+            //         let handle = PhysicalImage::new(i);
+            //         (hash, handle)
+            //     })
+            //     .collect::<Vec<_>>();
 
-            image_reuse.sort_by_key(|&(hash, _)| hash);
+            // image_reuse.sort_by_key(|&(hash, _)| hash);
 
-            // first try to straight out reuse previously created resources
-            for (i, img) in self.images.iter_mut().enumerate() {
-                let meta = &self.image_meta[i];
-                if !meta.alive.get() {
-                    continue;
-                }
-                let transient = GraphObject::deref_mut(img);
-                match transient {
-                    ImageData::TransientPrototype(info, allocation_info) => {
-                        let allocator = self.device.allocator();
-                        let memory_type = unsafe {
-                            allocator
-                                .find_memory_type_index(!0, allocation_info)
-                                .unwrap()
-                        };
+            // // first try to straight out reuse previously created resources
+            // for (i, img) in self.images.iter_mut().enumerate() {
+            //     let meta = &self.image_meta[i];
+            //     if !meta.alive.get() {
+            //         continue;
+            //     }
+            //     let transient = GraphObject::deref_mut(img);
+            //     match transient {
+            //         ImageData::TransientPrototype(info, allocation_info) => {
+            //             let allocator = self.device.allocator();
+            //             let memory_type = unsafe {
+            //                 allocator
+            //                     .find_memory_type_index(!0, allocation_info)
+            //                     .unwrap()
+            //             };
 
-                        let hash = image_info_hash(info, Dummy::new(memory_type));
+            //             let hash = image_info_hash(info, Dummy::new(memory_type));
 
-                        let Ok(found) = image_reuse.binary_search_by_key(&hash, |&(hash, _)| hash) else {
-                            continue;
-                        };
+            //             let Ok(found) = image_reuse.binary_search_by_key(&hash, |&(hash, _)| hash) else {
+            //                 continue;
+            //             };
 
-                        let (_, physical_image) = image_reuse[found];
-                        let physical_data = &self.physical_images[physical_image.index()];
+            //             let (_, physical_image) = image_reuse[found];
+            //             let physical_data = &self.physical_images[physical_image.index()];
 
-                        if image_info_eq(
-                            (info, Dummy::new(memory_type)),
-                            (
-                                &physical_data.info,
-                                Dummy::new(physical_data.get_memory_type()),
-                            ),
-                        ) {
-                            // TODO check that we can alias the memory
+            //             if image_info_eq(
+            //                 (info, Dummy::new(memory_type)),
+            //                 (
+            //                     &physical_data.info,
+            //                     Dummy::new(physical_data.get_memory_type()),
+            //                 ),
+            //             ) {
+            //                 // TODO check that we can alias the memory
 
-                            // FIXME use some structure with more efficient removes
-                            image_reuse.remove(found);
+            //                 // FIXME use some structure with more efficient removes
+            //                 image_reuse.remove(found);
 
-                            let handle = PhysicalImage::new(self.physical_images.len());
-                            let data = physical_images[physical_image.index()].take().unwrap();
-                            self.physical_images.push(data);
-                            *transient = ImageData::Transient(handle);
-                        }
-                    }
-                    ImageData::Transient(_) => {
-                        unreachable!("Transient resources are just getting assigned")
-                    }
-                    ImageData::Imported(_) => {}
-                    ImageData::Swapchain(_) => {}
-                    ImageData::Moved(_, _, _) => {}
-                }
-            }
+            //                 let handle = PhysicalImage::new(self.physical_images.len());
+            //                 let data = physical_images[physical_image.index()].take().unwrap();
+            //                 self.physical_images.push(data);
+            //                 *transient = ImageData::Transient(handle);
+            //             }
+            //         }
+            //         ImageData::Transient(_) => {
+            //             unreachable!("Transient resources are just getting assigned")
+            //         }
+            //         ImageData::Imported(_) => {}
+            //         ImageData::Swapchain(_) => {}
+            //         ImageData::Moved(_, _, _) => {}
+            //     }
+            // }
 
-            // buffer reuse
+            // // buffer reuse
 
-            generate_hash_eq! {
-                buffer_info_hash, buffer_info_eq, (Dummy<&BufferCreateInfo>, Dummy<u32>);
-                i
-                +
-                i
-            }
+            // generate_hash_eq! {
+            //     buffer_info_hash, buffer_info_eq, (Dummy<&BufferCreateInfo>, Dummy<u32>);
+            //     i
+            //     +
+            //     i
+            // }
 
             let mut physical_buffers = self
                 .physical_buffers
@@ -1497,70 +1542,70 @@ impl Graph {
                 .map(Some)
                 .collect::<Vec<_>>();
 
-            let mut resource_reuse = self
-                .physical_buffers
-                .iter()
-                .enumerate()
-                .map(|(i, data)| {
-                    let hash = buffer_info_hash(
-                        Dummy::new(&data.info),
-                        Dummy::new(data.get_memory_type()),
-                    );
-                    let handle = PhysicalBuffer::new(i);
-                    (hash, handle)
-                })
-                .collect::<Vec<_>>();
+            // let mut buffer_reuse = self
+            //     .physical_buffers
+            //     .iter()
+            //     .enumerate()
+            //     .map(|(i, data)| {
+            //         let hash = buffer_info_hash(
+            //             Dummy::new(&data.info),
+            //             Dummy::new(data.get_memory_type()),
+            //         );
+            //         let handle = PhysicalBuffer::new(i);
+            //         (hash, handle)
+            //     })
+            //     .collect::<Vec<_>>();
 
-            resource_reuse.sort_by_key(|&(hash, _)| hash);
+            // buffer_reuse.sort_by_key(|&(hash, _)| hash);
 
-            // first try to straight out reuse previously created resources
-            // FIXME code duplication
-            for (i, img) in self.buffers.iter_mut().enumerate() {
-                let meta = &self.buffer_meta[i];
-                if !meta.alive.get() {
-                    continue;
-                }
-                let transient = GraphObject::deref_mut(img);
-                match transient {
-                    BufferData::TransientPrototype(info, allocation_info) => {
-                        let allocator = self.device.allocator();
-                        let memory_type = unsafe {
-                            allocator
-                                .find_memory_type_index(!0, allocation_info)
-                                .unwrap()
-                        };
+            // // first try to straight out reuse previously created resources
+            // // FIXME code duplication
+            // for (i, img) in self.buffers.iter_mut().enumerate() {
+            //     let meta = &self.buffer_meta[i];
+            //     if !meta.alive.get() {
+            //         continue;
+            //     }
+            //     let transient = GraphObject::deref_mut(img);
+            //     match transient {
+            //         BufferData::TransientPrototype(info, allocation_info) => {
+            //             let allocator = self.device.allocator();
+            //             let memory_type = unsafe {
+            //                 allocator
+            //                     .find_memory_type_index(!0, allocation_info)
+            //                     .unwrap()
+            //             };
 
-                        let hash = buffer_info_hash(Dummy::new(info), Dummy::new(memory_type));
+            //             let hash = buffer_info_hash(Dummy::new(info), Dummy::new(memory_type));
 
-                        let Ok(found) = resource_reuse.binary_search_by_key(&hash, |&(hash, _)| hash) else {
-                            continue;
-                        };
+            //             let Ok(found) = buffer_reuse.binary_search_by_key(&hash, |&(hash, _)| hash) else {
+            //                 continue;
+            //             };
 
-                        let (_, physical_buffer) = resource_reuse[found];
-                        let physical_data = &self.physical_buffers[physical_buffer.index()];
+            //             let (_, physical_buffer) = buffer_reuse[found];
+            //             let physical_data = &self.physical_buffers[physical_buffer.index()];
 
-                        if buffer_info_eq(
-                            (Dummy::new(info), Dummy::new(memory_type)),
-                            (
-                                Dummy::new(&physical_data.info),
-                                Dummy::new(physical_data.get_memory_type()),
-                            ),
-                        ) {
-                            // FIXME use some structure with more efficient removes
-                            resource_reuse.remove(found);
+            //             if buffer_info_eq(
+            //                 (Dummy::new(info), Dummy::new(memory_type)),
+            //                 (
+            //                     Dummy::new(&physical_data.info),
+            //                     Dummy::new(physical_data.get_memory_type()),
+            //                 ),
+            //             ) {
+            //                 // FIXME use some structure with more efficient removes
+            //                 buffer_reuse.remove(found);
 
-                            let handle = PhysicalBuffer::new(self.physical_buffers.len());
-                            let data = physical_buffers[physical_buffer.index()].take().unwrap();
-                            self.physical_buffers.push(data);
-                            *transient = BufferData::Transient(handle);
-                        }
-                    }
-                    BufferData::Transient(_) => {
-                        unreachable!("Transient resources are just getting assigned")
-                    }
-                    BufferData::Imported(_) => {}
-                }
-            }
+            //                 let handle = PhysicalBuffer::new(self.physical_buffers.len());
+            //                 let data = physical_buffers[physical_buffer.index()].take().unwrap();
+            //                 self.physical_buffers.push(data);
+            //                 *transient = BufferData::Transient(handle);
+            //             }
+            //         }
+            //         BufferData::Transient(_) => {
+            //             unreachable!("Transient resources are just getting assigned")
+            //         }
+            //         BufferData::Imported(_) => {}
+            //     }
+            // }
 
             enum DeferredResourceFree {
                 Image {
@@ -1617,7 +1662,7 @@ impl Graph {
             let mut need_alloc = Vec::new();
             let mut pass_effects: Vec<(vk::PipelineStageFlags2KHR, Vec<AvailabilityToken>)> =
                 Vec::new();
-            // refcount, token
+            // token, refcount
             let mut after_local_passes: ahash::HashMap<AvailabilityToken, u32> =
                 constant_ahash_hashmap();
             for (i, submission) in submissions.iter().enumerate() {
@@ -1627,8 +1672,16 @@ impl Graph {
                     &mut submission_reuse,
                 );
 
-                if submission.passes.len() < pass_effects.len() {
+                if submission.passes.len() == 1 {
+                    let a = 2;
+                }
+
+                if submission.passes.len() > pass_effects.len() {
                     pass_effects.resize(submission.passes.len(), Default::default());
+                }
+
+                for (_, vec) in &mut pass_effects {
+                    vec.clear();
                 }
 
                 let reuse = &mut submission_reuse[i];
@@ -1789,12 +1842,29 @@ impl Graph {
                             // TODO oom handling
                             .expect("Failed to allocate memory from VMA, TODO handle this");
 
+                        let allocation = suballocation.memory.allocation;
+                        let memory_info =
+                            unsafe { self.device.allocator().get_allocation_info(allocation) };
+
                         match *resource {
                             NeedAlloc::Image { vkhandle, handle } => {
                                 let data = self.get_image_data(handle);
                                 let ImageData::TransientPrototype(create_info, allocation_info) = data else {
                                     unreachable!()
                                 };
+                                let allocation = suballocation.memory.allocation;
+
+                                unsafe {
+                                    // TODO consider using bind_image_memory2
+                                    self.device
+                                        .device()
+                                        .bind_image_memory(
+                                            vkhandle,
+                                            memory_info.device_memory,
+                                            memory_info.offset + suballocation.offset,
+                                        )
+                                        .unwrap();
+                                }
                                 let physical = PhysicalImage::new(self.physical_images.len());
                                 self.physical_images.push(PhysicalImageData {
                                     info: create_info.clone(),
@@ -1806,7 +1876,33 @@ impl Graph {
                                 });
                                 *self.get_image_data_mut(handle) = ImageData::Transient(physical);
                             }
-                            NeedAlloc::Buffer { vkhandle, handle } => todo!(),
+                            NeedAlloc::Buffer { vkhandle, handle } => {
+                                let data = self.get_buffer_data(handle);
+                                let BufferData::TransientPrototype(create_info, allocation_info) = data else {
+                                    unreachable!()
+                                };
+                                let allocation = suballocation.memory.allocation;
+
+                                unsafe {
+                                    // TODO consider using bind_buffer_memory2
+                                    self.device
+                                        .device()
+                                        .bind_buffer_memory(
+                                            vkhandle,
+                                            memory_info.device_memory,
+                                            memory_info.offset + suballocation.offset,
+                                        )
+                                        .unwrap();
+                                }
+                                let physical = PhysicalBuffer::new(self.physical_buffers.len());
+                                self.physical_buffers.push(PhysicalBufferData {
+                                    info: create_info.clone(),
+                                    memory: suballocation,
+                                    vkhandle,
+                                    state: BufferMutableState::new(),
+                                });
+                                *self.get_buffer_data_mut(handle) = BufferData::Transient(physical);
+                            }
                         }
                     }
                 }
@@ -1819,16 +1915,15 @@ impl Graph {
             }
         }
 
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open("target/test.dot")
-            .unwrap();
-
+        // let mut file = OpenOptions::new()
+        //     .write(true)
+        //     .create(true)
+        //     .truncate(true)
+        //     .open("target/test.dot")
+        //     .unwrap();
         // cargo test --quiet -- graph::test_graph --nocapture && cat target/test.dot | dot -Tpng -o target/out.png
         // self.write_dot_representation(&submissions, &mut file);
-        Self::write_submissions_dot_representation(&submissions, &mut file);
+        // Self::write_submissions_dot_representation(&submissions, &mut file);
     }
 
     fn get_last_resource_usage<'a, T: ResourceMarker>(
@@ -3344,11 +3439,6 @@ impl OpenSubmision {
             barriers: self.barriers.clone(),
             special_barriers: self.special_barriers.clone(),
         };
-
-        // may not be sorted
-        take.barriers.sort_unstable_by_key(|(pass, _)| *pass);
-        take.special_barriers
-            .sort_unstable_by_key(|(pass, _)| *pass);
 
         self.current_pass.take();
         self.pass_effects.clear();

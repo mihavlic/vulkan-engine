@@ -11,7 +11,9 @@
             "cargo": {
                 "args": [
                     "test",
-                    "--quiet",
+                    "--no-run",
+                    "--lib",
+                    "--package=graph",
                     "--",
                     "graph::test_graph",
                 ],
