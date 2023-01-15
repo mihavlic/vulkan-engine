@@ -127,6 +127,17 @@ impl<K: Key, T> GenArena<K, T> {
 
         Some(unsafe { self.remove_internal(index) })
     }
+    pub fn clear(&mut self) {
+        self.next_free = Optional::new_none();
+
+        let mut prev: Option<usize> = None;
+        for i in (0..self.entries.len()).rev() {
+            let entry = unsafe { self.entries.get_unchecked_mut(i) };
+            if entry.occupied() {
+                unsafe { self.remove_internal(UInt::from_usize(i)) };
+            }
+        }
+    }
     unsafe fn remove_internal(&mut self, index: <K as Key>::StoredIndex) -> T {
         let entry = self.entries.get_unchecked_mut(index.into_usize());
         entry.generation = entry.generation + 1.into();
@@ -154,8 +165,7 @@ impl<K: Key, T> GenArena<K, T> {
             return false;
         };
 
-        let generation = key.generation();
-        entry.generation == generation
+        entry.generation == key.generation()
     }
     pub fn capacity(&self) -> usize {
         self.entries.len()

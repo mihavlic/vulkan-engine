@@ -9,9 +9,11 @@ pub use surface::*;
 pub use swapchain::*;
 
 use pumice::VulkanResult;
-use std::{hash::Hash, mem::ManuallyDrop, ptr::NonNull};
+use std::{borrow::BorrowMut, cell::RefMut, hash::Hash, mem::ManuallyDrop, ptr::NonNull};
 
-use crate::storage::{ArcHeader, ObjectHeader, ObjectStorage};
+use crate::storage::{
+    ArcHeader, MutableShared, ObjectHeader, ObjectMutable, ObjectStorage, SynchronizationLock,
+};
 
 pub(crate) trait Object: Sized {
     type CreateInfo;
@@ -31,7 +33,8 @@ pub(crate) trait Object: Sized {
     unsafe fn destroy(
         ctx: &Self::Parent,
         handle: Self::Handle,
-        data: &Self::ObjectData,
+        header: &ObjectHeader<Self>,
+        lock: &SynchronizationLock,
     ) -> VulkanResult<()>;
 
     unsafe fn get_storage(parent: &Self::Parent) -> &Self::Storage;
@@ -40,6 +43,9 @@ pub(crate) trait Object: Sized {
 pub(crate) struct ArcHandle<T: Object>(pub(crate) NonNull<ArcHeader<T>>);
 
 impl<T: Object> ArcHandle<T> {
+    pub unsafe fn get_handle(&self) -> T::Handle {
+        self.get_header().handle
+    }
     pub unsafe fn get_header(&self) -> &ObjectHeader<T> {
         &self.0.as_ref().header
     }
@@ -57,6 +63,27 @@ impl<T: Object> ArcHandle<T> {
     }
     pub(crate) unsafe fn make_weak_copy(&self) -> ManuallyDrop<Self> {
         ManuallyDrop::new(std::ptr::read(self))
+    }
+    pub(crate) unsafe fn access_mutable<
+        A,
+        B,
+        F: FnOnce(&T::ObjectData) -> &MutableShared<A>,
+        F2: FnOnce(&mut A) -> B,
+    >(
+        &self,
+        fun1: F,
+        fun2: F2,
+    ) -> B {
+        let storage = self.get_storage();
+        let lock = storage.acquire_exclusive(self);
+
+        let mutable = fun1(&self.get_header().object_data);
+        let mut refmut = mutable.get_mut(&lock);
+
+        fun2(refmut.borrow_mut())
+    }
+    pub fn address(&self) -> usize {
+        self.0.as_ptr() as usize
     }
 }
 

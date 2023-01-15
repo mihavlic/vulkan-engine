@@ -87,7 +87,6 @@ impl Semaphore {
 
 pub struct QueueSubmitData {
     finished: AtomicBool,
-    queue: Queue,
     semaphore: Semaphore,
 }
 
@@ -116,7 +115,7 @@ impl SubmissionManager {
         wait_any: bool,
         device: &Device,
     ) -> VulkanResult<WaitResult> {
-        let mut timeout_ns = timeout_ns;
+        let mut remaining_timeout_ns = timeout_ns;
         let start = std::time::Instant::now();
 
         let mut timeout = false;
@@ -141,7 +140,11 @@ impl SubmissionManager {
                     ..Default::default()
                 };
 
-                let result = unsafe { device.device().wait_semaphores_khr(&info, timeout_ns)? };
+                let result = unsafe {
+                    device
+                        .device()
+                        .wait_semaphores_khr(&info, remaining_timeout_ns)?
+                };
 
                 match result {
                     vk::Result::SUCCESS => {
@@ -160,15 +163,12 @@ impl SubmissionManager {
                 return VulkanResult::Ok(WaitResult::AnyFinished);
             }
 
-            if timeout_ns > 0 {
-                let elapsed = start.elapsed().as_nanos();
-                let timeout = timeout_ns as u128;
-                if elapsed >= timeout {
-                    // we still want to check the other semaphores' status
-                    timeout_ns = 0;
-                } else {
-                    timeout_ns = (timeout - elapsed) as u64;
-                }
+            // u64::MAX is specially cased by the specification to never ever end, try to preserve it
+            if timeout_ns != u64::MAX {
+                remaining_timeout_ns = (timeout_ns as u128)
+                    .saturating_sub(start.elapsed().as_nanos())
+                    .try_into()
+                    .unwrap();
             }
         }
 
@@ -178,20 +178,14 @@ impl SubmissionManager {
             return VulkanResult::Ok(WaitResult::AllFinished);
         }
     }
-    fn allocate(&mut self, queue: Queue, device: &Device) -> QueueSubmission {
+    fn allocate(&mut self, device: &Device) -> QueueSubmission {
         let semaphore = self.get_fresh_semaphore(device);
-        self.push_submission(queue, semaphore, true)
+        self.push_submission(semaphore, true)
     }
-    fn push_submission(
-        &mut self,
-        queue: Queue,
-        mut semaphore: Semaphore,
-        head: bool,
-    ) -> QueueSubmission {
+    fn push_submission(&mut self, mut semaphore: Semaphore, head: bool) -> QueueSubmission {
         semaphore.value.set_flag(head);
         let key = self.submissions.insert(QueueSubmitData {
             finished: AtomicBool::new(false),
-            queue,
             semaphore,
         });
         QueueSubmission(key)
@@ -230,6 +224,10 @@ impl SubmissionManager {
             .map(|s| s.semaphore);
         self.free_semaphores.extend(drain);
     }
+    /// Empty all pending submissions, this should be called after vkDeviceWaitIdle
+    unsafe fn clear(&mut self) {
+        self.submissions.clear()
+    }
 }
 
 pub struct AllocateSequential<'a> {
@@ -241,7 +239,7 @@ pub struct AllocateSequential<'a> {
 impl<'a> AllocateSequential<'a> {
     fn alloc(&mut self, queue: Queue) -> QueueSubmission {
         self.semaphore.bump_value();
-        let key = self.manager.push_submission(queue, self.semaphore, false);
+        let key = self.manager.push_submission(self.semaphore, false);
         self.last = Some(key);
         key
     }
@@ -286,11 +284,21 @@ impl Device {
             last: None,
         }
     }
-    pub fn allocate(&self, queue: Queue) -> QueueSubmission {
-        self.synchronization_manager.write().allocate(queue, self)
+    pub fn allocate(&self) -> QueueSubmission {
+        self.synchronization_manager.write().allocate(self)
     }
-    fn collect(&mut self) {
+    pub fn collect(&self) {
         self.synchronization_manager.write().collect();
+    }
+    pub fn wait_idle(&self) {
+        let mut submissions = self.synchronization_manager.write();
+        let mut generations = self.generation_manager.write();
+
+        unsafe {
+            self.device().device_wait_idle();
+            submissions.clear();
+            generations.clear();
+        }
     }
 }
 

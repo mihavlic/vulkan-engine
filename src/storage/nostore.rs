@@ -40,34 +40,36 @@ impl<T: Object<Storage = Self>> ObjectStorage<T> for SimpleStorage<T> {
                 });
                 let leak = Box::leak(boxed);
                 let handle = ArcHandle(NonNull::from(leak));
-                self.handles
-                    .borrow_mut(lock)
-                    .insert(handle.make_weak_copy());
+                self.handles.get_mut(lock).insert(handle.make_weak_copy());
                 handle
             })
         })
     }
 
-    unsafe fn destroy(&self, header: &ArcHandle<T>) {
-        let handle = header.make_weak_copy();
-        let alloc = Box::from_raw(header.get_arc_header_ptr());
+    unsafe fn destroy(&self, handle: &ArcHandle<T>) {
+        let handle = handle.make_weak_copy();
+        let alloc = Box::from_raw(handle.get_arc_header_ptr());
         let ArcHeader { refcount, header } = *alloc;
 
         self.lock.with_locked(|lock| {
-            self.handles.borrow_mut(lock).remove(&handle);
-            T::destroy(header.parent(), header.handle, &header.object_data).unwrap();
+            self.handles.get_mut(lock).remove(&handle);
+            T::destroy(header.parent(), header.handle, &header, lock).unwrap();
         });
     }
 
-    fn acquire_exclusive<'a>(&'a self, header: &ArcHandle<T>) -> super::SynchronizationLock<'a> {
+    fn acquire_exclusive<'a>(&'a self, handle: &ArcHandle<T>) -> super::SynchronizationLock<'a> {
+        self.lock.lock()
+    }
+
+    fn acquire_all_exclusive<'a>(&'a self) -> super::SynchronizationLock<'a> {
         self.lock.lock()
     }
 
     unsafe fn cleanup(&self) {
         self.lock.with_locked(|lock| {
-            for handle in self.handles.borrow_mut(lock).drain() {
+            for handle in self.handles.get_mut(lock).drain() {
                 let header = handle.get_header();
-                T::destroy(header.parent(), header.handle, &header.object_data).unwrap();
+                T::destroy(header.parent(), header.handle, &header, lock).unwrap();
             }
         });
     }

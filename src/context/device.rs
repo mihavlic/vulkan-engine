@@ -63,6 +63,7 @@ pub struct DeviceCreateInfo<'a> {
 
 pub struct Device {
     pub(crate) device: pumice::DeviceWrapper,
+    pub(crate) physical_device: vk::PhysicalDevice,
     pub(crate) physical_device_properties: vk::PhysicalDeviceProperties,
     pub(crate) physical_device_features: vk::PhysicalDeviceFeatures,
 
@@ -233,6 +234,7 @@ impl Device {
         let inner = Device {
             instance,
             device,
+            physical_device,
             physical_device_properties,
             physical_device_features,
 
@@ -290,6 +292,31 @@ impl Device {
         self.swapchain_storage
             .get_or_create(info, (), NonNull::from(self))
             .map(object::Swapchain)
+    }
+    pub unsafe fn create_raw_semaphore(&self) -> VulkanResult<vk::Semaphore> {
+        let info = vk::SemaphoreCreateInfo::default();
+        self.device()
+            .create_semaphore(&info, self.allocator_callbacks())
+    }
+    pub unsafe fn create_raw_fence(&self, signalled: bool) -> VulkanResult<vk::Fence> {
+        let info = vk::FenceCreateInfo {
+            flags: if signalled {
+                vk::FenceCreateFlags::SIGNALED
+            } else {
+                vk::FenceCreateFlags::empty()
+            },
+            ..Default::default()
+        };
+        self.device()
+            .create_fence(&info, self.allocator_callbacks())
+    }
+    pub unsafe fn destroy_raw_semaphore(&self, semaphore: vk::Semaphore) {
+        self.device()
+            .destroy_semaphore(semaphore, self.allocator_callbacks())
+    }
+    pub unsafe fn destroy_raw_fence(&self, fence: vk::Fence) {
+        self.device()
+            .destroy_fence(fence, self.allocator_callbacks())
     }
 }
 

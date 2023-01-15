@@ -7,13 +7,17 @@ use crate::{
     arena::uint::OptionalU32,
     batch::GenerationId,
     context::device::Device,
-    storage::{constant_ahash_hasher, nostore::SimpleStorage, MutableShared},
+    graph::resource_marker::BufferMarker,
+    storage::{
+        constant_ahash_hasher, nostore::SimpleStorage, MutableShared, ObjectHeader,
+        SynchronizationLock,
+    },
     submission::ReaderWriterState,
 };
 use pumice::{vk, VulkanResult};
 use smallvec::SmallVec;
 
-use super::{ArcHandle, Object};
+use super::{ArcHandle, ImageViewEntry, Object, ResourceMutableState, SynchronizationState};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BufferCreateInfo {
@@ -76,16 +80,11 @@ struct BufferViewEntry {
     last_use: GenerationId,
 }
 
-pub struct BufferMutableState {
-    views: SmallVec<[BufferViewEntry; 2]>,
-    synchronization: BufferSynchronizationState,
-}
-
-impl BufferMutableState {
+impl ResourceMutableState<BufferMarker> {
     pub fn new() -> Self {
         Self {
             views: SmallVec::new(),
-            synchronization: BufferSynchronizationState::BLANK,
+            synchronization: SynchronizationState::blank(),
         }
     }
     pub unsafe fn get_view(
@@ -114,7 +113,7 @@ impl BufferMutableState {
                 .device()
                 .create_buffer_view(&raw, device.allocator_callbacks())?;
 
-            let entry = BufferViewEntry {
+            let entry = ImageViewEntry {
                 handle: view,
                 info_hash: hash,
                 last_use: batch_id,
@@ -141,7 +140,10 @@ impl Object for Buffer {
     type SupplementalInfo = pumice_vma::AllocationCreateInfo;
     type Handle = vk::Buffer;
     type Storage = SimpleStorage<Self>;
-    type ObjectData = (pumice_vma::Allocation, MutableShared<BufferMutableState>);
+    type ObjectData = (
+        pumice_vma::Allocation,
+        MutableShared<ResourceMutableState<BufferMarker>>,
+    );
 
     type Parent = Device;
 
@@ -156,17 +158,18 @@ impl Object for Buffer {
             .map(|(handle, allocation, _)| {
                 (
                     handle,
-                    (allocation, MutableShared::new(BufferMutableState::new())),
+                    (allocation, MutableShared::new(ResourceMutableState::new())),
                 )
             })
     }
 
     unsafe fn destroy(
-        ctx: &Device,
+        ctx: &Self::Parent,
         handle: Self::Handle,
-        &(allocation, _): &Self::ObjectData,
+        header: &ObjectHeader<Self>,
+        _: &SynchronizationLock,
     ) -> VulkanResult<()> {
-        ctx.allocator.destroy_buffer(handle, allocation);
+        ctx.allocator.destroy_buffer(handle, header.object_data.0);
         VulkanResult::Ok(())
     }
 

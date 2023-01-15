@@ -3,7 +3,7 @@ pub mod nostore;
 use crate::object::{ArcHandle, Object};
 use pumice::VulkanResult;
 use std::{
-    cell::{RefCell, RefMut, UnsafeCell},
+    cell::{Ref, RefCell, RefMut, UnsafeCell},
     hash::BuildHasher,
     ops::{Deref, DerefMut},
     ptr::NonNull,
@@ -32,6 +32,27 @@ impl<'a, T> Deref for ObjectRead<'a, T> {
     }
 }
 
+pub(crate) struct ObjectMutable<'a, T>(NonNull<T>, SynchronizationLock<'a>);
+
+impl<'a, T> ObjectMutable<'a, T> {
+    pub(crate) fn get_lock(&self) -> &SynchronizationLock<'a> {
+        &self.1
+    }
+}
+
+impl<'a, T> Deref for ObjectMutable<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.0.as_ref() }
+    }
+}
+
+impl<'a, T> DerefMut for ObjectMutable<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { self.0.as_mut() }
+    }
+}
+
 pub(crate) trait ObjectStorage<T: Object>: Sized {
     type StorageData;
     unsafe fn get_or_create(
@@ -41,13 +62,16 @@ pub(crate) trait ObjectStorage<T: Object>: Sized {
         ctx: NonNull<T::Parent>,
     ) -> VulkanResult<ArcHandle<T>>;
 
-    unsafe fn destroy(&self, header: &ArcHandle<T>);
+    unsafe fn destroy(&self, handle: &ArcHandle<T>);
 
-    fn acquire_exclusive<'a>(&'a self, header: &ArcHandle<T>) -> SynchronizationLock<'a>;
+    // acquires exlusive access for the object pointed to by handle
+    fn acquire_exclusive<'a>(&'a self, handle: &ArcHandle<T>) -> SynchronizationLock<'a>;
+    // acquires exlusive access for all objects of the
+    fn acquire_all_exclusive<'a>(&'a self) -> SynchronizationLock<'a>;
 
-    fn read_object<'a>(&'a self, header: &ArcHandle<T>) -> ObjectRead<'a, ObjectHeader<T>> {
-        let lock = self.acquire_exclusive(header);
-        unsafe { ObjectRead(NonNull::from(header.get_header()), lock) }
+    fn read_object<'a>(&'a self, handle: &ArcHandle<T>) -> ObjectRead<'a, ObjectHeader<T>> {
+        let lock = self.acquire_exclusive(handle);
+        unsafe { ObjectRead(NonNull::from(handle.get_header()), lock) }
     }
 
     unsafe fn cleanup(&self);
@@ -82,7 +106,10 @@ impl<T> MutableShared<T> {
     pub(crate) fn new(value: T) -> Self {
         MutableShared(RefCell::new(value))
     }
-    pub unsafe fn borrow_mut<'a>(&'a self, lock: &'a SynchronizationLock) -> RefMut<'a, T> {
+    pub unsafe fn get<'a>(&'a self, lock: &'a SynchronizationLock) -> Ref<'a, T> {
+        self.0.borrow()
+    }
+    pub unsafe fn get_mut<'a>(&'a self, lock: &'a SynchronizationLock) -> RefMut<'a, T> {
         self.0.borrow_mut()
     }
 }
