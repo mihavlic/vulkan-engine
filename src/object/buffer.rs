@@ -5,14 +5,12 @@ use std::{
 
 use crate::{
     arena::uint::OptionalU32,
-    batch::GenerationId,
-    context::device::Device,
     graph::resource_marker::BufferMarker,
+    device::{batch::GenerationId, submission::ReaderWriterState, Device},
     storage::{
         constant_ahash_hasher, nostore::SimpleStorage, MutableShared, ObjectHeader,
         SynchronizationLock,
     },
-    submission::ReaderWriterState,
 };
 use pumice::{vk, VulkanResult};
 use smallvec::SmallVec;

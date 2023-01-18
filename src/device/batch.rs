@@ -16,10 +16,11 @@ use parking_lot::{
 use pumice::VulkanResult;
 
 use crate::{
-    context::device::Device,
+    device::Device,
     storage::{constant_ahash_hasher, constant_ahash_hashset, constant_ahash_randomstate},
-    submission::{QueueSubmission, WaitResult},
 };
+
+use super::submission::{QueueSubmission, WaitResult};
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GenerationId(u32);
@@ -264,7 +265,7 @@ impl GenerationManager {
 }
 
 impl Device {
-    pub fn open_generation(&mut self) -> OpenGeneration {
+    pub fn open_generation(&self) -> OpenGeneration {
         self.generation_manager.write().open_generation(self)
     }
     /// Returns the id of the oldest generation that is possibly still unfinished,

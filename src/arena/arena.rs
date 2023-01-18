@@ -128,9 +128,6 @@ impl<K: Key, T> GenArena<K, T> {
         Some(unsafe { self.remove_internal(index) })
     }
     pub fn clear(&mut self) {
-        self.next_free = Optional::new_none();
-
-        let mut prev: Option<usize> = None;
         for i in (0..self.entries.len()).rev() {
             let entry = unsafe { self.entries.get_unchecked_mut(i) };
             if entry.occupied() {

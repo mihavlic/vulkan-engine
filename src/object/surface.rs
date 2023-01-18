@@ -1,6 +1,6 @@
 use pumice::vk;
 
-use crate::context::instance::Instance;
+use crate::instance::Instance;
 
 pub struct Surface {
     handle: vk::SurfaceKHR,

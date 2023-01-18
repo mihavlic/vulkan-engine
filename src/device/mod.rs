@@ -1,9 +1,14 @@
+pub mod batch;
+pub mod inflight;
+pub mod submission;
+
+use self::{
+    batch::GenerationManager, inflight::InflightResourceManager, submission::SubmissionManager,
+};
 use super::instance::{Instance, InstanceCreateInfo};
 use crate::{
-    batch::GenerationManager,
     object::{self, Buffer, Image, Swapchain},
     storage::{nostore::SimpleStorage, ObjectStorage},
-    submission::SubmissionManager,
     tracing::shim_macros::{info, trace},
     util::{
         self,
@@ -26,7 +31,7 @@ use smallvec::{smallvec, SmallVec};
 use std::{
     borrow::Borrow,
     collections::{hash_map::RandomState, HashSet},
-    ffi::CStr,
+    ffi::{c_void, CStr},
     fmt::Display,
     ops::Deref,
     pin::Pin,
@@ -59,6 +64,8 @@ pub struct DeviceCreateInfo<'a> {
     /// substrings of device names, devices that contain them are prioritized
     pub device_substrings: &'a [&'a str],
     pub verbose: bool,
+    // TODO verify that features are supported
+    pub p_next: *const c_void,
 }
 
 pub struct Device {
@@ -84,6 +91,8 @@ pub struct Device {
     pub(crate) synchronization_manager: parking_lot::RwLock<SubmissionManager>,
     // coarse grained synchronization
     pub(crate) generation_manager: parking_lot::RwLock<GenerationManager>,
+    // tracks resources in flight that cannot be safely deleted
+    pub(crate) pending_resources: parking_lot::RwLock<InflightResourceManager>,
 
     // at the bottom so that these are dropped last
     pub(crate) device_table: Box<DeviceTable>,
@@ -110,6 +119,7 @@ impl Device {
             queue_family_selection,
             device_substrings,
             verbose,
+            p_next,
         } = info;
 
         let allocation_callbacks = instance.allocator_callbacks();
@@ -172,6 +182,7 @@ impl Device {
             enabled_extension_count: device_extensions.len() as _,
             pp_enabled_extension_names: device_extensions.as_ptr(),
             p_enabled_features: &device_features,
+            p_next,
             ..Default::default()
         };
 
@@ -250,6 +261,7 @@ impl Device {
 
             synchronization_manager: parking_lot::RwLock::new(SubmissionManager::new()),
             generation_manager: parking_lot::RwLock::new(GenerationManager::new(10)),
+            pending_resources: parking_lot::RwLock::new(InflightResourceManager::new()),
 
             device_table,
         };
@@ -259,17 +271,30 @@ impl Device {
     pub fn device(&self) -> &pumice::DeviceWrapper {
         &self.device
     }
+    pub fn physical_device(&self) -> vk::PhysicalDevice {
+        self.physical_device
+    }
     pub fn allocator(&self) -> &Allocator {
         &self.allocator
     }
     pub fn allocator_callbacks(&self) -> Option<&vk::AllocationCallbacks> {
         self.instance.allocator_callbacks()
     }
+    pub fn get_queue_bundle(
+        &self,
+        selection_index: usize,
+        offset: usize,
+    ) -> Option<submission::Queue> {
+        Some(submission::Queue {
+            raw: self.get_queue(selection_index, offset)?,
+            family: self.get_queue_family(selection_index)?,
+        })
+    }
     pub fn get_queue(&self, selection_index: usize, offset: usize) -> Option<vk::Queue> {
         let range = self.queue_selection_mapping.get(selection_index)?.1.clone();
         self.queues.get(range)?.get(offset).cloned()
     }
-    pub fn get_queue_family(&self, selection_index: usize, offset: usize) -> Option<u32> {
+    pub fn get_queue_family(&self, selection_index: usize) -> Option<u32> {
         self.queue_selection_mapping
             .get(selection_index)
             .map(|(family, _)| *family as u32)
@@ -352,7 +377,7 @@ fn test_create_device() {
 
 #[test]
 fn test_device() {
-    install_tracing_subscriber(Severity::Info);
+    install_tracing_subscriber(Some(Severity::Info));
 
     unsafe {
         let device = __test_init_device(false);
@@ -410,6 +435,7 @@ pub(crate) unsafe fn __test_init_device(mock_device: bool) -> OwnedDevice {
         // in case the user has the Mock ICD installed, possibly prefer that
         device_substrings: if mock_device { &["Mock"] } else { &[] },
         verbose: false,
+        p_next: std::ptr::null(),
     };
     let device = Device::new(info);
     device
@@ -607,8 +633,8 @@ unsafe fn select_device(
                 }
 
                 info!(
-                    "Device '{}' skipped because it couldn't satisfy queue selection:\n{:?}",
-                    device_name, selection
+                    "Device '{}' skipped because it couldn't satisfy queue selection:\nTODO",
+                    device_name, /* selection */
                 );
             }
         }

@@ -12,7 +12,7 @@ use crate::{
         arena::{GenArena, U32Key},
         uint::OptionalU32,
     },
-    context::device::Device,
+    device::Device,
 };
 
 // little endian:
@@ -55,10 +55,10 @@ impl SemaphoreValue {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct Queue {
-    raw: vk::Queue,
-    family: u32,
+    pub(crate) raw: vk::Queue,
+    pub(crate) family: u32,
 }
 
 impl Queue {
@@ -74,12 +74,24 @@ impl Queue {
 }
 
 #[derive(Clone, Copy)]
-pub struct Semaphore {
+struct SemaphoreEntry {
     raw: vk::Semaphore,
     value: SemaphoreValue,
 }
 
-impl Semaphore {
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TimelineSemaphore {
+    pub raw: vk::Semaphore,
+    pub value: u64,
+}
+
+impl SemaphoreEntry {
+    fn to_public(&self) -> TimelineSemaphore {
+        TimelineSemaphore {
+            raw: self.raw,
+            value: self.value.value(),
+        }
+    }
     fn bump_value(&mut self) {
         self.value.set_value(self.value.value() + 1);
     }
@@ -87,7 +99,7 @@ impl Semaphore {
 
 pub struct QueueSubmitData {
     finished: AtomicBool,
-    semaphore: Semaphore,
+    semaphore: SemaphoreEntry,
 }
 
 pub enum WaitResult {
@@ -98,7 +110,7 @@ pub enum WaitResult {
 
 pub(crate) struct SubmissionManager {
     submissions: GenArena<U32Key, QueueSubmitData>,
-    free_semaphores: Vec<Semaphore>,
+    free_semaphores: Vec<SemaphoreEntry>,
 }
 
 impl SubmissionManager {
@@ -178,11 +190,12 @@ impl SubmissionManager {
             return VulkanResult::Ok(WaitResult::AllFinished);
         }
     }
-    fn allocate(&mut self, device: &Device) -> QueueSubmission {
-        let semaphore = self.get_fresh_semaphore(device);
-        self.push_submission(semaphore, true)
+    fn allocate(&mut self, device: &Device) -> (QueueSubmission, TimelineSemaphore) {
+        let mut semaphore = self.get_fresh_semaphore(device);
+        semaphore.bump_value();
+        (self.push_submission(semaphore, true), semaphore.to_public())
     }
-    fn push_submission(&mut self, mut semaphore: Semaphore, head: bool) -> QueueSubmission {
+    fn push_submission(&mut self, mut semaphore: SemaphoreEntry, head: bool) -> QueueSubmission {
         semaphore.value.set_flag(head);
         let key = self.submissions.insert(QueueSubmitData {
             finished: AtomicBool::new(false),
@@ -190,7 +203,7 @@ impl SubmissionManager {
         });
         QueueSubmission(key)
     }
-    fn get_fresh_semaphore(&mut self, device: &Device) -> Semaphore {
+    fn get_fresh_semaphore(&mut self, device: &Device) -> SemaphoreEntry {
         let semaphore = self.free_semaphores.pop().unwrap_or_else(|| {
             let p_next = vk::SemaphoreTypeCreateInfoKHR {
                 semaphore_type: vk::SemaphoreTypeKHR::TIMELINE,
@@ -207,7 +220,7 @@ impl SubmissionManager {
                     .create_semaphore(&info, device.allocator_callbacks())
                     .unwrap()
             };
-            Semaphore {
+            SemaphoreEntry {
                 raw,
                 value: SemaphoreValue::new(0, false),
             }
@@ -232,16 +245,16 @@ impl SubmissionManager {
 
 pub struct AllocateSequential<'a> {
     manager: parking_lot::RwLockWriteGuard<'a, SubmissionManager>,
-    semaphore: Semaphore,
+    semaphore: SemaphoreEntry,
     last: Option<QueueSubmission>,
 }
 
 impl<'a> AllocateSequential<'a> {
-    fn alloc(&mut self, queue: Queue) -> QueueSubmission {
+    fn alloc(&mut self, queue: Queue) -> (QueueSubmission, TimelineSemaphore) {
         self.semaphore.bump_value();
         let key = self.manager.push_submission(self.semaphore, false);
         self.last = Some(key);
-        key
+        (key, self.semaphore.to_public())
     }
 }
 
@@ -284,11 +297,12 @@ impl Device {
             last: None,
         }
     }
-    pub fn allocate(&self) -> QueueSubmission {
+    pub fn make_submission(&self) -> (QueueSubmission, TimelineSemaphore) {
         self.synchronization_manager.write().allocate(self)
     }
-    pub fn collect(&self) {
+    pub fn idle_cleanup_poll(&self) {
         self.synchronization_manager.write().collect();
+        self.pending_resources.write().poll(self);
     }
     pub fn wait_idle(&self) {
         let mut submissions = self.synchronization_manager.write();

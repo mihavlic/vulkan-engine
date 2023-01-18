@@ -4,11 +4,9 @@
 pub mod util;
 // util goes first
 pub mod arena;
-pub mod batch;
-pub mod context;
-mod freer;
+pub mod device;
 pub mod graph;
+pub mod instance;
 pub mod object;
 pub mod storage;
-pub mod submission;
 pub mod tracing;

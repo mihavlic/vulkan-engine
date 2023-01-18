@@ -1,4 +1,6 @@
 mod allocator;
+mod lazy_sorted;
+pub mod passes;
 pub mod resource_marker;
 mod reverse_edges;
 
@@ -12,7 +14,9 @@ use std::{
     hash::{Hash, Hasher},
     io::Write,
     marker::PhantomData,
+    mem::ManuallyDrop,
     ops::{ControlFlow, Deref, DerefMut, Not, Range},
+    sync::Arc,
 };
 
 use ahash::HashMap;
@@ -22,8 +26,12 @@ use smallvec::{smallvec, SmallVec};
 
 use crate::{
     arena::uint::{Config, OptionalU32, PackedUint},
-    batch::GenerationId,
-    context::device::{Device, OwnedDevice, __test_init_device},
+    device::{
+        Device, OwnedDevice, __test_init_device,
+        batch::GenerationId,
+        inflight::InflightResource,
+        submission::{self, QueueSubmission},
+    },
     graph::{
         allocator::MemoryKind,
         resource_marker::{BufferMarker, ImageMarker, TypeNone, TypeOption, TypeSome},
@@ -37,27 +45,29 @@ use crate::{
         constant_ahash_hasher, constant_ahash_hashmap, constant_ahash_hashset,
         constant_ahash_randomstate, ObjectStorage, SynchronizationLock,
     },
-    submission::{self, QueueSubmission},
     token_abuse,
     util::{self, format_utils::Fun, macro_abuse::WeirdFormatter},
 };
 
 use self::{
-    allocator::{AvailabilityToken, Suballocation, SuballocationUgh, Suballocator},
+    allocator::{
+        AvailabilityToken, RcPtrComparator, Suballocation, SuballocationUgh, Suballocator,
+    },
+    lazy_sorted::LazySorted,
     resource_marker::{ResourceData, ResourceMarker},
     reverse_edges::{DFSCommand, ImmutableGraph, NodeGraph},
 };
 
 pub trait RenderPass: 'static {
     fn prepare(&mut self);
-    fn execute(self, executor: &GraphExecutor, device: &Device) -> VulkanResult<()>;
+    unsafe fn execute(self, executor: &GraphExecutor, device: &Device) -> VulkanResult<()>;
 }
 
 impl RenderPass for () {
     fn prepare(&mut self) {
         {}
     }
-    fn execute(self, executor: &GraphExecutor, device: &Device) -> VulkanResult<()> {
+    unsafe fn execute(self, executor: &GraphExecutor, device: &Device) -> VulkanResult<()> {
         VulkanResult::Ok(())
     }
 }
@@ -76,13 +86,13 @@ impl<P: RenderPass, F: FnOnce(&mut GraphPassBuilder, &Device) -> P> CreatePass f
 struct StoredPass<T: RenderPass>(Option<T>);
 trait ObjectSafePass {
     fn prepare(&mut self);
-    fn execute(&mut self, executor: &GraphExecutor, device: &Device) -> VulkanResult<()>;
+    unsafe fn execute(&mut self, executor: &GraphExecutor, device: &Device) -> VulkanResult<()>;
 }
 impl<T: RenderPass> ObjectSafePass for StoredPass<T> {
     fn prepare(&mut self) {
         self.0.as_mut().unwrap().prepare()
     }
-    fn execute(&mut self, executor: &GraphExecutor, device: &Device) -> VulkanResult<()> {
+    unsafe fn execute(&mut self, executor: &GraphExecutor, device: &Device) -> VulkanResult<()> {
         self.0.take().unwrap().execute(executor, device)
     }
 }
@@ -181,6 +191,7 @@ enum SpecialBarrier {
         dst_family: u32,
     },
 }
+
 struct GraphMemoryType {
     allocator: Suballocator,
     memory_type: u32,
@@ -279,18 +290,18 @@ pub struct Graph {
     pass_children: ImmutableGraph,
 
     // FIXME should this be made prettier?
-    memory: RefCell<Box<[GraphMemoryType; vk::MAX_MEMORY_TYPES as usize]>>,
+    memory: RefCell<ManuallyDrop<Box<[GraphMemoryType; vk::MAX_MEMORY_TYPES as usize]>>>,
     physical_images: Vec<PhysicalImageData>,
     physical_buffers: Vec<PhysicalBufferData>,
 
-    prev_generation: Option<GenerationId>,
+    prev_generation: Cell<Option<GenerationId>>,
     // semaphores used for presenting:
     //  to synchronize the moment when we aren't using the swapchain image anymore
     //  to start the submission only after the presentation engine is done with it
     // https://vulkan-tutorial.com/Drawing_a_triangle/Drawing/Rendering_and_presentation#page_Creating-the-synchronization-objects
     swapchain_semaphores: LegacySemaphoreStack,
     command_pool: vk::CommandPool,
-    device: OwnedDevice,
+    device: ManuallyDrop<OwnedDevice>,
 }
 
 impl Graph {
@@ -310,10 +321,10 @@ impl Graph {
             image_meta: Vec::new(),
             buffer_meta: Vec::new(),
             pass_children: Default::default(),
-            memory: RefCell::new(memory.try_into().ok().unwrap()),
+            memory: RefCell::new(ManuallyDrop::new(memory.try_into().ok().unwrap())),
             physical_images: Vec::new(),
             physical_buffers: Vec::new(),
-            prev_generation: None,
+            prev_generation: Cell::new(None),
             swapchain_semaphores: LegacySemaphoreStack::new(),
             command_pool: unsafe {
                 device
@@ -324,7 +335,7 @@ impl Graph {
                     )
                     .unwrap()
             },
-            device,
+            device: ManuallyDrop::new(device),
         }
     }
     fn mark_pass_alive(&self, handle: GraphPass) {
@@ -361,7 +372,7 @@ impl Graph {
                 ImageData::Moved(to, ..) => {
                     image = *to;
                 }
-                _ => {}
+                _ => break,
             }
         }
     }
@@ -1002,7 +1013,7 @@ impl Graph {
             let mut waitfor_submissions: Vec<GraphSubmission> = Vec::new();
             let mut waitfor_resources: Vec<GraphResource> = Vec::new();
             // (src queue family, src pass, dst pass, resource in question)
-            let mut queue_family_accesses: SmallVec<
+            let mut queued_ownership_transitions: SmallVec<
                 [(
                     u32,
                     Vec<(
@@ -1030,8 +1041,9 @@ impl Graph {
                         let on_end = |recorder: &mut SubmissionRecorder| {
                             let dst_queue_family =
                                 self.get_queue_family(recorder.get_current_submission().queue);
+
                             for &mut (src_queue_family, ref mut src_submissions) in
-                                &mut queue_family_accesses
+                                &mut queued_ownership_transitions
                             {
                                 use slice_group_by::GroupBy;
                                 // list of submissions which we need to wait on to perform a queue ownership release
@@ -1039,8 +1051,6 @@ impl Graph {
                                 // list of resources that will be released and then acquired
                                 waitfor_resources.clear();
 
-                                // create the queue ownership release barriers (and dummy submissions)
-                                // queue ownership acquire has already been emitted during resource state updates
                                 src_submissions.sort_unstable_by_key(|(_, _, _, s)| *s);
                                 for entries in
                                     src_submissions.binary_group_by_key(|(_, _, _, s)| *s)
@@ -1050,6 +1060,7 @@ impl Graph {
                                         .iter()
                                         .all(|(_, _, dst, _)| *dst == entries[0].2));
 
+                                    // the current submission gets acquires the ownership for the resources
                                     for &(submission, src_pass, dst_pass, data) in entries {
                                         let barrier = match data {
                                             GraphResource::Image(image) => {
@@ -1073,6 +1084,7 @@ impl Graph {
                                             .push((dst_pass, barrier));
                                     }
 
+                                    // emit the ownership releases
                                     match entries {
                                         &[] => unreachable!(),
                                         // only a single dependency, put the barrier straigh after the src pass
@@ -1113,6 +1125,7 @@ impl Graph {
                                                 let dummy_pass =
                                                     SubmissionPass::new(sub.passes.len());
 
+                                                // FIXME check whether such a barrier is already in place
                                                 sub.barriers.push((dummy_pass, SimpleBarrier {
                                                     // TODO accumulate actual accesses of passes and use that 
                                                     src_stages: vk::PipelineStageFlags2KHR::ALL_COMMANDS,
@@ -1160,7 +1173,7 @@ impl Graph {
                                     let queue =
                                         recorder.find_queue_with_family(src_queue_family).unwrap();
 
-                                    let barrier_iter = waitfor_resources.iter().map(|&res| {
+                                    let barriers = waitfor_resources.iter().map(|&res| {
                                         (
                                             SubmissionPass(0),
                                             match res {
@@ -1187,7 +1200,7 @@ impl Graph {
                                         passes: Default::default(),
                                         semaphore_dependencies: waitfor_submissions.clone(),
                                         barriers: Default::default(),
-                                        special_barriers: barrier_iter.collect(),
+                                        special_barriers: barriers.collect(),
                                     };
 
                                     let sub = recorder.add_submission_sneaky(submission);
@@ -1195,7 +1208,7 @@ impl Graph {
                                 }
                             }
                             // clear the data we've just processed
-                            for v in &mut queue_family_accesses {
+                            for v in &mut queued_ownership_transitions {
                                 v.1.clear();
                             }
                         };
@@ -1216,7 +1229,7 @@ impl Graph {
                                 img,
                                 &recorder,
                                 &mut image_rw,
-                                &mut queue_family_accesses,
+                                &mut queued_ownership_transitions,
                                 &mut accessors,
                             );
                         }
@@ -1230,7 +1243,7 @@ impl Graph {
                                 buf,
                                 &recorder,
                                 &mut buffer_rw,
-                                &mut queue_family_accesses,
+                                &mut queued_ownership_transitions,
                                 &mut accessors,
                             );
                         }
@@ -1954,7 +1967,7 @@ impl Graph {
 
         // we can now start executing the graph (TODO move this to another function, allow the built graph to be executed multiple times)
         // wait for previously submitted work to finish
-        if let Some(id) = self.prev_generation {
+        if let Some(id) = self.prev_generation.get() {
             self.device
                 .wait_for_generation_single(id, u64::MAX)
                 .unwrap();
@@ -1997,7 +2010,7 @@ impl Graph {
         // TODO use sequential semaphore allocation to improve efficiency
         let semaphores = submissions
             .iter()
-            .map(|_| self.device.allocate())
+            .map(|_| self.device.make_submission())
             .collect::<Vec<_>>();
 
         // TODO do something about this so that we don't hold the lock for all of execution
@@ -2005,23 +2018,20 @@ impl Graph {
         let buffer_storage_lock = self.device.buffer_storage.acquire_all_exclusive();
         let swapchain_storage_lock = self.device.swapchain_storage.acquire_all_exclusive();
 
-        // TODO reconsider having this be a separate structure
-        struct SubmissionLegacySemaphore {
+        struct SwapchainPreset {
             swapchain: GraphImage,
             vkhandle: vk::SwapchainKHR,
             image: vk::Image,
+            image_index: u32,
             image_acquire: vk::Semaphore,
             image_release: vk::Semaphore,
         }
 
         let mut semaphore_scratch = Vec::new();
         let mut waited_idle = false;
-        let mut swapchain_indices: ahash::HashMap<GraphImage, (u32, vk::Semaphore)> =
+        let mut swapchain_indices: ahash::HashMap<GraphImage, u32> = constant_ahash_hashmap();
+        let mut submission_swapchains: ahash::HashMap<QueueSubmission, Vec<SwapchainPreset>> =
             constant_ahash_hashmap();
-        let mut submission_swapchains: ahash::HashMap<
-            QueueSubmission,
-            Vec<SubmissionLegacySemaphore>,
-        > = constant_ahash_hashmap();
 
         // collect the first accesses to all external resources, we will need to synchronize against them and possibly perform queue family and layout transitions
 
@@ -2047,7 +2057,7 @@ impl Graph {
                         let pass = self.timeline[a.index()].get_pass().unwrap();
                         let submission =
                             self.get_pass_meta(pass).scheduled_submission.get().unwrap();
-                        semaphores[submission as usize]
+                        semaphores[submission as usize].0
                     }));
 
                     // nothing is using the resource, continue
@@ -2130,16 +2140,17 @@ impl Graph {
                             submission_swapchains
                                 .entry(semaphore_scratch[0])
                                 .or_default()
-                                .push(SubmissionLegacySemaphore {
+                                .push(SwapchainPreset {
                                     swapchain: handle,
                                     vkhandle: mutable.get_swapchain(index),
                                     image: data.image,
+                                    image_index: index,
                                     image_acquire: acquire_semaphore,
                                     image_release: release_semaphore,
                                 });
 
                             // we do not update any synchronization state here, since we already get synchonization from swapchain image acquire and the subsequent present
-                            swapchain_indices.insert(handle, (index, acquire_semaphore));
+                            swapchain_indices.insert(handle, index);
                         },
                         _ => unreachable!(),
                     }
@@ -2171,7 +2182,7 @@ impl Graph {
                         let pass = self.timeline[a.index()].get_pass().unwrap();
                         let submission =
                             self.get_pass_meta(pass).scheduled_submission.get().unwrap();
-                        semaphores[submission as usize]
+                        semaphores[submission as usize].0
                     }));
 
                     // nothing is using the resource, continue
@@ -2205,16 +2216,25 @@ impl Graph {
             }
         }
 
-        let get_image_raw = |image: GraphImage| -> Option<vk::Image> {
-            unsafe {
-                match self.get_image_data(image) {
+        let mut raw_images = self
+            .images
+            .iter()
+            .enumerate()
+            .map(|(i, data)| unsafe {
+                let image = GraphImage::new(i);
+
+                if !self.get_image_meta(image).alive.get() {
+                    return None;
+                }
+
+                match data.deref() {
                     ImageData::TransientPrototype(_, _) => None,
                     ImageData::Transient(physical) => {
                         Some(self.get_physical_image_data(*physical).vkhandle)
                     }
                     ImageData::Imported(archandle) => Some(archandle.0.get_handle()),
                     ImageData::Swapchain(archandle) => {
-                        let &(image_index, _) = swapchain_indices.get(&image).unwrap();
+                        let image_index = *swapchain_indices.get(&image).unwrap();
                         Some(
                             archandle
                                 .0
@@ -2227,20 +2247,36 @@ impl Graph {
                     }
                     ImageData::Moved(_, _, _) => todo!("TODO implement this"),
                 }
-            }
-        };
+            })
+            .collect::<Vec<_>>();
 
-        let get_buffer_raw = |buffer: GraphBuffer| -> Option<vk::Buffer> {
-            unsafe {
-                match self.get_buffer_data(buffer) {
+        let mut raw_buffers = self
+            .buffers
+            .iter()
+            .enumerate()
+            .map(|(i, data)| unsafe {
+                let buffer = GraphBuffer::new(i);
+
+                if !self.get_buffer_meta(buffer).alive.get() {
+                    return None;
+                }
+
+                match data.deref() {
                     BufferData::TransientPrototype(_, _) => None,
                     BufferData::Transient(physical) => {
                         Some(self.get_physical_buffer_data(*physical).vkhandle)
                     }
                     BufferData::Imported(archandle) => Some(archandle.0.get_handle()),
                 }
-            }
-        };
+            })
+            .collect::<Vec<_>>();
+
+        let current_generation = self.device.open_generation();
+        current_generation.add_submissions(semaphores.iter().map(|(s, _)| *s));
+        let id = current_generation.id();
+        current_generation.finish();
+
+        self.prev_generation.set(Some(id));
 
         // TODO multithreaded execution
         let mut memory_barriers = Vec::new();
@@ -2294,8 +2330,8 @@ impl Graph {
                         &mut image_barriers,
                         &mut buffer_barriers,
                         &mut special_barriers,
-                        &get_image_raw,
-                        &get_buffer_raw,
+                        &raw_images,
+                        &raw_buffers,
                         command_buffer,
                         false,
                     );
@@ -2303,6 +2339,8 @@ impl Graph {
                         graph: self,
                         current_pass: pass,
                         command_buffer,
+                        raw_images: &raw_images,
+                        raw_buffers: &raw_buffers,
                     };
                     self.passes[pass.index()]
                         .pass
@@ -2317,8 +2355,8 @@ impl Graph {
                     &mut image_barriers,
                     &mut buffer_barriers,
                     &mut special_barriers,
-                    &get_image_raw,
-                    &get_buffer_raw,
+                    &raw_images,
+                    &raw_buffers,
                     command_buffer,
                     true,
                 );
@@ -2327,40 +2365,101 @@ impl Graph {
 
                 let pass_data = &self.passes[i];
                 let queue = self.queues[pass_data.queue.index()].inner.clone();
-                let queue_submission = semaphores[i];
+                let (queue_submission, finished_semaphore) = semaphores[i];
                 let swapchains = submission_swapchains.get(&queue_submission);
 
-                let mut acquire_semaphores = Vec::new();
-                let mut release_semaphores = Vec::new();
+                let mut wait_semaphores = Vec::new();
+                let mut signal_semaphores = Vec::new();
                 if let Some(swapchains) = swapchains {
-                    acquire_semaphores = swapchains
+                    wait_semaphores = swapchains
                         .iter()
-                        .map(|s| s.image_acquire)
+                        .map(|s| vk::SemaphoreSubmitInfoKHR {
+                            semaphore: s.image_acquire,
+                            // not a timeline semaphore, value ignored
+                            value: 0,
+                            // TODO we should probably bother to track this information
+                            // though then transitive reduction and such become invalid and have to be patched up ... eh
+                            stage_mask: vk::PipelineStageFlags2KHR::ALL_COMMANDS,
+                            ..Default::default()
+                        })
                         .collect::<Vec<_>>();
-                    release_semaphores = swapchains
+                    signal_semaphores = swapchains
+                        .iter()
+                        .map(|s| vk::SemaphoreSubmitInfoKHR {
+                            semaphore: s.image_release,
+                            // not a timeline semaphore, value ignored
+                            value: 0,
+                            stage_mask: vk::PipelineStageFlags2KHR::ALL_COMMANDS,
+                            ..Default::default()
+                        })
+                        .collect::<Vec<_>>();
+                }
+                signal_semaphores.push(vk::SemaphoreSubmitInfoKHR {
+                    semaphore: finished_semaphore.raw,
+                    value: finished_semaphore.value,
+                    stage_mask: vk::PipelineStageFlags2KHR::ALL_COMMANDS,
+                    ..Default::default()
+                });
+                for dep in semaphore_dependencies {
+                    let semaphore = semaphores[dep.index()].1;
+                    wait_semaphores.push(vk::SemaphoreSubmitInfoKHR {
+                        semaphore: semaphore.raw,
+                        value: semaphore.value,
+                        stage_mask: vk::PipelineStageFlags2KHR::ALL_COMMANDS,
+                        ..Default::default()
+                    });
+                }
+
+                let command_buffer_info = vk::CommandBufferSubmitInfoKHR {
+                    command_buffer,
+                    ..Default::default()
+                };
+
+                let submit = vk::SubmitInfo2KHR {
+                    flags: vk::SubmitFlagsKHR::empty(),
+                    wait_semaphore_info_count: wait_semaphores.len() as u32,
+                    p_wait_semaphore_infos: wait_semaphores.as_ptr(),
+                    command_buffer_info_count: 1,
+                    p_command_buffer_infos: &command_buffer_info,
+                    signal_semaphore_info_count: signal_semaphores.len() as u32,
+                    p_signal_semaphore_infos: signal_semaphores.as_ptr(),
+                    ..Default::default()
+                };
+
+                // TODO some either timeout or constant quota based submit batching
+                d.queue_submit_2_khr(
+                    queue.raw(),
+                    std::slice::from_ref(&submit),
+                    vk::Fence::null(),
+                )
+                .map_err(|e| panic!("Submit err {:?}", e));
+
+                if let Some(swapchains) = swapchains {
+                    let wait_semaphores = swapchains
                         .iter()
                         .map(|s| s.image_release)
                         .collect::<Vec<_>>();
-                }
+                    let image_indices =
+                        swapchains.iter().map(|s| s.image_index).collect::<Vec<_>>();
+                    let swapchains = swapchains.iter().map(|s| s.vkhandle).collect::<Vec<_>>();
 
-                let submit = 
+                    let mut results = vec![std::mem::zeroed(); swapchains.len()];
 
-                // TODO some smarter submit solution
-                d.queue_submit_2_khr(queue.raw(), submits, fence);
-
-                if let Some(swapchains) = swapchains {
-                    let swapchains = swapchains.iter().map(|s| s.swapchain).collect::<Vec<_>>();
                     let present_info = vk::PresentInfoKHR {
-                        wait_semaphore_count: release_semaphores,
-                        p_wait_semaphores: release_semaphores.len() as u32,
-                        swapchain_count: swapchains.len() as usize,
-                        p_swapchains: todo!(),
-                        p_image_indices: todo!(),
-                        p_results: todo!(),
+                        wait_semaphore_count: wait_semaphores.len() as u32,
+                        p_wait_semaphores: wait_semaphores.as_ptr(),
+                        swapchain_count: swapchains.len() as u32,
+                        p_swapchains: swapchains.as_ptr(),
+                        p_image_indices: image_indices.as_ptr(),
+                        p_results: results.as_mut_ptr(),
                         ..Default::default()
                     };
-                    // TODO handle errors
-                    d.queue_present_khr(queue.raw(), present_info).unwrap();
+
+                    d.queue_present_khr(queue.raw(), &present_info).unwrap();
+
+                    for res in results {
+                        pumice::new_result((), res).unwrap();
+                    }
                 }
             }
         }
@@ -2385,7 +2484,7 @@ impl Graph {
         img: &T::Data,
         recorder: &RefCell<SubmissionRecorder>,
         image_rw: &mut Vec<(ResourceState<T>, bool)>,
-        queue_family_accesses: &mut SmallVec<
+        queued_ownership_transitions: &mut SmallVec<
             [(
                 u32,
                 Vec<(
@@ -2408,13 +2507,16 @@ impl Graph {
             img,
             recorder,
             image_rw,
-            queue_family_accesses,
+            queued_ownership_transitions,
         );
 
         let resource = img.graph_resource();
         let imported = match resource {
             GraphResource::Image(handle) => {
-                matches!(self.get_image_data(handle), ImageData::Imported(_))
+                matches!(
+                    self.get_image_data(handle),
+                    ImageData::Imported(_) | ImageData::Swapchain(_)
+                )
             }
             GraphResource::Buffer(handle) => {
                 matches!(self.get_buffer_data(handle), BufferData::Imported(_))
@@ -2520,7 +2622,7 @@ impl Graph {
         resource_data: &T::Data,
         recorder: &RefCell<SubmissionRecorder>,
         resource_rw: &mut [(ResourceState<T>, bool)],
-        queue_family_accesses: &mut [(
+        queued_ownership_transitions: &mut [(
             u32,
             Vec<(
                 GraphSubmission,
@@ -2601,7 +2703,7 @@ impl Graph {
                     //   https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#synchronization-queue-transfers
                     // 3. no transfer is neccessary if both accesses are on the same queue
                     if !concurrent
-                        && dst_layout != vk::ImageLayout::UNDEFINED
+                        /* && dst_layout != vk::ImageLayout::UNDEFINED */
                         && src_queue_family != dst_queue_family
                     {
                         synchronize();
@@ -2610,7 +2712,7 @@ impl Graph {
                         // we want to acquire ownership from src_queue_family
 
                         // find the vector of pending acquires for the src queue
-                        let (_, entry) = queue_family_accesses
+                        let (_, entry) = queued_ownership_transitions
                             .iter_mut()
                             .find(|(f, _)| *f == src_queue_family)
                             .unwrap();
@@ -2667,11 +2769,11 @@ impl Graph {
                     synchronize();
                 }
 
-                let image_undefined =
-                    ImageMarker::IS_IMAGE && dst_layout.unwrap() == vk::ImageLayout::UNDEFINED;
-
                 // layout transition
-                if !image_undefined && dst_layout.unwrap() != src_layout.unwrap() {
+                if ImageMarker::IS_IMAGE
+                    && dst_layout.unwrap() != vk::ImageLayout::UNDEFINED
+                    && dst_layout.unwrap() != src_layout.unwrap()
+                {
                     synchronize();
                     dst_writes = true;
                     recorder.borrow_mut().layout_transition(
@@ -2682,7 +2784,7 @@ impl Graph {
                 }
 
                 // queue family ownership transition
-                if !image_undefined && !concurrent && *src_queue_family != dst_queue_family {
+                if !concurrent && *src_queue_family != dst_queue_family {
                     synchronize();
                     dst_writes = true;
 
@@ -2690,7 +2792,7 @@ impl Graph {
                     // we want to acquire ownership from src_queue_family
 
                     // find the vector of pending acquires for the src queue
-                    let (_, entry) = queue_family_accesses
+                    let (_, entry) = queued_ownership_transitions
                         .iter_mut()
                         .find(|(f, _)| *f == *src_queue_family)
                         .unwrap();
@@ -2915,6 +3017,46 @@ impl Graph {
     }
 }
 
+impl Drop for Graph {
+    fn drop(&mut self) {
+        let Self {
+            memory,
+            prev_generation,
+            swapchain_semaphores,
+            command_pool,
+            device,
+            ..
+        } = self;
+
+        let memory = unsafe { ManuallyDrop::take(&mut *memory.borrow_mut()) };
+        let command_pool = *command_pool;
+
+        let device_ptr: *const Device = Arc::as_ptr(&device.0);
+        let owned_device = unsafe { ManuallyDrop::take(device) };
+
+        if let Some(prev) = prev_generation.get() {
+            unsafe {
+                (*device_ptr).add_inflight(
+                    prev,
+                    std::iter::once(InflightResource::Closure(ManuallyDrop::new(Box::new(
+                        move || {
+                            owned_device.device().destroy_command_pool(
+                                command_pool,
+                                owned_device.allocator_callbacks(),
+                            );
+                            for mem in *memory {
+                                for RcPtrComparator(block) in mem.allocator.collect_blocks() {
+                                    owned_device.allocator().free_memory(block.allocation);
+                                }
+                            }
+                        },
+                    )))),
+                )
+            }
+        }
+    }
+}
+
 unsafe fn do_barriers(
     i: usize,
     d: &DeviceWrapper,
@@ -2923,8 +3065,8 @@ unsafe fn do_barriers(
     image_barriers: &mut Vec<vk::ImageMemoryBarrier2KHR>,
     buffer_barriers: &mut Vec<vk::BufferMemoryBarrier2KHR>,
     special_barriers: &mut std::slice::Iter<(SubmissionPass, SpecialBarrier)>,
-    get_image_raw: &dyn Fn(GraphImage) -> Option<vk::Image>,
-    get_buffer_raw: &dyn Fn(GraphBuffer) -> Option<vk::Buffer>,
+    raw_images: &[Option<vk::Image>],
+    raw_buffers: &[Option<vk::Buffer>],
     command_buffer: vk::CommandBuffer,
     flush: bool,
 ) {
@@ -2965,7 +3107,7 @@ unsafe fn do_barriers(
                 } => image_barriers.push(vk::ImageMemoryBarrier2KHR {
                     old_layout: *src_layout,
                     new_layout: *dst_layout,
-                    image: get_image_raw(*image).unwrap(),
+                    image: raw_images[image.index()].unwrap(),
                     subresource_range,
                     ..Default::default()
                 }),
@@ -2976,7 +3118,7 @@ unsafe fn do_barriers(
                 } => image_barriers.push(vk::ImageMemoryBarrier2KHR {
                     src_queue_family_index: *src_family,
                     dst_queue_family_index: *dst_family,
-                    image: get_image_raw(*image).unwrap(),
+                    image: raw_images[image.index()].unwrap(),
                     subresource_range,
                     ..Default::default()
                 }),
@@ -2987,7 +3129,7 @@ unsafe fn do_barriers(
                 } => buffer_barriers.push(vk::BufferMemoryBarrier2KHR {
                     src_queue_family_index: *src_family,
                     dst_queue_family_index: *dst_family,
-                    buffer: get_buffer_raw(*buffer).unwrap(),
+                    buffer: raw_buffers[buffer.index()].unwrap(),
                     offset: 0,
                     size: vk::WHOLE_SIZE,
                     ..Default::default()
@@ -3591,6 +3733,7 @@ impl<'a> GraphPassBuilder<'a> {
             pass: RefCell::new(Box::new(StoredPass(Some(pass)))),
         }
     }
+    // TODO check (possibly update for transients) usage flags against their create info
     pub fn use_image(
         &mut self,
         image: GraphImage,
@@ -3631,15 +3774,27 @@ pub struct GraphExecutor<'a> {
     graph: &'a Graph,
     current_pass: GraphPass,
     command_buffer: vk::CommandBuffer,
+    raw_images: &'a [Option<vk::Image>],
+    raw_buffers: &'a [Option<vk::Buffer>],
 }
 
 pub struct DescriptorState;
 impl<'a> GraphExecutor<'a> {
-    pub fn get_image(&self, handle: GraphImage) -> vk::Image {
-        todo!()
+    pub fn get_image_subresource_range(&self, handle: GraphImage) -> vk::ImageSubresourceRange {
+        vk::ImageSubresourceRange {
+            // TODO don't be dumb
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: vk::REMAINING_MIP_LEVELS,
+            base_array_layer: 0,
+            layer_count: vk::REMAINING_ARRAY_LAYERS,
+        }
     }
-    pub fn get_buffer(&self, handle: GraphBuffer) -> vk::Buffer {
-        todo!()
+    pub fn get_image(&self, image: GraphImage) -> vk::Image {
+        self.raw_images[image.index()].unwrap()
+    }
+    pub fn get_buffer(&self, buffer: GraphBuffer) -> vk::Buffer {
+        self.raw_buffers[buffer.index()].unwrap()
     }
     pub fn make_descriptor(&self) -> DescriptorState {
         todo!()

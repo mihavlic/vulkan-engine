@@ -1,5 +1,5 @@
 use super::{GraphResource, SubmissionResourceReuse};
-use crate::{context::device::Device, simple_handle, storage::constant_ahash_hashset};
+use crate::{device::Device, simple_handle, storage::constant_ahash_hashset};
 use pumice::{vk, VulkanResult};
 use std::{
     cell::{Cell, Ref, RefCell, RefMut},
@@ -71,7 +71,7 @@ pub(crate) struct SuballocationUgh {
     pub(crate) size: u64,
 }
 
-struct RcPtrComparator<T>(Rc<T>);
+pub(crate) struct RcPtrComparator<T>(pub(crate) Rc<T>);
 
 impl<T> PartialEq for RcPtrComparator<T> {
     fn eq(&self, other: &Self) -> bool {
@@ -99,10 +99,7 @@ impl Suballocator {
         }
     }
     pub(crate) fn reset(&mut self) {
-        let mut memory_blocks = constant_ahash_hashset();
-        for (key, (alloc, memory)) in &self.allocations {
-            memory_blocks.insert(RcPtrComparator(memory.clone()));
-        }
+        let memory_blocks = self.collect_blocks();
 
         self.allocations.clear();
         self.id_counter = 0;
@@ -128,6 +125,14 @@ impl Suballocator {
 
             self.allocations.insert(key, (block.head.clone(), block));
         }
+    }
+    pub(crate) fn collect_blocks(&self) -> ahash::HashSet<RcPtrComparator<MemoryBlock>> {
+        let mut memory_blocks = constant_ahash_hashset();
+        for (key, (alloc, memory)) in &self.allocations {
+            memory_blocks.insert(RcPtrComparator(memory.clone()));
+        }
+
+        memory_blocks
     }
     // assigns physical memory to a resource, it is not usually neccessary to free it since lifetime ranges are used for aliasing
     pub(crate) fn allocate<

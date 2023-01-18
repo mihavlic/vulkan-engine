@@ -11,14 +11,12 @@ use smallvec::{smallvec, SmallVec};
 
 use crate::{
     arena::uint::OptionalU32,
-    batch::GenerationId,
-    context::device::Device,
     graph::resource_marker::{BufferMarker, ImageMarker, ResourceMarker, TypeOption},
+    device::{batch::GenerationId, submission::QueueSubmission, Device},
     storage::{
         constant_ahash_hasher, nostore::SimpleStorage, MutableShared, ObjectHeader, ObjectStorage,
         SynchronizationLock,
     },
-    submission::{QueueSubmission, ReaderWriterState},
 };
 
 use super::{ArcHandle, Object};

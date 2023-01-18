@@ -5,7 +5,7 @@ use std::{
 
 use pumice::vk::{self, DebugUtilsMessageSeverityFlagsEXT};
 
-use crate::tracing::Severity;
+use crate::{tracing::Severity, util::format_writer::FormatWriter};
 
 pub fn to_version(version: u32) -> (u16, u16, u16, u16) {
     (
@@ -59,16 +59,18 @@ pub unsafe extern "system" fn debug_callback(
 
         #[cfg(not(feature = "build-tracing"))]
         {
-            #[rustfmt::skip]
+            #[rustfmt::skip] 
             let text = match level {
-                Severity::Trace => "[TRACE]",
-                Severity::Info =>  "[INFO] ",
-                Severity::Debug => "[DEBUG]",
-                Severity::Warn =>  "[WARN] ",
-                Severity::Error => "[ERROR]",
+                Severity::Trace => "TRACE",
+                Severity::Info =>  "INFO ",
+                Severity::Debug => "DEBUG",
+                Severity::Warn =>  "WARN ",
+                Severity::Error => "ERROR",
             };
             let color = Colored(level, &text);
-            eprintln!("{color} {args}");
+            let mut formatter = FormatWriter::new(std::io::stdout(), "     ");
+            use std::io::Write;
+            writeln!(formatter, "{color} {args}");
         }
     };
 

@@ -2,10 +2,10 @@ use std::ptr;
 
 use super::{ArcHandle, Object, ResourceMutableState};
 use crate::arena::uint::{Config, PackedUint};
-use crate::context::device::Device;
+use crate::device::Device;
 use crate::graph::resource_marker::ImageMarker;
+use crate::storage::nostore::SimpleStorage;
 use crate::storage::{MutableShared, ObjectHeader, SynchronizationLock};
-use crate::{storage::nostore::SimpleStorage, submission::ReaderWriterState};
 use pumice::util::ObjectHandle;
 use pumice::vk;
 use pumice::VulkanResult;
@@ -92,10 +92,36 @@ impl SwapchainState {
                 create_info.surface,
             )?;
 
-        self.extent = surface_info.current_extent.clone();
+        // vulkan requires weird extent tricks
+        // stolen from https://github.com/glfw/glfw/blob/57cbded0760a50b9039ee0cb3f3c14f60145567c/tests/triangle-vulkan.c#L598
+
+        let mut extent = create_info.extent.clone();
+        // width and height are either both 0xFFFFFFFF, or both not 0xFFFFFFFF
+        if (surface_info.current_extent.width == u32::MAX) {
+            // If the surface size is undefined, the size is set to the size
+            // of the images requested, which must fit within the minimum and
+            // maximum values.
+
+            if (extent.width < surface_info.min_image_extent.width) {
+                extent.width = surface_info.min_image_extent.width;
+            } else if (extent.width > surface_info.max_image_extent.width) {
+                extent.width = surface_info.max_image_extent.width;
+            }
+
+            if (extent.height < surface_info.min_image_extent.height) {
+                extent.height = surface_info.min_image_extent.height;
+            } else if (extent.height > surface_info.max_image_extent.height) {
+                extent.height = surface_info.max_image_extent.height;
+            }
+        } else {
+            // If the surface size is defined, the swap chain size must match
+            extent = surface_info.current_extent.clone();
+        }
+
+        self.extent = extent.clone();
 
         let create_info = vk::SwapchainCreateInfoKHR {
-            image_extent: surface_info.current_extent,
+            image_extent: extent,
             old_swapchain: self.swapchain,
             ..create_info.to_vk()
         };
@@ -246,7 +272,7 @@ impl Object for Swapchain {
     }
 
     unsafe fn get_storage(parent: &Self::Parent) -> &Self::Storage {
-        todo!()
+        &parent.swapchain_storage
     }
 }
 
