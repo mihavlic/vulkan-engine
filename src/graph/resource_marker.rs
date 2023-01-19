@@ -222,6 +222,7 @@ impl ResourceData for PassBufferData {
 
 pub trait ResourceMarker {
     const IS_IMAGE: bool;
+    const IS_BUFFER: bool = !Self::IS_IMAGE;
 
     type IfImage<T>: TypeOption<T>;
     type IfBuffer<T>: TypeOption<T>;
