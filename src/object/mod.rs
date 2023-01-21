@@ -9,11 +9,9 @@ pub use surface::*;
 pub use swapchain::*;
 
 use pumice::VulkanResult;
-use std::{borrow::BorrowMut, cell::RefMut, hash::Hash, mem::ManuallyDrop, ptr::NonNull};
+use std::{borrow::BorrowMut, hash::Hash, mem::ManuallyDrop, ptr::NonNull};
 
-use crate::storage::{
-    ArcHeader, MutableShared, ObjectHeader, ObjectMutable, ObjectStorage, SynchronizationLock,
-};
+use crate::storage::{ArcHeader, MutableShared, ObjectHeader, ObjectStorage, SynchronizationLock};
 
 pub(crate) trait Object: Sized {
     type CreateInfo;
@@ -96,7 +94,7 @@ impl<T: Object> PartialOrd for ArcHandle<T> {
 }
 impl<T: Object> Eq for ArcHandle<T> {}
 impl<T: Object> Ord for ArcHandle<T> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, _other: &Self) -> std::cmp::Ordering {
         todo!()
     }
 }
@@ -191,7 +189,7 @@ impl<T: Object> Drop for ArcHandle<T> {
             assert!(prev > 0);
 
             if prev == 1 {
-                let mut storage = self.get_storage();
+                let storage = self.get_storage();
                 T::Storage::destroy(storage, self);
             }
         }

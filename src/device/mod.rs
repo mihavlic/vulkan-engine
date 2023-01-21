@@ -10,33 +10,24 @@ use crate::{
     object::{self, Buffer, Image, Swapchain},
     storage::{nostore::SimpleStorage, ObjectStorage},
     tracing::shim_macros::{info, trace},
-    util::{
-        self,
-        debug_callback::to_version,
-        format_utils::{self, Fun, IterDisplay},
-    },
+    util::format_utils::{self},
 };
 use pumice::{
-    loader::{
-        tables::{DeviceTable, EntryTable, InstanceTable},
-        DeviceLoader, InstanceLoader,
-    },
+    loader::{tables::DeviceTable, DeviceLoader},
     util::ApiLoadConfig,
     vk,
     vk10::QueueFamilyProperties,
     DeviceWrapper, VulkanResult,
 };
-use pumice_vma::{Allocator, AllocatorCreateInfo};
+use pumice_vma::Allocator;
 use smallvec::{smallvec, SmallVec};
 use std::{
-    borrow::Borrow,
     collections::{hash_map::RandomState, HashSet},
     ffi::{c_void, CStr},
     fmt::Display,
     ops::Deref,
-    pin::Pin,
     ptr::NonNull,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -118,7 +109,7 @@ impl Device {
             device_features,
             queue_family_selection,
             device_substrings,
-            verbose,
+            verbose: _,
             p_next,
         } = info;
 
@@ -365,7 +356,6 @@ use {
     crate::tracing::tracing_subscriber::install_tracing_subscriber,
     crate::tracing::Severity,
     pumice_vma::{AllocationCreateFlags, AllocationCreateInfo},
-    std::str::FromStr,
 };
 
 #[test]
@@ -501,7 +491,7 @@ unsafe fn select_device(
         let index = device_considered
             .iter()
             .enumerate()
-            .filter(|&(i, &checked)| checked == false)
+            .filter(|&(_i, &checked)| checked == false)
             .next()
             .map(|(i, _)| i);
 
@@ -518,7 +508,7 @@ unsafe fn select_device(
         let physical_device = physical_devices[i];
         let physical_device_properties = &physical_device_properties[i];
 
-        let device_name =
+        let _device_name =
             CStr::from_ptr(physical_device_properties.device_name.as_ptr()).to_string_lossy();
 
         // extension criteria
@@ -537,7 +527,7 @@ unsafe fn select_device(
             let difference = device_extensions.difference(&scratch_extensions);
 
             if difference.clone().next().is_some() {
-                let iter =
+                let _iter =
                     format_utils::IterDisplay::new(difference, |i, d| i.to_string_lossy().fmt(d));
 
                 trace!("Device '{device_name}' is missing extensions:\n{iter}");
@@ -556,7 +546,7 @@ unsafe fn select_device(
             family_search_scratch.clear();
             family_search_scratch.resize(queue_families.len(), 0);
 
-            for (i, selection) in queue_family_selection.iter().enumerate() {
+            for (_i, selection) in queue_family_selection.iter().enumerate() {
                 let is_valid: fn(vk::QueueFlags, vk::QueueFlags) -> bool = if selection.exact {
                     |flags: vk::QueueFlags, mask: vk::QueueFlags| flags == mask
                 } else {

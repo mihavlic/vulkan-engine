@@ -76,7 +76,7 @@ impl<T> From<T> for TypeSome<T> {
 pub struct TypeNone<T>(std::marker::PhantomData<fn() -> T>);
 impl<T> TypeOption<T> for TypeNone<T> {
     #[inline(always)]
-    fn new_some(val: T) -> Self {
+    fn new_some(_val: T) -> Self {
         TypeNone(std::marker::PhantomData)
     }
 
@@ -131,18 +131,18 @@ impl<T> From<T> for TypeNone<T> {
 }
 // #[derive(PartialEq, Eq, PartialOrd, Ord)]
 impl<T> PartialEq for TypeNone<T> {
-    fn eq(&self, other: &Self) -> bool {
+    fn eq(&self, _other: &Self) -> bool {
         true
     }
 }
 impl<T> Eq for TypeNone<T> {}
 impl<T> PartialOrd for TypeNone<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, _other: &Self) -> Option<std::cmp::Ordering> {
         Some(std::cmp::Ordering::Equal)
     }
 }
 impl<T> Ord for TypeNone<T> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, _other: &Self) -> std::cmp::Ordering {
         std::cmp::Ordering::Equal
     }
 }
@@ -268,7 +268,7 @@ impl ResourceMarker for ImageMarker {
     }
 
     #[inline(always)]
-    fn when_buffer<T, F: FnOnce() -> T>(fun: F) -> Self::IfBuffer<T> {
+    fn when_buffer<T, F: FnOnce() -> T>(_fun: F) -> Self::IfBuffer<T> {
         TypeNone(std::marker::PhantomData)
     }
 
@@ -277,7 +277,7 @@ impl ResourceMarker for ImageMarker {
     #[inline(always)]
     fn select<Image, Buffer>(
         a: Self::IfImage<Image>,
-        b: Self::IfBuffer<Buffer>,
+        _b: Self::IfBuffer<Buffer>,
     ) -> Self::EitherOut<Image, Buffer> {
         a.unwrap()
     }
@@ -285,7 +285,7 @@ impl ResourceMarker for ImageMarker {
     #[inline(always)]
     fn select_ref<'a, Image, Buffer>(
         a: &'a Self::IfImage<Image>,
-        b: &'a Self::IfBuffer<Buffer>,
+        _b: &'a Self::IfBuffer<Buffer>,
     ) -> &'a Self::EitherOut<Image, Buffer> {
         a.get()
     }
@@ -293,7 +293,7 @@ impl ResourceMarker for ImageMarker {
     #[inline(always)]
     fn select_ref_mut<'a, Image, Buffer>(
         a: &'a mut Self::IfImage<Image>,
-        b: &'a mut Self::IfBuffer<Buffer>,
+        _b: &'a mut Self::IfBuffer<Buffer>,
     ) -> &'a mut Self::EitherOut<Image, Buffer> {
         a.get_mut()
     }
@@ -308,7 +308,7 @@ impl ResourceMarker for ImageMarker {
     #[inline(always)]
     fn select_with<Image, Buffer, FImage: FnOnce() -> Image, FBuffer: FnOnce() -> Buffer>(
         image: FImage,
-        buffer: FBuffer,
+        _buffer: FBuffer,
     ) -> Self::EitherOut<Image, Buffer> {
         image()
     }
@@ -324,7 +324,7 @@ impl ResourceMarker for BufferMarker {
     type Data = PassBufferData;
 
     #[inline(always)]
-    fn when_image<T, F: FnOnce() -> T>(fun: F) -> Self::IfImage<T> {
+    fn when_image<T, F: FnOnce() -> T>(_fun: F) -> Self::IfImage<T> {
         TypeNone(std::marker::PhantomData)
     }
 
@@ -337,7 +337,7 @@ impl ResourceMarker for BufferMarker {
 
     #[inline(always)]
     fn select<Image, Buffer>(
-        a: Self::IfImage<Image>,
+        _a: Self::IfImage<Image>,
         b: Self::IfBuffer<Buffer>,
     ) -> Self::EitherOut<Image, Buffer> {
         b.unwrap()
@@ -345,7 +345,7 @@ impl ResourceMarker for BufferMarker {
 
     #[inline(always)]
     fn select_ref<'a, Image, Buffer>(
-        a: &'a Self::IfImage<Image>,
+        _a: &'a Self::IfImage<Image>,
         b: &'a Self::IfBuffer<Buffer>,
     ) -> &'a Self::EitherOut<Image, Buffer> {
         b.get()
@@ -353,7 +353,7 @@ impl ResourceMarker for BufferMarker {
 
     #[inline(always)]
     fn select_ref_mut<'a, Image, Buffer>(
-        a: &'a mut Self::IfImage<Image>,
+        _a: &'a mut Self::IfImage<Image>,
         b: &'a mut Self::IfBuffer<Buffer>,
     ) -> &'a mut Self::EitherOut<Image, Buffer> {
         b.get_mut()
@@ -368,7 +368,7 @@ impl ResourceMarker for BufferMarker {
 
     #[inline(always)]
     fn select_with<Image, Buffer, FImage: FnOnce() -> Image, FBuffer: FnOnce() -> Buffer>(
-        image: FImage,
+        _image: FImage,
         buffer: FBuffer,
     ) -> Self::EitherOut<Image, Buffer> {
         buffer()

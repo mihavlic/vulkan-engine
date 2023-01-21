@@ -1,17 +1,13 @@
 use std::{
-    borrow::Borrow,
     ffi::c_void,
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use pumice::{vk, DeviceWrapper, VulkanResult};
+use pumice::{vk, VulkanResult};
 use smallvec::SmallVec;
 
 use crate::{
-    arena::{
-        arena::{GenArena, U32Key},
-        uint::OptionalU32,
-    },
+    arena::arena::{GenArena, U32Key},
     device::Device,
 };
 
@@ -253,7 +249,7 @@ pub struct AllocateSequential<'a> {
 }
 
 impl<'a> AllocateSequential<'a> {
-    fn alloc(&mut self, queue: Queue) -> (QueueSubmission, TimelineSemaphore) {
+    fn alloc(&mut self, _queue: Queue) -> (QueueSubmission, TimelineSemaphore) {
         self.semaphore.bump_value();
         let key = self.manager.push_submission(self.semaphore, false);
         self.last = Some(key);

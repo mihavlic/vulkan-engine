@@ -19,7 +19,7 @@ impl Surface {
     pub unsafe fn into_raw(self) -> vk::SurfaceKHR {
         let prison = ManuallyDrop::new(self);
         let handle = std::ptr::read(&prison.handle);
-        let instance = std::ptr::read(&prison.instance);
+        let _instance = std::ptr::read(&prison.instance);
         handle
     }
 }

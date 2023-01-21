@@ -1,7 +1,7 @@
 use std::ptr;
 
 use super::{ArcHandle, Object, ResourceMutableState};
-use crate::arena::uint::{Config, PackedUint};
+
 use crate::device::Device;
 use crate::graph::resource_marker::ImageMarker;
 use crate::storage::nostore::SimpleStorage;
@@ -9,7 +9,6 @@ use crate::storage::{MutableShared, ObjectHeader, SynchronizationLock};
 use pumice::util::ObjectHandle;
 use pumice::vk;
 use pumice::VulkanResult;
-use smallvec::SmallVec;
 
 #[derive(PartialEq, Eq, Hash)]
 pub struct SwapchainCreateInfo {
@@ -46,12 +45,12 @@ pub(crate) struct SwapchainImage {
 }
 
 impl SwapchainImage {
-    unsafe fn new(image: vk::Image, ctx: &Device) -> Self {
-        let fence_info = vk::FenceCreateInfo {
+    unsafe fn new(image: vk::Image, _ctx: &Device) -> Self {
+        let _fence_info = vk::FenceCreateInfo {
             flags: pumice::vk10::FenceCreateFlags::SIGNALED,
             ..Default::default()
         };
-        let semaphore_info = vk::SemaphoreCreateInfo::default();
+        let _semaphore_info = vk::SemaphoreCreateInfo::default();
         Self {
             image,
             state: ResourceMutableState::with_initial_layout(vk::ImageLayout::UNDEFINED),
@@ -98,7 +97,7 @@ impl SwapchainState {
 
         // spec states:
         //   "currentExtent [...] special value (0xFFFFFFFF, 0xFFFFFFFF) indicating that the surface size will be determined by the extent of a swapchain targeting the surface"
-        let extent = if (surface_info.current_extent.width == u32::MAX) {
+        let extent = if surface_info.current_extent.width == u32::MAX {
             let target_extent = self
                 .resized_to
                 .clone()
@@ -187,7 +186,7 @@ impl SwapchainState {
 
         match result {
             Ok((index, vk::Result::SUCCESS)) => SwapchainAcquireStatus::Ok(index, false),
-            Ok((index, vk::Result::TIMEOUT | vk::Result::NOT_READY)) => {
+            Ok((_index, vk::Result::TIMEOUT | vk::Result::NOT_READY)) => {
                 return SwapchainAcquireStatus::Timeout
             }
             Ok((index, vk::Result::SUBOPTIMAL_KHR)) => {
@@ -201,7 +200,7 @@ impl SwapchainState {
     pub fn surface_resized(&mut self, new_extent: vk::Extent2D) {
         self.resized_to = Some(new_extent);
     }
-    pub fn get_swapchain(&self, image_index: u32) -> vk::SwapchainKHR {
+    pub fn get_swapchain(&self, _image_index: u32) -> vk::SwapchainKHR {
         self.swapchain
     }
     pub fn get_image_data(&self, image_index: u32) -> &SwapchainImage {
@@ -260,14 +259,14 @@ impl Object for Swapchain {
     unsafe fn create(
         ctx: &Device,
         info: &Self::CreateInfo,
-        allocation_info: &Self::SupplementalInfo,
+        _allocation_info: &Self::SupplementalInfo,
     ) -> VulkanResult<(Self::Handle, Self::ObjectData)> {
         SwapchainState::new(info, ctx).map(|state| ((), MutableShared::new(state)))
     }
 
     unsafe fn destroy(
         ctx: &Self::Parent,
-        handle: Self::Handle,
+        _handle: Self::Handle,
         header: &ObjectHeader<Self>,
         lock: &SynchronizationLock,
     ) -> VulkanResult<()> {

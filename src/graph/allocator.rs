@@ -1,12 +1,7 @@
-use super::{GraphResource, SubmissionResourceReuse};
-use crate::{device::Device, simple_handle, storage::constant_ahash_hashset};
+use super::SubmissionResourceReuse;
+use crate::storage::constant_ahash_hashset;
 use pumice::{vk, VulkanResult};
-use std::{
-    cell::{Cell, Ref, RefCell, RefMut},
-    collections::{BTreeMap, BTreeSet},
-    hash::Hash,
-    rc::Rc,
-};
+use std::{cell::RefCell, collections::BTreeMap, hash::Hash, rc::Rc};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MemoryKind {
@@ -128,7 +123,7 @@ impl Suballocator {
     }
     pub(crate) fn collect_blocks(&self) -> ahash::HashSet<RcPtrComparator<MemoryBlock>> {
         let mut memory_blocks = constant_ahash_hashset();
-        for (key, (alloc, memory)) in &self.allocations {
+        for (_key, (_alloc, memory)) in &self.allocations {
             memory_blocks.insert(RcPtrComparator(memory.clone()));
         }
 
@@ -218,7 +213,7 @@ impl Suballocator {
                     new_key
                 };
 
-                let (mut chunk_value, memory) = self
+                let (chunk_value, memory) = self
                     .allocations
                     .remove(&key)
                     .expect("The chunk is not here?!");

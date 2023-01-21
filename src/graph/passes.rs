@@ -12,7 +12,7 @@ impl CreatePass for ClearImage {
     fn create(
         self,
         builder: &mut super::GraphPassBuilder,
-        device: &crate::device::Device,
+        _device: &crate::device::Device,
     ) -> Self::Pass {
         builder.use_image(
             self.image,

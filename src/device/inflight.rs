@@ -1,9 +1,6 @@
-use std::{
-    mem::ManuallyDrop,
-    time::{Duration, Instant},
-};
+use std::{mem::ManuallyDrop, time::Instant};
 
-use crate::{object, storage::constant_ahash_hashmap};
+use crate::object;
 
 use super::{batch::GenerationId, submission::WaitResult, Device};
 

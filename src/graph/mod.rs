@@ -6,33 +6,30 @@ mod reverse_edges;
 
 use core::panic;
 use std::{
-    borrow::{Borrow, Cow},
+    borrow::Cow,
     cell::{Cell, RefCell, RefMut},
-    collections::{hash_map::Entry, BinaryHeap, HashSet, VecDeque},
-    f32::consts::E,
+    collections::{hash_map::Entry, BinaryHeap},
     fmt::Display,
-    fs::OpenOptions,
     hash::{Hash, Hasher},
     io::Write,
-    marker::PhantomData,
     mem::ManuallyDrop,
-    ops::{ControlFlow, Deref, DerefMut, Not, Range},
+    ops::{Deref, DerefMut, Range},
     sync::Arc,
 };
 
 use ahash::HashMap;
 use pumice::{util::ObjectHandle, vk, vk10::CommandPoolCreateInfo, DeviceWrapper, VulkanResult};
-use pumice_vma::{Allocation, AllocationCreateInfo};
-use slice_group_by::GroupByMut;
+use pumice_vma::AllocationCreateInfo;
+
 use smallvec::{smallvec, SmallVec};
 
 use crate::{
     arena::uint::{Config, OptionalU32, PackedUint},
     device::{
-        Device, OwnedDevice, __test_init_device,
         batch::GenerationId,
         inflight::InflightResource,
         submission::{self, QueueSubmission},
+        Device, OwnedDevice,
     },
     graph::{
         allocator::MemoryKind,
@@ -43,19 +40,13 @@ use crate::{
         self, BufferCreateInfo, ImageCreateInfo, Object, ResourceMutableState,
         SwapchainAcquireStatus, SynchronizeResult,
     },
-    storage::{
-        constant_ahash_hasher, constant_ahash_hashmap, constant_ahash_hashset,
-        constant_ahash_randomstate, ObjectStorage, SynchronizationLock,
-    },
+    storage::{constant_ahash_hashmap, constant_ahash_hashset, ObjectStorage},
     token_abuse,
-    util::{self, format_utils::Fun, macro_abuse::WeirdFormatter},
+    util::{format_utils::Fun, macro_abuse::WeirdFormatter},
 };
 
 use self::{
-    allocator::{
-        AvailabilityToken, RcPtrComparator, Suballocation, SuballocationUgh, Suballocator,
-    },
-    lazy_sorted::LazySorted,
+    allocator::{AvailabilityToken, RcPtrComparator, SuballocationUgh, Suballocator},
     resource_marker::{ResourceData, ResourceMarker},
     reverse_edges::{DFSCommand, ImmutableGraph, NodeGraph},
 };
@@ -69,7 +60,7 @@ impl RenderPass for () {
     fn prepare(&mut self) {
         {}
     }
-    unsafe fn execute(self, executor: &GraphExecutor, device: &Device) -> VulkanResult<()> {
+    unsafe fn execute(self, _executor: &GraphExecutor, _device: &Device) -> VulkanResult<()> {
         VulkanResult::Ok(())
     }
 }
@@ -243,7 +234,7 @@ impl LegacySemaphoreStack {
     }
     unsafe fn next(&mut self, ctx: &Device) -> vk::Semaphore {
         if self.next_index == self.semaphores.len() {
-            let info = vk::SemaphoreCreateInfo::default();
+            let _info = vk::SemaphoreCreateInfo::default();
             let semaphore = ctx.create_raw_semaphore().unwrap();
             self.semaphores.push(semaphore);
         }
@@ -468,7 +459,7 @@ impl Graph {
             ImageData::Moved(..) => unreachable!(),
         }
     }
-    fn is_buffer_external(&self, mut buffer: GraphBuffer) -> bool {
+    fn is_buffer_external(&self, buffer: GraphBuffer) -> bool {
         match self.get_buffer_data(buffer) {
             BufferData::TransientPrototype(..) => false,
             BufferData::Transient(..) => unreachable!(),
@@ -527,11 +518,11 @@ impl Graph {
         self.pass_meta
             .iter()
             .enumerate()
-            .filter(|&(i, meta)| meta.alive.get())
+            .filter(|&(_i, meta)| meta.alive.get())
             .map(|(i, _)| GraphPass::new(i))
     }
     fn get_children(&self, pass: GraphPass) -> &[GraphPass] {
-        let meta = &self.pass_meta[pass.index()];
+        let _meta = &self.pass_meta[pass.index()];
         let children = self.pass_children.get_children(pass.0);
         // sound because handles are repr(transparent)
         unsafe {
@@ -735,7 +726,7 @@ impl Graph {
                             let dst_writing = buffer.is_written();
                             let src = &mut buffer_rw[buffer.handle.index()];
 
-                            let resource = GraphResource::Buffer(buffer.handle);
+                            let _resource = GraphResource::Buffer(buffer.handle);
 
                             update_resource_state(src, p, dst_writing, data);
                         }
@@ -823,10 +814,10 @@ impl Graph {
                     .get_pass()
                     .0
             }
-            fn get_node_data(&self, this: NodeKey) -> &Self::NodeData {
+            fn get_node_data(&self, _this: NodeKey) -> &Self::NodeData {
                 &()
             }
-            fn get_node_data_mut(&mut self, this: NodeKey) -> &mut Self::NodeData {
+            fn get_node_data_mut(&mut self, _this: NodeKey) -> &mut Self::NodeData {
                 &mut self.1
             }
         }
@@ -927,7 +918,7 @@ impl Graph {
                                     let dependency_info = &mut dependency_count[next_pass.index()];
                                     // if the pass has no outstanding deendencies, we measure its priority and add it to the heap
                                     if dependency_info.0 == 0 {
-                                        let queue = data.queue;
+                                        let _queue = data.queue;
                                         let item =
                                             AvailablePass::new(next_pass, self, &mut graph_layers);
                                         heap.push(item);
@@ -982,7 +973,7 @@ impl Graph {
 
         // collect live intervals of the resources
         // this is used for physical resource physical resource assignment and correct image move handling
-        let (image_usage, buffer_usage) = {
+        let (image_usage, _buffer_usage) = {
             let mut image_usage = vec![0..0; self.images.len()];
             let mut buffer_usage = vec![0..0; self.buffers.len()];
 
@@ -1050,7 +1041,7 @@ impl Graph {
                 buffer_rw[i].1 = self.get_buffer_data(buffer).is_sharing_concurrent();
             }
 
-            let mut recorder = RefCell::new(SubmissionRecorder::new(self));
+            let recorder = RefCell::new(SubmissionRecorder::new(self));
 
             // set of first accesses that occur in the timeline,
             // becomes "closed" (bool = true) when the first write occurs
@@ -1146,7 +1137,7 @@ impl Graph {
                         }
                     }
                     PassEventData::Move(_) => {} // this is handled differently
-                    PassEventData::Flush(q) => recorder.borrow_mut().close_current_submission(),
+                    PassEventData::Flush(_q) => recorder.borrow_mut().close_current_submission(),
                 }
             }
 
@@ -1362,7 +1353,7 @@ impl Graph {
             //     i
             // }
 
-            let mut physical_images = self.physical_images.drain(..).map(Some).collect::<Vec<_>>();
+            let physical_images = self.physical_images.drain(..).map(Some).collect::<Vec<_>>();
 
             // let mut image_reuse = self
             //     .physical_images
@@ -1438,7 +1429,7 @@ impl Graph {
             //     i
             // }
 
-            let mut physical_buffers = self
+            let physical_buffers = self
                 .physical_buffers
                 .drain(..)
                 .map(Some)
@@ -1516,8 +1507,8 @@ impl Graph {
             for img in physical_images.into_iter().flatten() {
                 let memory_type = img.get_memory_type();
                 let PhysicalImageData {
-                    info,
-                    memory,
+                    info: _,
+                    memory: _,
                     vkhandle,
                     state,
                 } = img;
@@ -1529,8 +1520,8 @@ impl Graph {
             for buf in physical_buffers.into_iter().flatten() {
                 let memory_type = buf.get_memory_type();
                 let PhysicalBufferData {
-                    info,
-                    memory,
+                    info: _,
+                    memory: _,
                     vkhandle,
                     state,
                 } = buf;
@@ -1564,7 +1555,7 @@ impl Graph {
                 );
 
                 if submission.passes.len() == 1 {
-                    let a = 2;
+                    let _a = 2;
                 }
 
                 if submission.passes.len() > pass_effects.len() {
@@ -1630,7 +1621,7 @@ impl Graph {
 
                     need_alloc.clear();
                     for a in &data.images {
-                        if let ImageData::TransientPrototype(create_info, allocation_info) =
+                        if let ImageData::TransientPrototype(create_info, _allocation_info) =
                             self.get_image_data(a.handle)
                         {
                             let vk_info = create_info.to_vk();
@@ -1651,7 +1642,7 @@ impl Graph {
                         }
                     }
                     for a in &data.buffers {
-                        if let BufferData::TransientPrototype(create_info, allocation_info) =
+                        if let BufferData::TransientPrototype(create_info, _allocation_info) =
                             self.get_buffer_data(a.handle)
                         {
                             let vk_info = create_info.to_vk();
@@ -1677,7 +1668,10 @@ impl Graph {
 
                     for (resource, reqs) in &need_alloc {
                         let (tiling, allocation_info, availability, display) = match *resource {
-                            NeedAlloc::Image { vkhandle, handle } => {
+                            NeedAlloc::Image {
+                                vkhandle: _,
+                                handle,
+                            } => {
                                 let ImageData::TransientPrototype(create_info, allocation_info) = self.get_image_data(handle) else {
                                     unreachable!()
                                 };
@@ -1688,8 +1682,11 @@ impl Graph {
                                     self.get_image_display(handle),
                                 )
                             }
-                            NeedAlloc::Buffer { vkhandle, handle } => {
-                                let BufferData::TransientPrototype(create_info, allocation_info) = self.get_buffer_data(handle) else {
+                            NeedAlloc::Buffer {
+                                vkhandle: _,
+                                handle,
+                            } => {
+                                let BufferData::TransientPrototype(_create_info, allocation_info) = self.get_buffer_data(handle) else {
                                     unreachable!()
                                 };
                                 (
@@ -1740,10 +1737,10 @@ impl Graph {
                         match *resource {
                             NeedAlloc::Image { vkhandle, handle } => {
                                 let data = self.get_image_data(handle);
-                                let ImageData::TransientPrototype(create_info, allocation_info) = data else {
+                                let ImageData::TransientPrototype(create_info, _allocation_info) = data else {
                                     unreachable!()
                                 };
-                                let allocation = suballocation.memory.allocation;
+                                let _allocation = suballocation.memory.allocation;
 
                                 unsafe {
                                     // TODO consider using bind_image_memory2
@@ -1769,10 +1766,10 @@ impl Graph {
                             }
                             NeedAlloc::Buffer { vkhandle, handle } => {
                                 let data = self.get_buffer_data(handle);
-                                let BufferData::TransientPrototype(create_info, allocation_info) = data else {
+                                let BufferData::TransientPrototype(create_info, _allocation_info) = data else {
                                     unreachable!()
                                 };
-                                let allocation = suballocation.memory.allocation;
+                                let _allocation = suballocation.memory.allocation;
 
                                 unsafe {
                                     // TODO consider using bind_buffer_memory2
@@ -1892,7 +1889,7 @@ impl Graph {
                     let resource = GraphResource::Image(handle);
                     let first_access = accessors.get(&resource).unwrap();
 
-                    let ResourceState::Normal { layout, queue_family, access } = &image_last_state[i].0 else {
+                    let ResourceState::Normal { layout, queue_family, access: _ } = &image_last_state[i].0 else {
                         panic!("Unsupported resource state (TODO should Uninit be allowed?)");
                     };
 
@@ -1956,7 +1953,7 @@ impl Graph {
 
                             let mut attempt = 0;
                             let index = loop {
-                                let image_index = match mutable.acquire_image(
+                                let _image_index = match mutable.acquire_image(
                                     u64::MAX,
                                     acquire_semaphore,
                                     vk::Fence::null(),
@@ -2074,7 +2071,7 @@ impl Graph {
                     let resource = GraphResource::Buffer(handle);
                     let usage = accessors.get(&resource).unwrap();
 
-                    let ResourceState::Normal { layout, queue_family, access } = &buffer_last_state[i].0 else {
+                    let ResourceState::Normal { layout, queue_family, access: _ } = &buffer_last_state[i].0 else {
                         panic!("Unsupported resource state (TODO should Uninit be allowed?)");
                     };
 
@@ -2117,7 +2114,7 @@ impl Graph {
             }
         }
 
-        let mut raw_images = self
+        let raw_images = self
             .images
             .iter()
             .enumerate()
@@ -2151,7 +2148,7 @@ impl Graph {
             })
             .collect::<Vec<_>>();
 
-        let mut raw_buffers = self
+        let raw_buffers = self
             .buffers
             .iter()
             .enumerate()
@@ -2201,12 +2198,12 @@ impl Graph {
 
                 let d = self.device.device();
                 let Submission {
-                    queue,
+                    queue: _,
                     passes,
                     semaphore_dependencies,
                     barriers,
                     special_barriers,
-                    contains_end_all_barrier,
+                    contains_end_all_barrier: _,
                 } = sub;
 
                 d.begin_command_buffer(
@@ -2435,7 +2432,7 @@ impl Graph {
                 let ResourceState::Normal {
                     layout,
                     queue_family,
-                    access,
+                    access: _,
                 } = &image_rw[img.raw_resource_handle().index()].0 else {
                     panic!("Impossible for external resources to be any other state")
                 };
@@ -2497,8 +2494,8 @@ impl Graph {
                     );
                 }
                 ResourceState::Normal {
-                    layout,
-                    queue_family,
+                    layout: _,
+                    queue_family: _,
                     access,
                 } => add(access.iter().cloned(), scratch, self),
             }
@@ -2525,7 +2522,7 @@ impl Graph {
     fn emit_barriers<T: ResourceMarker>(
         &self,
         pass: GraphPass,
-        dst_pass: SubmissionPass,
+        _dst_pass: SubmissionPass,
         dst_queue_family: u32,
         resource_data: &T::Data,
         recorder: &RefCell<SubmissionRecorder>,
@@ -2583,7 +2580,7 @@ impl Graph {
 
                 for subresource in parts.iter_mut() {
                     let ImageSubresource {
-                        src_image,
+                        src_image: _,
                         layout: src_layout,
                         queue_family: src_queue_family,
                         access,
@@ -2866,7 +2863,7 @@ impl Graph {
 
             // a weird way to count that heads has at least two Some(_)
             if heads.iter().flatten().nth(1).is_some() {
-                let mut heads = heads
+                let heads = heads
                     .iter()
                     .enumerate()
                     .filter_map(|(i, p)| p.as_ref().map(|p| (i, p)));
@@ -3162,7 +3159,7 @@ fn submission_fill_reuse<T: ResourceMarker>(
             old
         });
         resource_availability[i] = token;
-        let handle = RawHandle::new(i);
+        let _handle = RawHandle::new(i);
         match reuse {
             ResourceLastUse::None => {}
             ResourceLastUse::Single(sub, passes) => {
@@ -3208,7 +3205,7 @@ fn submission_fill_reuse<T: ResourceMarker>(
 
 #[test]
 fn test_graph() {
-    let device = unsafe { __test_init_device(true) };
+    let device = unsafe { crate::device::__test_init_device(true) };
     let mut g = Graph::new(device);
     g.run(|b| {
         let dummy_queue1 = submission::Queue::new(pumice::vk10::Queue::from_raw(1), 0);
@@ -3598,7 +3595,7 @@ impl GraphBuilder {
                 layer_offset += layer_count;
             }
 
-            let mut info = ImageCreateInfo {
+            let info = ImageCreateInfo {
                 array_layers: layer_offset as u32,
                 ..first_info
             };
@@ -3752,7 +3749,7 @@ pub struct GraphExecutor<'a> {
 
 pub struct DescriptorState;
 impl<'a> GraphExecutor<'a> {
-    pub fn get_image_subresource_range(&self, handle: GraphImage) -> vk::ImageSubresourceRange {
+    pub fn get_image_subresource_range(&self, _handle: GraphImage) -> vk::ImageSubresourceRange {
         vk::ImageSubresourceRange {
             // TODO don't be dumb
             aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -4072,7 +4069,7 @@ impl OpenSubmision {
         }
     }
     fn finish(&mut self, queue: GraphQueue) -> Submission {
-        let mut take = Submission {
+        let take = Submission {
             queue,
             passes: self.passes.clone(),
             semaphore_dependencies: self.semaphore_dependencies.clone(),
@@ -4219,7 +4216,7 @@ impl<'a> SubmissionRecorder<'a> {
 
         // the pass is on another queue in an open submission, close it for the next step
         if data.queue != queue && scheduled.is_none() {
-            let submission = self
+            let _submission = self
                 .__close_submission(data.queue)
                 .expect("Dependency must be scheduled before the dependee");
         }
@@ -4367,10 +4364,10 @@ impl<'a> NodeGraph for SubmissionFacade<'a> {
     fn get_child(&self, this: NodeKey, child: ChildRelativeKey) -> NodeKey {
         self.0[this as usize].semaphore_dependencies[child as usize].0
     }
-    fn get_node_data(&self, this: NodeKey) -> &Self::NodeData {
+    fn get_node_data(&self, _this: NodeKey) -> &Self::NodeData {
         &()
     }
-    fn get_node_data_mut(&mut self, this: NodeKey) -> &mut Self::NodeData {
+    fn get_node_data_mut(&mut self, _this: NodeKey) -> &mut Self::NodeData {
         &mut self.1
     }
 }

@@ -5,8 +5,8 @@ use std::{
 
 use crate::{
     arena::uint::OptionalU32,
-    graph::resource_marker::BufferMarker,
     device::{batch::GenerationId, submission::ReaderWriterState, Device},
+    graph::resource_marker::BufferMarker,
     storage::{
         constant_ahash_hasher, nostore::SimpleStorage, MutableShared, ObjectHeader,
         SynchronizationLock,
@@ -87,7 +87,7 @@ impl ResourceMutableState<BufferMarker> {
     }
     pub unsafe fn get_view(
         &mut self,
-        self_handle: vk::Buffer,
+        _self_handle: vk::Buffer,
         info: &BufferViewCreateInfo,
         batch_id: GenerationId,
         device: &Device,

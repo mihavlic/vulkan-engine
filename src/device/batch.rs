@@ -1,23 +1,17 @@
 use std::{
-    borrow::BorrowMut,
     cell::UnsafeCell,
-    cmp::Ordering,
-    collections::{BTreeSet, VecDeque},
-    panic::AssertUnwindSafe,
+    collections::VecDeque,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use ahash::{HashSet, RandomState};
-use parking_lot::{
-    lock_api::{RawMutex, RawMutexTimed},
-    Mutex,
-};
+use ahash::HashSet;
+use parking_lot::lock_api::{RawMutex, RawMutexTimed};
 use pumice::VulkanResult;
 
 use crate::{
     device::Device,
-    storage::{constant_ahash_hasher, constant_ahash_hashset, constant_ahash_randomstate},
+    storage::{constant_ahash_hashset, constant_ahash_randomstate},
 };
 
 use super::submission::{QueueSubmission, WaitResult};
@@ -171,7 +165,7 @@ impl GenerationManager {
                 let inner = unsafe { std::ptr::read(arc) };
                 let OpenGenerationEntry {
                     id,
-                    mutex,
+                    mutex: _,
                     submissions,
                 } = Arc::try_unwrap(inner)
                     .ok()

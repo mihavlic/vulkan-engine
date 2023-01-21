@@ -1,6 +1,6 @@
-use std::{hash::BuildHasher, mem::ManuallyDrop, ptr::NonNull, sync::atomic::Ordering};
+use std::{mem::ManuallyDrop, ptr::NonNull};
 
-use ahash::{HashSet, RandomState};
+use ahash::HashSet;
 use pumice::VulkanResult;
 
 use super::{
@@ -49,7 +49,10 @@ impl<T: Object<Storage = Self>> ObjectStorage<T> for SimpleStorage<T> {
     unsafe fn destroy(&self, handle: &ArcHandle<T>) {
         let handle = handle.make_weak_copy();
         let alloc = Box::from_raw(handle.get_arc_header_ptr());
-        let ArcHeader { refcount, header } = *alloc;
+        let ArcHeader {
+            refcount: _,
+            header,
+        } = *alloc;
 
         self.lock.with_locked(|lock| {
             self.handles.get_mut(lock).remove(&handle);
@@ -57,7 +60,7 @@ impl<T: Object<Storage = Self>> ObjectStorage<T> for SimpleStorage<T> {
         });
     }
 
-    fn acquire_exclusive<'a>(&'a self, handle: &ArcHandle<T>) -> super::SynchronizationLock<'a> {
+    fn acquire_exclusive<'a>(&'a self, _handle: &ArcHandle<T>) -> super::SynchronizationLock<'a> {
         self.lock.lock()
     }
 

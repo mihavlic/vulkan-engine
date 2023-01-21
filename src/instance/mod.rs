@@ -7,7 +7,7 @@ use std::{
 
 use pumice::{
     loader::{
-        tables::{DeviceTable, EntryTable, InstanceTable},
+        tables::{EntryTable, InstanceTable},
         EntryLoader, InstanceLoader,
     },
     util::ApiLoadConfig,
@@ -17,7 +17,7 @@ use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
 
 use crate::{
     object,
-    tracing::shim_macros::{info, trace},
+    tracing::shim_macros::info,
     util::{
         self,
         debug_callback::to_version,
@@ -155,7 +155,7 @@ impl Instance {
             let iter = instance_layer_properties
                 .iter()
                 .map(|l| CStr::from_ptr(l.layer_name.as_ptr()).to_string_lossy());
-            let iter = IterDisplay::new(iter, |i, w| i.fmt(w));
+            let _iter = IterDisplay::new(iter, |i, w| i.fmt(w));
             info!(
                 "{} instance layers:\n{}",
                 instance_layer_properties.len(),
@@ -230,7 +230,7 @@ impl Instance {
             .collect::<Vec<_>>();
 
         if verbose {
-            let fun = Fun::new(|f: &mut std::fmt::Formatter<'_>| {
+            let _fun = Fun::new(|f: &mut std::fmt::Formatter<'_>| {
                 for (i, property) in physical_device_properties.iter().enumerate() {
                     let name = CStr::from_ptr(property.device_name.as_ptr()).to_string_lossy();
                     let core = to_version(property.api_version);

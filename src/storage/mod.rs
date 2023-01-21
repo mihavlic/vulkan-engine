@@ -3,14 +3,11 @@ pub mod nostore;
 use crate::object::{ArcHandle, Object};
 use pumice::VulkanResult;
 use std::{
-    cell::{Ref, RefCell, RefMut, UnsafeCell},
+    cell::{Ref, RefCell, RefMut},
     hash::BuildHasher,
     ops::{Deref, DerefMut},
     ptr::NonNull,
-    sync::{
-        atomic::{AtomicBool, AtomicPtr, AtomicUsize},
-        Mutex,
-    },
+    sync::atomic::AtomicUsize,
 };
 
 pub enum SynchronizationLock<'a> {
@@ -106,10 +103,10 @@ impl<T> MutableShared<T> {
     pub(crate) fn new(value: T) -> Self {
         MutableShared(RefCell::new(value))
     }
-    pub unsafe fn get<'a>(&'a self, lock: &'a SynchronizationLock) -> Ref<'a, T> {
+    pub unsafe fn get<'a>(&'a self, _lock: &'a SynchronizationLock) -> Ref<'a, T> {
         self.0.borrow()
     }
-    pub unsafe fn get_mut<'a>(&'a self, lock: &'a SynchronizationLock) -> RefMut<'a, T> {
+    pub unsafe fn get_mut<'a>(&'a self, _lock: &'a SynchronizationLock) -> RefMut<'a, T> {
         self.0.borrow_mut()
     }
 }

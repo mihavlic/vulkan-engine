@@ -1,8 +1,5 @@
 use std::{
-    borrow::BorrowMut,
-    cell::UnsafeCell,
-    hash::{BuildHasher, Hash, Hasher},
-    ops::DerefMut,
+    hash::{Hash, Hasher},
     ptr,
 };
 
@@ -12,7 +9,7 @@ use smallvec::{smallvec, SmallVec};
 use crate::{
     arena::uint::OptionalU32,
     device::{batch::GenerationId, submission::QueueSubmission, Device},
-    graph::resource_marker::{BufferMarker, ImageMarker, ResourceMarker, TypeOption},
+    graph::resource_marker::{ImageMarker, ResourceMarker, TypeOption},
     storage::{
         constant_ahash_hasher, nostore::SimpleStorage, MutableShared, ObjectHeader, ObjectStorage,
         SynchronizationLock,
@@ -145,8 +142,8 @@ impl<T: ResourceMarker> SynchronizationState<T> {
         dst_layout: T::IfImage<vk::ImageLayout>,
         // the state of the resource at the end of the scheduled work
         final_access: &[QueueSubmission],
-        final_layout: T::IfImage<vk::ImageLayout>,
-        final_family: u32,
+        _final_layout: T::IfImage<vk::ImageLayout>,
+        _final_family: u32,
         // whether the resource was created with VK_ACCESS_MODE_CONCURRENT and does not need queue ownership transitions
         resource_concurrent: bool,
     ) -> SynchronizeResult

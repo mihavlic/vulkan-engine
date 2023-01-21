@@ -59,7 +59,7 @@ pub unsafe extern "system" fn debug_callback(
 
         #[cfg(not(feature = "build-tracing"))]
         {
-            #[rustfmt::skip] 
+            #[rustfmt::skip]
             let text = match level {
                 Severity::Trace => "TRACE",
                 Severity::Info =>  "INFO ",

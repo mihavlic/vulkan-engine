@@ -39,7 +39,7 @@ fn dfs_visit_inner<T: NodeGraph + ?Sized, F: FnMut(NodeKey) -> DFSCommand>(
     }
 
     for c in graph.children(root) {
-        let node = graph.get_child(root, c);
+        let _node = graph.get_child(root, c);
         match dfs_visit_inner(graph, root, fun) {
             DFSCommand::Continue => {}
             DFSCommand::Ascend => return DFSCommand::Continue,
@@ -88,11 +88,11 @@ impl NodeGraph for ImmutableGraph {
         self.children[(node.0 + child) as usize]
     }
 
-    fn get_node_data(&self, this: NodeKey) -> &Self::NodeData {
+    fn get_node_data(&self, _this: NodeKey) -> &Self::NodeData {
         &()
     }
 
-    fn get_node_data_mut(&mut self, this: NodeKey) -> &mut Self::NodeData {
+    fn get_node_data_mut(&mut self, _this: NodeKey) -> &mut Self::NodeData {
         &mut self.dummy_unit
     }
 }

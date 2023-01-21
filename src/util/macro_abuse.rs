@@ -1,7 +1,4 @@
-use std::{
-    fmt::{Display, Write},
-    io::stderr,
-};
+use std::fmt::{Display, Write};
 
 use smallvec::{smallvec, SmallVec};
 
