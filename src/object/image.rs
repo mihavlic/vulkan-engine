@@ -9,14 +9,11 @@ use smallvec::{smallvec, SmallVec};
 use crate::{
     arena::uint::OptionalU32,
     device::{batch::GenerationId, submission::QueueSubmission, Device},
-    graph::resource_marker::{ImageMarker, ResourceMarker, TypeOption},
-    storage::{
-        constant_ahash_hasher, nostore::SimpleStorage, MutableShared, ObjectHeader, ObjectStorage,
-        SynchronizationLock,
-    },
+    graph::resource_marker::{ImageMarker, ResourceMarker, TypeOption, TypeSome},
+    storage::{constant_ahash_hasher, nostore::SimpleStorage, MutableShared, SynchronizationLock},
 };
 
-use super::{ArcHandle, Object};
+use super::{ArcHandle, Object, ObjectData};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Extent {
@@ -26,14 +23,14 @@ pub enum Extent {
 }
 
 impl Extent {
-    pub fn as_image_type(&self) -> vk::ImageType {
+    pub(crate) fn as_image_type(&self) -> vk::ImageType {
         match self {
             Extent::D1(_) => vk::ImageType::T1D,
             Extent::D2(_, _) => vk::ImageType::T2D,
             Extent::D3(_, _, _) => vk::ImageType::T3D,
         }
     }
-    pub fn as_extent_2d(&self) -> vk::Extent2D {
+    pub(crate) fn as_extent_2d(&self) -> vk::Extent2D {
         match *self {
             Extent::D1(w) => vk::Extent2D {
                 width: w,
@@ -49,7 +46,7 @@ impl Extent {
             },
         }
     }
-    pub fn as_extent_3d(&self) -> vk::Extent3D {
+    pub(crate) fn as_extent_3d(&self) -> vk::Extent3D {
         match *self {
             Extent::D1(w) => vk::Extent3D {
                 width: w,
@@ -85,7 +82,7 @@ pub struct ImageCreateInfo {
 }
 
 impl ImageCreateInfo {
-    pub fn to_vk(&self) -> vk::ImageCreateInfo {
+    pub(crate) fn to_vk(&self) -> vk::ImageCreateInfo {
         vk::ImageCreateInfo {
             p_next: ptr::null(),
             flags: self.flags,
@@ -112,7 +109,7 @@ pub struct SynchronizeResult {
     pub prev_access: SmallVec<[QueueSubmission; 4]>,
 }
 
-pub struct SynchronizationState<T: ResourceMarker> {
+pub(crate) struct SynchronizationState<T: ResourceMarker> {
     owning_family: OptionalU32,
     layout: T::IfImage<vk::ImageLayout>,
     // FIXME for now we only allow exclusive access to resources, since when we are reading the state of global resources is already built
@@ -122,28 +119,28 @@ pub struct SynchronizationState<T: ResourceMarker> {
 }
 
 impl<T: ResourceMarker> SynchronizationState<T> {
-    pub fn blank() -> Self {
+    pub(crate) fn blank() -> Self {
         Self {
             owning_family: OptionalU32::NONE,
             layout: TypeOption::new_some(vk::ImageLayout::UNDEFINED),
             access: smallvec![],
         }
     }
-    pub fn with_initial_layout(layout: vk::ImageLayout) -> Self {
+    pub(crate) fn with_initial_layout(layout: vk::ImageLayout) -> Self {
         Self {
             layout: layout.into(),
             ..Self::blank()
         }
     }
-    pub fn update_state(
+    pub(crate) fn update_state(
         &mut self,
         // the initial state of the resource
         dst_family: u32,
         dst_layout: T::IfImage<vk::ImageLayout>,
         // the state of the resource at the end of the scheduled work
         final_access: &[QueueSubmission],
-        _final_layout: T::IfImage<vk::ImageLayout>,
-        _final_family: u32,
+        final_layout: T::IfImage<vk::ImageLayout>,
+        final_family: u32,
         // whether the resource was created with VK_ACCESS_MODE_CONCURRENT and does not need queue ownership transitions
         resource_concurrent: bool,
     ) -> SynchronizeResult
@@ -176,8 +173,8 @@ impl<T: ResourceMarker> SynchronizationState<T> {
             prev_access: self.access.clone(),
         };
 
-        self.owning_family = OptionalU32::new_some(dst_family);
-        self.layout = dst_layout;
+        self.owning_family = OptionalU32::new_some(final_family);
+        self.layout = final_layout;
         self.access.clear();
         self.access.extend(final_access.iter().cloned());
 
@@ -203,19 +200,19 @@ impl ImageViewCreateInfo {
     }
 }
 
-pub(crate) struct ImageViewEntry<T: ResourceMarker> {
-    pub(crate) handle: T::EitherOut<vk::ImageView, vk::BufferView>,
+pub(crate) struct ImageViewEntry {
+    pub(crate) handle: vk::ImageView,
     pub(crate) info_hash: u32,
     pub(crate) last_use: GenerationId,
 }
 
-pub struct ResourceMutableState<T: ResourceMarker> {
-    pub(crate) views: SmallVec<[ImageViewEntry<T>; 2]>,
-    pub(crate) synchronization: SynchronizationState<T>,
+pub struct ImageMutableState {
+    pub(crate) views: SmallVec<[ImageViewEntry; 2]>,
+    pub(crate) synchronization: SynchronizationState<ImageMarker>,
 }
 
-impl ResourceMutableState<ImageMarker> {
-    pub fn with_initial_layout(layout: vk::ImageLayout) -> Self {
+impl ImageMutableState {
+    pub(crate) fn new(layout: vk::ImageLayout) -> Self {
         Self {
             views: SmallVec::new(),
             synchronization: SynchronizationState::with_initial_layout(layout),
@@ -267,48 +264,76 @@ impl ResourceMutableState<ImageMarker> {
     }
 }
 
+pub(crate) struct ImageState {
+    handle: vk::Image,
+    info: ImageCreateInfo,
+    allocation: pumice_vma::Allocation,
+    mutable: MutableShared<ImageMutableState>,
+}
+
+impl ImageState {
+    pub(crate) unsafe fn update_state(
+        &self,
+        // the initial state of the resource
+        dst_family: u32,
+        dst_layout: vk::ImageLayout,
+        // the state of the resource at the end of the scheduled work
+        final_access: &[QueueSubmission],
+        final_layout: vk::ImageLayout,
+        final_family: u32,
+        // whether the resource was created with VK_ACCESS_MODE_CONCURRENT and does not need queue ownership transitions
+        resource_concurrent: bool,
+        lock: &SynchronizationLock,
+    ) -> SynchronizeResult {
+        self.mutable.get_mut(lock).synchronization.update_state(
+            dst_family,
+            TypeSome::new_some(dst_layout),
+            final_access,
+            TypeSome::new_some(final_layout),
+            final_family,
+            resource_concurrent,
+        )
+    }
+}
+
+impl ObjectData for ImageState {
+    type CreateInfo = ImageCreateInfo;
+    type Handle = vk::Image;
+
+    fn get_create_info(&self) -> &Self::CreateInfo {
+        &self.info
+    }
+    fn get_handle(&self) -> Self::Handle {
+        self.handle
+    }
+}
+
 #[derive(Clone)]
 pub struct Image(pub(crate) ArcHandle<Self>);
 impl Object for Image {
-    type CreateInfo = ImageCreateInfo;
-    type SupplementalInfo = pumice_vma::AllocationCreateInfo;
-    type Handle = vk::Image;
     type Storage = SimpleStorage<Self>;
-    type ObjectData = (
-        pumice_vma::Allocation,
-        MutableShared<ResourceMutableState<ImageMarker>>,
-    );
-
     type Parent = Device;
 
-    unsafe fn create(
-        ctx: &Device,
-        info: &Self::CreateInfo,
-        allocation_info: &Self::SupplementalInfo,
-    ) -> VulkanResult<(Self::Handle, Self::ObjectData)> {
-        let image_info = info.to_vk();
+    type InputData = (ImageCreateInfo, pumice_vma::AllocationCreateInfo);
+    type Data = ImageState;
+
+    unsafe fn create(data: Self::InputData, ctx: &Self::Parent) -> VulkanResult<Self::Data> {
+        let image_info = data.0.to_vk();
         ctx.allocator
-            .create_image(&image_info, allocation_info)
-            .map(|(handle, allocation, _)| {
-                (
-                    handle,
-                    (
-                        allocation,
-                        MutableShared::new(ResourceMutableState::with_initial_layout(
-                            info.initial_layout,
-                        )),
-                    ),
-                )
+            .create_image(&image_info, &data.1)
+            .map(|(handle, allocation, _)| ImageState {
+                handle,
+                mutable: MutableShared::new(ImageMutableState::new(data.0.initial_layout)),
+                info: data.0,
+                allocation,
             })
     }
-
     unsafe fn destroy(
+        data: &Self::Data,
+        _lock: &SynchronizationLock,
         ctx: &Self::Parent,
-        handle: Self::Handle,
-        header: &ObjectHeader<Self>,
-        _: &SynchronizationLock,
     ) -> VulkanResult<()> {
-        ctx.allocator.destroy_image(handle, header.object_data.0);
+        ctx.allocator.destroy_image(data.handle, data.allocation);
         VulkanResult::Ok(())
     }
 
@@ -317,15 +342,15 @@ impl Object for Image {
     }
 }
 
-impl Image {
-    unsafe fn get_view(
-        &self,
-        info: &ImageViewCreateInfo,
-        batch_id: GenerationId,
-    ) -> VulkanResult<vk::ImageView> {
-        let storage = self.0.get_storage();
-        let header = storage.read_object(&self.0);
-        let mut data = header.object_data.1.get_mut(header.get_lock());
-        data.get_view(header.handle, info, batch_id, self.0.get_parent())
-    }
-}
+// impl Image {
+//     unsafe fn get_view(
+//         &self,
+//         info: &ImageViewCreateInfo,
+//         batch_id: GenerationId,
+//     ) -> VulkanResult<vk::ImageView> {
+//         let storage = self.0.get_storage();
+//         let header = storage.read_object(&self.0);
+//         let mut data = header.object_data.1.get_mut(header.get_lock());
+//         data.get_view(header.handle, info, batch_id, self.0.get_parent())
+//     }
+// }

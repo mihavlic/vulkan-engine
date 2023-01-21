@@ -10,8 +10,7 @@ use std::{
     cell::{Cell, RefCell, RefMut},
     collections::{hash_map::Entry, BinaryHeap},
     fmt::Display,
-    hash::{Hash, Hasher},
-    io::Write,
+    hash::Hash,
     mem::ManuallyDrop,
     ops::{Deref, DerefMut, Range},
     sync::Arc,
@@ -33,11 +32,11 @@ use crate::{
     },
     graph::{
         allocator::MemoryKind,
-        resource_marker::{BufferMarker, ImageMarker, TypeNone, TypeOption, TypeSome},
+        resource_marker::{BufferMarker, ImageMarker, TypeOption, TypeSome},
         reverse_edges::{reverse_edges_into, ChildRelativeKey, NodeKey},
     },
     object::{
-        self, BufferCreateInfo, ImageCreateInfo, Object, ResourceMutableState,
+        self, BufferCreateInfo, BufferMutableState, ImageCreateInfo, ImageMutableState, ObjectData,
         SwapchainAcquireStatus, SynchronizeResult,
     },
     storage::{constant_ahash_hashmap, constant_ahash_hashset, ObjectStorage},
@@ -95,67 +94,28 @@ struct PassMeta {
     alive: Cell<bool>,
     scheduled_submission: Cell<OptionalU32>,
     scheduled_submission_position: Cell<OptionalU32>,
-    queue_intervals: Cell<QueueIntervals>,
 }
 #[derive(Clone)]
 struct ImageMeta {
     alive: Cell<bool>,
-    physical: OptionalU32,
-    producer: Cell<GraphPassOption>,
 }
 impl ImageMeta {
     fn new() -> Self {
         Self {
             alive: Cell::new(false),
-            physical: OptionalU32::NONE,
-            producer: Cell::new(GraphPassOption::NONE),
         }
     }
 }
 #[derive(Clone)]
 struct BufferMeta {
     alive: Cell<bool>,
-    physical: OptionalU32,
-    producer: Cell<GraphPassOption>,
 }
 impl BufferMeta {
     fn new() -> Self {
         Self {
             alive: Cell::new(false),
-            physical: OptionalU32::NONE,
-            producer: Cell::new(GraphPassOption::NONE),
         }
     }
-}
-
-#[derive(Clone)]
-struct ImageBarrier {
-    pub image: GraphImage,
-    pub src_stage_mask: vk::PipelineStageFlags2KHR,
-    pub src_access_mask: vk::AccessFlags2KHR,
-    pub dst_stage_mask: vk::PipelineStageFlags2KHR,
-    pub dst_access_mask: vk::AccessFlags2KHR,
-    pub old_layout: vk::ImageLayout,
-    pub new_layout: vk::ImageLayout,
-    pub src_queue_family_index: u32,
-    pub dst_queue_family_index: u32,
-}
-
-#[derive(Clone)]
-struct BufferBarrier {
-    pub buffer: vk::Buffer,
-    pub src_access_mask: vk::AccessFlags,
-    pub dst_access_mask: vk::AccessFlags,
-    pub src_queue_family_index: u32,
-    pub dst_queue_family_index: u32,
-}
-
-#[derive(Clone)]
-struct MemoryBarrier {
-    pub src_stage_mask: vk::PipelineStageFlags2KHR,
-    pub src_access_mask: vk::AccessFlags2KHR,
-    pub dst_stage_mask: vk::PipelineStageFlags2KHR,
-    pub dst_access_mask: vk::AccessFlags2KHR,
 }
 
 #[derive(Clone)]
@@ -185,25 +145,11 @@ enum SpecialBarrier {
     },
 }
 
-struct GraphMemoryType {
-    allocator: Suballocator,
-    memory_type: u32,
-}
-
-impl GraphMemoryType {
-    fn new(memory_type: u32) -> Self {
-        Self {
-            allocator: Suballocator::new(),
-            memory_type,
-        }
-    }
-}
-
 struct PhysicalImageData {
     info: ImageCreateInfo,
     memory: SuballocationUgh,
     vkhandle: vk::Image,
-    state: ResourceMutableState<ImageMarker>,
+    state: ImageMutableState,
 }
 
 impl PhysicalImageData {
@@ -216,7 +162,7 @@ struct PhysicalBufferData {
     info: BufferCreateInfo,
     memory: SuballocationUgh,
     vkhandle: vk::Buffer,
-    state: ResourceMutableState<BufferMarker>,
+    state: BufferMutableState,
 }
 
 #[derive(Default)]
@@ -319,7 +265,7 @@ pub struct Graph {
     pass_children: ImmutableGraph,
 
     // FIXME should this be made prettier?
-    memory: RefCell<ManuallyDrop<Box<[GraphMemoryType; vk::MAX_MEMORY_TYPES as usize]>>>,
+    memory: RefCell<ManuallyDrop<Box<[Suballocator; vk::MAX_MEMORY_TYPES as usize]>>>,
     physical_images: Vec<PhysicalImageData>,
     physical_buffers: Vec<PhysicalBufferData>,
 
@@ -336,7 +282,7 @@ pub struct Graph {
 impl Graph {
     pub fn new(device: OwnedDevice) -> Self {
         let memory = (0..vk::MAX_MEMORY_TYPES)
-            .map(|i| GraphMemoryType::new(i))
+            .map(|_| Suballocator::new())
             .collect::<Box<[_]>>();
 
         Graph {
@@ -433,7 +379,6 @@ impl Graph {
                 alive: Cell::new(false),
                 scheduled_submission_position: Cell::new(OptionalU32::NONE),
                 scheduled_submission: Cell::new(OptionalU32::NONE),
-                queue_intervals: Cell::new(QueueIntervals::NONE),
             },
         );
         self.image_meta.resize(len, ImageMeta::new());
@@ -470,9 +415,7 @@ impl Graph {
         self.pass_meta[pass.index()].alive.get()
     }
     fn get_suballocator(&self, memory_type: u32) -> RefMut<Suballocator> {
-        RefMut::map(self.memory.borrow_mut(), |m| {
-            &mut m[memory_type as usize].allocator
-        })
+        RefMut::map(self.memory.borrow_mut(), |m| &mut m[memory_type as usize])
     }
     fn get_image_data(&self, image: GraphImage) -> &ImageData {
         &self.images[image.index()]
@@ -726,8 +669,6 @@ impl Graph {
                             let dst_writing = buffer.is_written();
                             let src = &mut buffer_rw[buffer.handle.index()];
 
-                            let _resource = GraphResource::Buffer(buffer.handle);
-
                             update_resource_state(src, p, dst_writing, data);
                         }
                     }
@@ -826,7 +767,7 @@ impl Graph {
         let mut graph = std::mem::take(&mut self.pass_children);
         let facade = GraphFacade(self, ());
         reverse_edges_into(&facade, &mut graph);
-        std::mem::replace(&mut self.pass_children, graph);
+        let _ = std::mem::replace(&mut self.pass_children, graph);
 
         // do a greedy graph traversal where nodes with a larger priority will be selected first
         // at this point this is essentially just a bfs
@@ -1046,7 +987,7 @@ impl Graph {
             // set of first accesses that occur in the timeline,
             // becomes "closed" (bool = true) when the first write occurs
             // this will be used during graph execution to synchronize with external resources
-            let mut accessors: HashMap<GraphResource, ResourceFirstAccess> =
+            let mut accessors: HashMap<CombinedResourceHandle, ResourceFirstAccess> =
                 constant_ahash_hashmap();
 
             for (timeline_i, &e) in scheduled.iter().enumerate() {
@@ -1151,13 +1092,13 @@ impl Graph {
                         // FIXME kinda stupid
                         let resource = match barrier {
                             &SpecialBarrier::LayoutTransition { image, .. } => {
-                                GraphResource::Image(image)
+                                CombinedResourceHandle::new_image(image)
                             }
                             &SpecialBarrier::ImageOwnershipTransition { image, .. } => {
-                                GraphResource::Image(image)
+                                CombinedResourceHandle::new_image(image)
                             }
                             &SpecialBarrier::BufferOwnershipTransition { buffer, .. } => {
-                                GraphResource::Buffer(buffer)
+                                CombinedResourceHandle::new_buffer(buffer)
                             }
                         };
                         (*pass, resource)
@@ -1267,8 +1208,8 @@ impl Graph {
                 &mut availibility_interner,
             );
 
-            for a in self.memory.borrow_mut().iter_mut() {
-                a.allocator.reset();
+            for allocator in self.memory.borrow_mut().iter_mut() {
+                allocator.reset();
             }
 
             // Resource reuse is currently not implemented since we will need a more extensive liveness tracking scheme
@@ -1758,9 +1699,7 @@ impl Graph {
                                     info: create_info.clone(),
                                     memory: suballocation,
                                     vkhandle,
-                                    state: ResourceMutableState::with_initial_layout(
-                                        vk::ImageLayout::UNDEFINED,
-                                    ),
+                                    state: ImageMutableState::new(vk::ImageLayout::UNDEFINED),
                                 });
                                 *self.get_image_data_mut(handle) = ImageData::Transient(physical);
                             }
@@ -1787,7 +1726,7 @@ impl Graph {
                                     info: create_info.clone(),
                                     memory: suballocation,
                                     vkhandle,
-                                    state: ResourceMutableState::new(),
+                                    state: BufferMutableState::new(),
                                 });
                                 *self.get_buffer_data_mut(handle) = BufferData::Transient(physical);
                             }
@@ -1860,9 +1799,7 @@ impl Graph {
         let swapchain_storage_lock = self.device.swapchain_storage.acquire_all_exclusive();
 
         struct SwapchainPreset {
-            swapchain: GraphImage,
             vkhandle: vk::SwapchainKHR,
-            image: vk::Image,
             image_index: u32,
             image_acquire: vk::Semaphore,
             image_release: vk::Semaphore,
@@ -1886,7 +1823,7 @@ impl Graph {
 
             match img.deref() {
                 ImageData::Imported(_) | ImageData::Swapchain(_) => {
-                    let resource = GraphResource::Image(handle);
+                    let resource = CombinedResourceHandle::new_image(handle);
                     let first_access = accessors.get(&resource).unwrap();
 
                     let ResourceState::Normal { layout, queue_family, access: _ } = &image_last_state[i].0 else {
@@ -1910,21 +1847,15 @@ impl Graph {
 
                     match img.deref() {
                         ImageData::Imported(archandle) => unsafe {
-                            let synchronize_result = archandle
-                                .0
-                                .get_header()
-                                .object_data
-                                .1
-                                .get_mut(&image_storage_lock)
-                                .synchronization
-                                .update_state(
-                                    first_access.dst_queue_family,
-                                    TypeSome::new_some(first_access.dst_layout),
-                                    &semaphore_scratch,
-                                    *layout,
-                                    *queue_family,
-                                    img.is_sharing_concurrent(),
-                                );
+                            let synchronize_result = archandle.0.get_object_data().update_state(
+                                first_access.dst_queue_family,
+                                first_access.dst_layout,
+                                &semaphore_scratch,
+                                layout.unwrap(),
+                                *queue_family,
+                                img.is_sharing_concurrent(),
+                                &image_storage_lock,
+                            );
 
                             let SynchronizeResult {
                                 transition_layout_from,
@@ -1944,9 +1875,8 @@ impl Graph {
 
                             let mut mutable = archandle
                                 .0
-                                .get_header()
-                                .object_data
-                                .get_mut(&swapchain_storage_lock);
+                                .get_object_data()
+                                .get_mutable_state(&swapchain_storage_lock);
 
                             let acquire_semaphore = self.swapchain_semaphores.next(&self.device);
                             let release_semaphore = self.swapchain_semaphores.next(&self.device);
@@ -1973,7 +1903,7 @@ impl Graph {
                                         }
 
                                         mutable
-                                            .recreate(&archandle.0.get_header().info, &self.device)
+                                            .recreate(&archandle.0.get_create_info(), &self.device)
                                             .unwrap();
 
                                         attempt += 1;
@@ -1988,15 +1918,11 @@ impl Graph {
                                 };
                             };
 
-                            let data = mutable.get_image_data(index);
-
                             submission_swapchains
                                 .entry(semaphore_scratch[0])
                                 .or_default()
                                 .push(SwapchainPreset {
-                                    swapchain: handle,
                                     vkhandle: mutable.get_swapchain(index),
-                                    image: data.image,
                                     image_index: index,
                                     image_acquire: acquire_semaphore,
                                     image_release: release_semaphore,
@@ -2068,10 +1994,10 @@ impl Graph {
 
             match buf.deref() {
                 BufferData::Imported(archandle) => {
-                    let resource = GraphResource::Buffer(handle);
+                    let resource = CombinedResourceHandle::new_buffer(handle);
                     let usage = accessors.get(&resource).unwrap();
 
-                    let ResourceState::Normal { layout, queue_family, access: _ } = &buffer_last_state[i].0 else {
+                    let ResourceState::Normal { layout: _, queue_family, access: _ } = &buffer_last_state[i].0 else {
                         panic!("Unsupported resource state (TODO should Uninit be allowed?)");
                     };
 
@@ -2093,21 +2019,13 @@ impl Graph {
                     semaphore_scratch.dedup();
 
                     unsafe {
-                        archandle
-                            .0
-                            .get_header()
-                            .object_data
-                            .1
-                            .get_mut(&buffer_storage_lock)
-                            .synchronization
-                            .update_state(
-                                usage.dst_queue_family,
-                                TypeNone::new_none(),
-                                &semaphore_scratch,
-                                *layout,
-                                *queue_family,
-                                buf.is_sharing_concurrent(),
-                            );
+                        archandle.0.get_object_data().update_state(
+                            usage.dst_queue_family,
+                            &semaphore_scratch,
+                            *queue_family,
+                            buf.is_sharing_concurrent(),
+                            &buffer_storage_lock,
+                        );
                     }
                 }
                 _ => {}
@@ -2136,9 +2054,8 @@ impl Graph {
                         Some(
                             archandle
                                 .0
-                                .get_header()
-                                .object_data
-                                .get(&swapchain_storage_lock)
+                                .get_object_data()
+                                .get_mutable_state(&swapchain_storage_lock)
                                 .get_image_data(image_index)
                                 .image,
                         )
@@ -2189,12 +2106,11 @@ impl Graph {
                     command_buffer_count: 1,
                     ..Default::default()
                 };
-                let command_buffer = unsafe {
-                    self.device
-                        .device()
-                        .allocate_command_buffers(&info)
-                        .unwrap()[0]
-                };
+                let command_buffer = self
+                    .device
+                    .device()
+                    .allocate_command_buffers(&info)
+                    .unwrap()[0];
 
                 let d = self.device.device();
                 let Submission {
@@ -2236,7 +2152,6 @@ impl Graph {
                     );
                     let executor = GraphExecutor {
                         graph: self,
-                        current_pass: pass,
                         command_buffer,
                         raw_images: &raw_images,
                         raw_buffers: &raw_buffers,
@@ -2404,7 +2319,7 @@ impl Graph {
         img: &T::Data,
         recorder: &RefCell<SubmissionRecorder>,
         image_rw: &mut Vec<(ResourceState<T>, bool)>,
-        accessors: &mut ahash::HashMap<GraphResource, ResourceFirstAccess>,
+        accessors: &mut ahash::HashMap<CombinedResourceHandle, ResourceFirstAccess>,
     ) where
         // hack because without this the typechecker is not cooperating
         T::IfImage<vk::ImageLayout>: Copy,
@@ -2413,7 +2328,7 @@ impl Graph {
             self.emit_barriers::<T>(p, submission_pass, queue_family, img, recorder, image_rw);
 
         let resource = img.graph_resource();
-        let imported = match resource {
+        let imported = match resource.unpack() {
             GraphResource::Image(handle) => {
                 matches!(
                     self.get_image_data(handle),
@@ -2477,7 +2392,8 @@ impl Graph {
                     (submission, pass)
                 });
                 to.extend(parts);
-            };
+            }
+
             scratch.clear();
             match state {
                 ResourceState::Uninit | ResourceState::Moved => {
@@ -2550,7 +2466,7 @@ impl Graph {
         match state {
             // no dependency
             ResourceState::Uninit => {
-                let imported = match resource_handle {
+                let imported = match resource_handle.unpack() {
                     GraphResource::Image(handle) => {
                         matches!(
                             self.get_image_data(handle),
@@ -2655,7 +2571,7 @@ impl Graph {
         dst_layout: <T as ResourceMarker>::IfImage<vk::ImageLayout>,
         dst_writes: &mut bool,
         raw_resource_handle: RawHandle,
-        resource_handle: GraphResource,
+        resource_handle: CombinedResourceHandle,
         concurrent: bool,
         recorder: &RefCell<SubmissionRecorder>,
     ) where
@@ -2718,7 +2634,7 @@ impl Graph {
     }
     fn emit_family_ownership_transition(
         &self,
-        resource_handle: GraphResource,
+        resource_handle: CombinedResourceHandle,
         src_queue_family: u32,
         dst_queue_family: u32,
         access: &[PassTouch],
@@ -2732,7 +2648,7 @@ impl Graph {
             (submission, pass)
         };
 
-        let barrier = match resource_handle {
+        let barrier = match resource_handle.unpack() {
             GraphResource::Image(image) => SpecialBarrier::ImageOwnershipTransition {
                 image,
                 src_family: src_queue_family,
@@ -2801,7 +2717,7 @@ impl Graph {
                     r#"q{q}[label="{}:"; peripheries=0; fontsize=15; fontname="Helvetica,Arial,sans-serif bold"];"#,
                     self.get_queue_display(GraphQueue::new(q))
                         .set_prefix("Queue ")
-                );
+                )?;
             }
 
             writeln!(w)?;
@@ -2827,7 +2743,7 @@ impl Graph {
                             r#"p{}[label="{}"];"#,
                             p.index(),
                             self.get_pass_display(p).set_prefix("#")
-                        );
+                        )?;
                     }
                     Ok(())
                 });
@@ -3012,8 +2928,8 @@ impl Drop for Graph {
                                 command_pool,
                                 owned_device.allocator_callbacks(),
                             );
-                            for mem in *memory {
-                                for RcPtrComparator(block) in mem.allocator.collect_blocks() {
+                            for allocator in *memory {
+                                for RcPtrComparator(block) in allocator.collect_blocks() {
                                     owned_device.allocator().free_memory(block.allocation);
                                 }
                             }
@@ -3241,7 +3157,6 @@ fn test_graph() {
 #[derive(Clone)]
 pub struct PassImageData {
     handle: GraphImage,
-    usage: vk::ImageUsageFlags,
     stages: vk::PipelineStageFlags2KHR,
     access: vk::AccessFlags2KHR,
     start_layout: vk::ImageLayout,
@@ -3256,7 +3171,6 @@ impl PassImageData {
 
 pub struct PassBufferData {
     handle: GraphBuffer,
-    usage: vk::BufferUsageFlags,
     access: vk::AccessFlags2KHR,
     stages: vk::PipelineStageFlags2KHR,
 }
@@ -3333,9 +3247,7 @@ impl ImageData {
         match self {
             ImageData::TransientPrototype(info, _) => info.sharing_mode_concurrent,
             ImageData::Imported(handle) => {
-                unsafe { handle.0.get_header() }
-                    .info
-                    .sharing_mode_concurrent
+                unsafe { handle.0.get_create_info() }.sharing_mode_concurrent
             }
             ImageData::Swapchain(_) => false,
             ImageData::Transient(_) => unreachable!(),
@@ -3355,9 +3267,7 @@ impl BufferData {
             BufferData::TransientPrototype(info, _) => info.sharing_mode_concurrent,
             BufferData::Transient(_) => unreachable!(),
             BufferData::Imported(handle) => {
-                unsafe { handle.0.get_header() }
-                    .info
-                    .sharing_mode_concurrent
+                unsafe { handle.0.get_create_info() }.sharing_mode_concurrent
             }
         }
     }
@@ -3712,10 +3622,19 @@ impl<'a> GraphPassBuilder<'a> {
         start_layout: vk::ImageLayout,
         end_layout: Option<vk::ImageLayout>,
     ) {
+        let data = self.graph_builder.0.get_image_data(image);
+        let resource_usage = match data {
+            ImageData::TransientPrototype(info, _) => info.usage,
+            ImageData::Imported(archandle) => unsafe { archandle.0.get_create_info().usage },
+            ImageData::Swapchain(archandle) => unsafe { archandle.0.get_create_info().usage },
+            ImageData::Transient(_) | ImageData::Moved(_, _, _) => unreachable!(),
+        };
+
+        assert!(resource_usage.contains(usage));
+
         // TODO deduplicate or explicitly forbid multiple entries with the same handle
         self.images.push(PassImageData {
             handle: image,
-            usage,
             stages,
             access,
             start_layout,
@@ -3729,10 +3648,18 @@ impl<'a> GraphPassBuilder<'a> {
         stages: vk::PipelineStageFlags2KHR,
         access: vk::AccessFlags2KHR,
     ) {
+        let data = self.graph_builder.0.get_buffer_data(buffer);
+        let resource_usage = match data {
+            BufferData::TransientPrototype(info, _) => info.usage,
+            BufferData::Imported(archandle) => unsafe { archandle.0.get_create_info().usage },
+            BufferData::Transient(_) => unreachable!(),
+        };
+
+        assert!(resource_usage.contains(usage));
+
         // TODO deduplicate or explicitly forbid multiple entries with the same handle
         self.buffers.push(PassBufferData {
             handle: buffer,
-            usage,
             access,
             stages,
         });
@@ -3741,7 +3668,6 @@ impl<'a> GraphPassBuilder<'a> {
 
 pub struct GraphExecutor<'a> {
     graph: &'a Graph,
-    current_pass: GraphPass,
     command_buffer: vk::CommandBuffer,
     raw_images: &'a [Option<vk::Image>],
     raw_buffers: &'a [Option<vk::Buffer>],
@@ -3780,6 +3706,7 @@ macro_rules! simple_handle {
             #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
             #[repr(transparent)]
             $visibility struct $name(u32);
+            #[allow(unused)]
             impl $name {
                 fn new(index: usize) -> Self {
                     assert!(index <= u32::MAX as usize);
@@ -3825,6 +3752,7 @@ macro_rules! optional_index {
         $(
             #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
             struct $name(OptionalU32);
+            #[allow(unused)]
             impl $name {
                 const NONE: Self = Self(OptionalU32::NONE);
                 fn new(index: Option<usize>) -> Self {
@@ -3867,6 +3795,7 @@ impl GraphPassEvent {
 
 macro_rules! gen_pass_getters {
     ($name:ident, $data:ident: $($fun:ident, $handle:ident, $disc:tt: $val:expr;)+) => {
+        #[allow(unused)]
         impl $name {
             fn new(data: $data) -> Self {
                 let (discriminant, index) = match data {
@@ -3908,15 +3837,21 @@ gen_pass_getters! {
     get_flush, GraphQueue, Flush: 2;
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct CombinedResourceConfig;
 impl Config for CombinedResourceConfig {
     const FIRST_BITS: usize = 1;
     const SECOND_BITS: usize = 31;
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct CombinedResourceHandle(PackedUint<CombinedResourceConfig, u32>);
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GraphResource {
+    Image(GraphImage),
+    Buffer(GraphBuffer),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct CombinedResourceHandle(PackedUint<CombinedResourceConfig, u32>);
 
 impl CombinedResourceHandle {
     fn new_image(image: GraphImage) -> Self {
@@ -3925,18 +3860,26 @@ impl CombinedResourceHandle {
     fn new_buffer(buffer: GraphBuffer) -> Self {
         Self(PackedUint::new(1, buffer.0))
     }
-    fn get_image(&self) -> Option<GraphPass> {
+    fn get_image(self) -> Option<GraphPass> {
         if self.0.first() == 0 {
             Some(GraphPass(self.0.second()))
         } else {
             None
         }
     }
-    fn get_buffer(&self) -> Option<GraphPass> {
+    fn get_buffer(self) -> Option<GraphPass> {
         if self.0.first() == 1 {
             Some(GraphPass(self.0.second()))
         } else {
             None
+        }
+    }
+    fn unpack(self) -> GraphResource {
+        let second = self.0.second();
+        match self.0.first() {
+            0 => GraphResource::Image(GraphImage(second)),
+            1 => GraphResource::Buffer(GraphBuffer(second)),
+            _ => unreachable!(),
         }
     }
 }
@@ -4024,13 +3967,6 @@ impl<T: ResourceMarker> Default for ResourceState<T> {
     fn default() -> Self {
         Self::Uninit
     }
-}
-
-// TODO pack this into 32 bits
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum GraphResource {
-    Image(GraphImage),
-    Buffer(GraphBuffer),
 }
 
 #[derive(Clone)]
@@ -4429,10 +4365,10 @@ struct ResourceFirstAccess {
 enum DeferredResourceFree {
     Image {
         vkhandle: vk::Image,
-        state: ResourceMutableState<ImageMarker>,
+        state: ImageMutableState,
     },
     Buffer {
         vkhandle: vk::Buffer,
-        state: ResourceMutableState<BufferMarker>,
+        state: BufferMutableState,
     },
 }

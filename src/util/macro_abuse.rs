@@ -1,4 +1,4 @@
-use std::fmt::{Display, Write};
+use std::fmt::Display;
 
 use smallvec::{smallvec, SmallVec};
 
@@ -125,7 +125,7 @@ impl<'a> WeirdFormatter<'a> {
             }
             '\n' => {
                 if *transient == Transient::Newline {
-                    write!(w, "\n");
+                    write!(w, "\n")?;
                 }
 
                 *transient = Transient::Newline;

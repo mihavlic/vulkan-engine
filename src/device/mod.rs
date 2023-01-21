@@ -97,7 +97,7 @@ impl Deref for OwnedDevice {
     type Target = Device;
     #[inline]
     fn deref(&self) -> &Self::Target {
-        unsafe { self.0.as_ref() }
+        self.0.as_ref()
     }
 }
 
@@ -297,7 +297,7 @@ impl Device {
         allocate: pumice_vma::AllocationCreateInfo,
     ) -> VulkanResult<object::Image> {
         self.image_storage
-            .get_or_create(info, allocate, NonNull::from(self))
+            .get_or_create((info, allocate), NonNull::from(self))
             .map(object::Image)
     }
 
@@ -306,7 +306,7 @@ impl Device {
         info: object::SwapchainCreateInfo,
     ) -> VulkanResult<object::Swapchain> {
         self.swapchain_storage
-            .get_or_create(info, (), NonNull::from(self))
+            .get_or_create(info, NonNull::from(self))
             .map(object::Swapchain)
     }
     pub unsafe fn create_raw_semaphore(&self) -> VulkanResult<vk::Semaphore> {

@@ -1,11 +1,11 @@
+use std::cell::RefMut;
 use std::ptr;
 
-use super::{ArcHandle, Object, ResourceMutableState};
+use super::{ArcHandle, ImageMutableState, Object, ObjectData};
 
 use crate::device::Device;
-use crate::graph::resource_marker::ImageMarker;
 use crate::storage::nostore::SimpleStorage;
-use crate::storage::{MutableShared, ObjectHeader, SynchronizationLock};
+use crate::storage::{MutableShared, SynchronizationLock};
 use pumice::util::ObjectHandle;
 use pumice::vk;
 use pumice::VulkanResult;
@@ -41,7 +41,7 @@ pub enum SwapchainAcquireStatus {
 
 pub(crate) struct SwapchainImage {
     pub image: vk::Image,
-    pub state: ResourceMutableState<ImageMarker>,
+    pub state: ImageMutableState,
 }
 
 impl SwapchainImage {
@@ -53,7 +53,7 @@ impl SwapchainImage {
         let _semaphore_info = vk::SemaphoreCreateInfo::default();
         Self {
             image,
-            state: ResourceMutableState::with_initial_layout(vk::ImageLayout::UNDEFINED),
+            state: ImageMutableState::new(vk::ImageLayout::UNDEFINED),
         }
     }
     unsafe fn destroy(self, ctx: &Device) {
@@ -61,7 +61,7 @@ impl SwapchainImage {
     }
 }
 
-pub(crate) struct SwapchainState {
+pub(crate) struct SwapchainMutableState {
     swapchain: vk::SwapchainKHR,
     current_extent: vk::Extent2D,
     // signals that the surace has been resized and we need to recreate it the next time we acquire an image
@@ -70,7 +70,7 @@ pub(crate) struct SwapchainState {
     images: Vec<SwapchainImage>,
 }
 
-impl SwapchainState {
+impl SwapchainMutableState {
     pub unsafe fn new(create_info: &SwapchainCreateInfo, ctx: &Device) -> VulkanResult<Self> {
         let mut state = Self {
             swapchain: vk::SwapchainKHR::null(),
@@ -129,7 +129,7 @@ impl SwapchainState {
         for data in &mut self.images {
             std::mem::replace(
                 &mut data.state,
-                ResourceMutableState::with_initial_layout(vk::ImageLayout::UNDEFINED),
+                ImageMutableState::new(vk::ImageLayout::UNDEFINED),
             )
             .destroy(ctx);
         }
@@ -161,7 +161,7 @@ impl SwapchainState {
         for (old_image, new_image) in self.images.iter_mut().zip(images) {
             std::mem::replace(
                 &mut old_image.state,
-                ResourceMutableState::with_initial_layout(vk::ImageLayout::UNDEFINED),
+                ImageMutableState::new(vk::ImageLayout::UNDEFINED),
             )
             .destroy(ctx);
             old_image.image = new_image;
@@ -245,35 +245,57 @@ impl SwapchainCreateInfo {
     }
 }
 
+pub(crate) struct SwapchainState {
+    info: SwapchainCreateInfo,
+    mutable: MutableShared<SwapchainMutableState>,
+}
+
+impl SwapchainState {
+    pub(crate) unsafe fn get_mutable_state<'a>(
+        &'a self,
+        lock: &'a SynchronizationLock,
+    ) -> RefMut<'a, SwapchainMutableState> {
+        self.mutable.get_mut(lock)
+    }
+}
+
+impl ObjectData for SwapchainState {
+    type CreateInfo = SwapchainCreateInfo;
+    type Handle = ();
+
+    fn get_create_info(&self) -> &Self::CreateInfo {
+        &self.info
+    }
+    fn get_handle(&self) -> Self::Handle {
+        ()
+    }
+}
+
 #[derive(Clone)]
 pub struct Swapchain(pub(crate) ArcHandle<Self>);
 impl Object for Swapchain {
-    type CreateInfo = SwapchainCreateInfo;
-    type SupplementalInfo = ();
-    type Handle = ();
     type Storage = SimpleStorage<Self>;
-    type ObjectData = MutableShared<SwapchainState>;
-
     type Parent = Device;
 
-    unsafe fn create(
-        ctx: &Device,
-        info: &Self::CreateInfo,
-        _allocation_info: &Self::SupplementalInfo,
-    ) -> VulkanResult<(Self::Handle, Self::ObjectData)> {
-        SwapchainState::new(info, ctx).map(|state| ((), MutableShared::new(state)))
+    type InputData = SwapchainCreateInfo;
+    type Data = SwapchainState;
+
+    unsafe fn create(data: Self::InputData, ctx: &Self::Parent) -> VulkanResult<Self::Data> {
+        SwapchainMutableState::new(&data, ctx).map(|state| SwapchainState {
+            info: data,
+            mutable: MutableShared::new(state),
+        })
     }
 
     unsafe fn destroy(
-        ctx: &Self::Parent,
-        _handle: Self::Handle,
-        header: &ObjectHeader<Self>,
+        data: &Self::Data,
         lock: &SynchronizationLock,
+        ctx: &Self::Parent,
     ) -> VulkanResult<()> {
-        header.object_data.get_mut(lock).destroy(ctx);
+        data.mutable.get_mut(lock).destroy(ctx);
         ctx.instance
             .handle()
-            .destroy_surface_khr(header.info.surface, ctx.allocator_callbacks());
+            .destroy_surface_khr(data.info.surface, ctx.allocator_callbacks());
 
         VulkanResult::Ok(())
     }
@@ -286,6 +308,6 @@ impl Object for Swapchain {
 impl Swapchain {
     pub unsafe fn surface_resized(&self, new_extent: vk::Extent2D) {
         self.0
-            .access_mutable(|d| d, |s| s.surface_resized(new_extent))
+            .access_mutable(|d| &d.mutable, |s| s.surface_resized(new_extent))
     }
 }

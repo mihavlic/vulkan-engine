@@ -11,28 +11,30 @@ pub use swapchain::*;
 use pumice::VulkanResult;
 use std::{borrow::BorrowMut, hash::Hash, mem::ManuallyDrop, ptr::NonNull};
 
-use crate::storage::{ArcHeader, MutableShared, ObjectHeader, ObjectStorage, SynchronizationLock};
+use crate::storage::{ArcHeader, MutableShared, ObjectStorage, SynchronizationLock};
+
+pub(crate) trait ObjectData {
+    type CreateInfo;
+    type Handle: Copy;
+    /// The method must be safe to be called from multiple threads at the same time
+    fn get_create_info(&self) -> &Self::CreateInfo;
+    /// The method must be safe to be called from multiple threads at the same time
+    fn get_handle(&self) -> Self::Handle;
+}
 
 pub(crate) trait Object: Sized {
-    type CreateInfo;
-    type SupplementalInfo;
-    type Handle: Copy;
     type Storage: ObjectStorage<Self> + Sync;
-    type ObjectData;
-
     type Parent;
 
-    unsafe fn create(
-        ctx: &Self::Parent,
-        info: &Self::CreateInfo,
-        supplemental_info: &Self::SupplementalInfo,
-    ) -> VulkanResult<(Self::Handle, Self::ObjectData)>;
+    type InputData;
+    type Data: ObjectData;
+
+    unsafe fn create(data: Self::InputData, ctx: &Self::Parent) -> VulkanResult<Self::Data>;
 
     unsafe fn destroy(
-        ctx: &Self::Parent,
-        handle: Self::Handle,
-        header: &ObjectHeader<Self>,
+        data: &Self::Data,
         lock: &SynchronizationLock,
+        ctx: &Self::Parent,
     ) -> VulkanResult<()>;
 
     unsafe fn get_storage(parent: &Self::Parent) -> &Self::Storage;
@@ -41,11 +43,21 @@ pub(crate) trait Object: Sized {
 pub(crate) struct ArcHandle<T: Object>(pub(crate) NonNull<ArcHeader<T>>);
 
 impl<T: Object> ArcHandle<T> {
-    pub unsafe fn get_handle(&self) -> T::Handle {
-        self.get_header().handle
+    pub unsafe fn get_object_data(&self) -> &T::Data {
+        &self.0.as_ref().object_data
     }
-    pub unsafe fn get_header(&self) -> &ObjectHeader<T> {
-        &self.0.as_ref().header
+    pub unsafe fn get_storage_data(&self) -> &<T::Storage as ObjectStorage<T>>::StorageData {
+        &self.0.as_ref().storage_data
+    }
+    pub unsafe fn get_parent_storage(&self) -> &T::Storage {
+        let parent = self.get_parent();
+        T::get_storage(parent)
+    }
+    pub unsafe fn get_handle(&self) -> <T::Data as ObjectData>::Handle {
+        self.get_object_data().get_handle()
+    }
+    pub unsafe fn get_create_info(&self) -> &<T::Data as ObjectData>::CreateInfo {
+        self.get_object_data().get_create_info()
     }
     pub(crate) unsafe fn get_arc_header(&self) -> &ArcHeader<T> {
         self.0.as_ref()
@@ -53,11 +65,8 @@ impl<T: Object> ArcHandle<T> {
     pub(crate) unsafe fn get_arc_header_ptr(&self) -> *mut ArcHeader<T> {
         self.0.as_ptr()
     }
-    pub(crate) unsafe fn get_storage(&self) -> &T::Storage {
-        T::get_storage(self.get_parent())
-    }
     pub(crate) unsafe fn get_parent(&self) -> &T::Parent {
-        self.get_header().parent()
+        self.get_arc_header().parent.as_ref()
     }
     pub(crate) unsafe fn make_weak_copy(&self) -> ManuallyDrop<Self> {
         ManuallyDrop::new(std::ptr::read(self))
@@ -65,17 +74,17 @@ impl<T: Object> ArcHandle<T> {
     pub(crate) unsafe fn access_mutable<
         A,
         B,
-        F: FnOnce(&T::ObjectData) -> &MutableShared<A>,
+        F: FnOnce(&T::Data) -> &MutableShared<A>,
         F2: FnOnce(&mut A) -> B,
     >(
         &self,
         fun1: F,
         fun2: F2,
     ) -> B {
-        let storage = self.get_storage();
+        let storage = self.get_parent_storage();
         let lock = storage.acquire_exclusive(self);
 
-        let mutable = fun1(&self.get_header().object_data);
+        let mutable = fun1(&self.get_object_data());
         let mut refmut = mutable.get_mut(&lock);
 
         fun2(refmut.borrow_mut())
@@ -138,7 +147,7 @@ impl<T: Object> Drop for CloneMany<T> {
 
             // if we just subtracted the same value as was in self.count, self.count is now 0, destroy the object
             if prev == self.count {
-                let storage = self.handle.get_storage();
+                let storage = self.handle.get_parent_storage();
                 T::Storage::destroy(storage, &self.handle);
             }
         }
@@ -189,7 +198,7 @@ impl<T: Object> Drop for ArcHandle<T> {
             assert!(prev > 0);
 
             if prev == 1 {
-                let storage = self.get_storage();
+                let storage = self.get_parent_storage();
                 T::Storage::destroy(storage, self);
             }
         }

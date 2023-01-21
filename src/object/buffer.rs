@@ -5,23 +5,24 @@ use std::{
 
 use crate::{
     arena::uint::OptionalU32,
-    device::{batch::GenerationId, submission::ReaderWriterState, Device},
-    graph::resource_marker::BufferMarker,
-    storage::{
-        constant_ahash_hasher, nostore::SimpleStorage, MutableShared, ObjectHeader,
-        SynchronizationLock,
+    device::{
+        batch::GenerationId,
+        submission::{QueueSubmission, ReaderWriterState},
+        Device,
     },
+    graph::resource_marker::{BufferMarker, TypeNone, TypeOption},
+    storage::{constant_ahash_hasher, nostore::SimpleStorage, MutableShared, SynchronizationLock},
 };
 use pumice::{vk, VulkanResult};
 use smallvec::SmallVec;
 
-use super::{ArcHandle, ImageViewEntry, Object, ResourceMutableState, SynchronizationState};
+use super::{ArcHandle, Object, ObjectData, SynchronizationState, SynchronizeResult};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BufferCreateInfo {
-    flags: vk::BufferCreateFlags,
-    size: u64,
-    usage: vk::BufferUsageFlags,
+    pub flags: vk::BufferCreateFlags,
+    pub size: u64,
+    pub usage: vk::BufferUsageFlags,
     pub sharing_mode_concurrent: bool,
 }
 
@@ -72,13 +73,18 @@ impl BufferViewCreateInfo {
     }
 }
 
-struct BufferViewEntry {
-    handle: vk::BufferView,
-    info_hash: u32,
-    last_use: GenerationId,
+pub(crate) struct BufferViewEntry {
+    pub(crate) handle: vk::BufferView,
+    pub(crate) info_hash: u32,
+    pub(crate) last_use: GenerationId,
 }
 
-impl ResourceMutableState<BufferMarker> {
+pub struct BufferMutableState {
+    pub(crate) views: SmallVec<[BufferViewEntry; 2]>,
+    pub(crate) synchronization: SynchronizationState<BufferMarker>,
+}
+
+impl BufferMutableState {
     pub fn new() -> Self {
         Self {
             views: SmallVec::new(),
@@ -111,7 +117,7 @@ impl ResourceMutableState<BufferMarker> {
                 .device()
                 .create_buffer_view(&raw, device.allocator_callbacks())?;
 
-            let entry = ImageViewEntry {
+            let entry = BufferViewEntry {
                 handle: view,
                 info_hash: hash,
                 last_use: batch_id,
@@ -131,43 +137,74 @@ impl ResourceMutableState<BufferMarker> {
     }
 }
 
+pub(crate) struct BufferState {
+    handle: vk::Buffer,
+    info: BufferCreateInfo,
+    allocation: pumice_vma::Allocation,
+    mutable: MutableShared<BufferMutableState>,
+}
+
+impl BufferState {
+    pub(crate) unsafe fn update_state(
+        &self,
+        // the initial state of the resource
+        dst_family: u32,
+        // the state of the resource at the end of the scheduled work
+        final_access: &[QueueSubmission],
+        final_family: u32,
+        // whether the resource was created with VK_ACCESS_MODE_CONCURRENT and does not need queue ownership transitions
+        resource_concurrent: bool,
+        lock: &SynchronizationLock,
+    ) -> SynchronizeResult {
+        self.mutable.get_mut(lock).synchronization.update_state(
+            dst_family,
+            TypeNone::new_none(),
+            final_access,
+            TypeNone::new_none(),
+            final_family,
+            resource_concurrent,
+        )
+    }
+}
+
+impl ObjectData for BufferState {
+    type CreateInfo = BufferCreateInfo;
+    type Handle = vk::Buffer;
+
+    fn get_create_info(&self) -> &Self::CreateInfo {
+        &self.info
+    }
+    fn get_handle(&self) -> Self::Handle {
+        self.handle
+    }
+}
+
 #[derive(Clone)]
 pub struct Buffer(pub(crate) ArcHandle<Self>);
 impl Object for Buffer {
-    type CreateInfo = BufferCreateInfo;
-    type SupplementalInfo = pumice_vma::AllocationCreateInfo;
-    type Handle = vk::Buffer;
     type Storage = SimpleStorage<Self>;
-    type ObjectData = (
-        pumice_vma::Allocation,
-        MutableShared<ResourceMutableState<BufferMarker>>,
-    );
-
     type Parent = Device;
 
-    unsafe fn create(
-        ctx: &Device,
-        info: &Self::CreateInfo,
-        allocation_info: &Self::SupplementalInfo,
-    ) -> VulkanResult<(Self::Handle, Self::ObjectData)> {
-        let image_info = info.to_vk();
+    type InputData = (BufferCreateInfo, pumice_vma::AllocationCreateInfo);
+    type Data = BufferState;
+
+    unsafe fn create(data: Self::InputData, ctx: &Self::Parent) -> VulkanResult<Self::Data> {
+        let buffer_info = data.0.to_vk();
         ctx.allocator
-            .create_buffer(&image_info, allocation_info)
-            .map(|(handle, allocation, _)| {
-                (
-                    handle,
-                    (allocation, MutableShared::new(ResourceMutableState::new())),
-                )
+            .create_buffer(&buffer_info, &data.1)
+            .map(|(handle, allocation, _)| BufferState {
+                handle,
+                info: data.0,
+                allocation,
+                mutable: MutableShared::new(BufferMutableState::new()),
             })
     }
-
     unsafe fn destroy(
+        data: &Self::Data,
+        _lock: &SynchronizationLock,
         ctx: &Self::Parent,
-        handle: Self::Handle,
-        header: &ObjectHeader<Self>,
-        _: &SynchronizationLock,
     ) -> VulkanResult<()> {
-        ctx.allocator.destroy_buffer(handle, header.object_data.0);
+        ctx.allocator.destroy_buffer(data.handle, data.allocation);
         VulkanResult::Ok(())
     }
 

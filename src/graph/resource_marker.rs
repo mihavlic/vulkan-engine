@@ -1,8 +1,8 @@
-use super::{GraphResource, PassBufferData, PassImageData, RawHandle};
+use super::{CombinedResourceHandle, PassBufferData, PassImageData, RawHandle};
 use pumice::vk;
 use std::ops::{Deref, DerefMut};
 
-pub trait TypeOption<T>: From<T> {
+pub(crate) trait TypeOption<T>: From<T> {
     fn new_some(val: T) -> Self;
     fn new_none() -> Self;
     fn get(&self) -> &T;
@@ -16,7 +16,7 @@ pub trait TypeOption<T>: From<T> {
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
-pub struct TypeSome<T>(T);
+pub(crate) struct TypeSome<T>(T);
 impl<T> TypeOption<T> for TypeSome<T> {
     #[inline(always)]
     fn new_some(val: T) -> Self {
@@ -73,7 +73,7 @@ impl<T> From<T> for TypeSome<T> {
     }
 }
 
-pub struct TypeNone<T>(std::marker::PhantomData<fn() -> T>);
+pub(crate) struct TypeNone<T>(std::marker::PhantomData<fn() -> T>);
 impl<T> TypeOption<T> for TypeNone<T> {
     #[inline(always)]
     fn new_some(_val: T) -> Self {
@@ -147,12 +147,12 @@ impl<T> Ord for TypeNone<T> {
     }
 }
 
-pub trait ResourceData {
+pub(crate) trait ResourceData {
     fn access(&self) -> vk::AccessFlags2KHR;
     fn stages(&self) -> vk::PipelineStageFlags2KHR;
     fn start_layout(&self) -> vk::ImageLayout;
     fn raw_resource_handle(&self) -> RawHandle;
-    fn graph_resource(&self) -> GraphResource;
+    fn graph_resource(&self) -> CombinedResourceHandle;
     fn end_layout(&self) -> Option<vk::ImageLayout>;
 }
 
@@ -178,8 +178,8 @@ impl ResourceData for PassImageData {
     }
 
     #[inline(always)]
-    fn graph_resource(&self) -> GraphResource {
-        GraphResource::Image(self.handle)
+    fn graph_resource(&self) -> CombinedResourceHandle {
+        CombinedResourceHandle::new_image(self.handle)
     }
 
     #[inline(always)]
@@ -210,8 +210,8 @@ impl ResourceData for PassBufferData {
     }
 
     #[inline(always)]
-    fn graph_resource(&self) -> GraphResource {
-        GraphResource::Buffer(self.handle)
+    fn graph_resource(&self) -> CombinedResourceHandle {
+        CombinedResourceHandle::new_buffer(self.handle)
     }
 
     #[inline(always)]
@@ -220,7 +220,7 @@ impl ResourceData for PassBufferData {
     }
 }
 
-pub trait ResourceMarker {
+pub(crate) trait ResourceMarker {
     const IS_IMAGE: bool;
     const IS_BUFFER: bool = !Self::IS_IMAGE;
 
@@ -254,7 +254,7 @@ pub trait ResourceMarker {
 }
 
 #[derive(Clone, Default)]
-pub struct ImageMarker;
+pub(crate) struct ImageMarker;
 impl ResourceMarker for ImageMarker {
     const IS_IMAGE: bool = true;
 
@@ -315,7 +315,7 @@ impl ResourceMarker for ImageMarker {
 }
 
 #[derive(Clone, Default)]
-pub struct BufferMarker;
+pub(crate) struct BufferMarker;
 impl ResourceMarker for BufferMarker {
     const IS_IMAGE: bool = false;
 
@@ -376,22 +376,22 @@ impl ResourceMarker for BufferMarker {
 }
 
 #[derive(Clone, Default)]
-pub struct TypeEither<T: ResourceMarker + ?Sized, Image, Buffer>(
+pub(crate) struct TypeEither<T: ResourceMarker + ?Sized, Image, Buffer>(
     T::IfImage<Image>,
     T::IfBuffer<Buffer>,
 );
 
 impl<T: ResourceMarker, IfImage, IfBuffer> TypeEither<T, IfImage, IfBuffer> {
     #[inline(always)]
-    pub fn new(value: T::EitherOut<IfImage, IfBuffer>) -> Self {
+    pub(crate) fn new(value: T::EitherOut<IfImage, IfBuffer>) -> Self {
         T::new_either(value)
     }
     #[inline(always)]
-    pub fn decompose(self) -> T::EitherOut<IfImage, IfBuffer> {
+    pub(crate) fn decompose(self) -> T::EitherOut<IfImage, IfBuffer> {
         T::select(self.0, self.1)
     }
     #[inline(always)]
-    pub fn map<TI, TB, FImage: FnOnce(IfImage) -> TI, FBuffer: FnOnce(IfBuffer) -> TB>(
+    pub(crate) fn map<TI, TB, FImage: FnOnce(IfImage) -> TI, FBuffer: FnOnce(IfBuffer) -> TB>(
         self,
         map_image: FImage,
         map_buffer: FBuffer,

@@ -54,45 +54,46 @@ pub(crate) trait ObjectStorage<T: Object>: Sized {
     type StorageData;
     unsafe fn get_or_create(
         &self,
-        info: <T as Object>::CreateInfo,
-        supplemental: <T as Object>::SupplementalInfo,
+        data: T::InputData,
         ctx: NonNull<T::Parent>,
     ) -> VulkanResult<ArcHandle<T>>;
 
-    unsafe fn destroy(&self, handle: &ArcHandle<T>);
+    unsafe fn destroy(&self, handle: &ArcHandle<T>) -> VulkanResult<()>;
 
     // acquires exlusive access for the object pointed to by handle
     fn acquire_exclusive<'a>(&'a self, handle: &ArcHandle<T>) -> SynchronizationLock<'a>;
     // acquires exlusive access for all objects of the
     fn acquire_all_exclusive<'a>(&'a self) -> SynchronizationLock<'a>;
 
-    fn read_object<'a>(&'a self, handle: &ArcHandle<T>) -> ObjectRead<'a, ObjectHeader<T>> {
+    fn read_object<'a>(&'a self, handle: &ArcHandle<T>) -> ObjectRead<'a, T::Data> {
         let lock = self.acquire_exclusive(handle);
-        unsafe { ObjectRead(NonNull::from(handle.get_header()), lock) }
+        unsafe { ObjectRead(NonNull::from(handle.get_object_data()), lock) }
     }
 
     unsafe fn cleanup(&self);
 }
 
-pub(crate) struct ObjectHeader<T: Object> {
-    pub(crate) handle: T::Handle,
-    pub(crate) info: T::CreateInfo,
-    pub(crate) storage_data: <T::Storage as ObjectStorage<T>>::StorageData,
-    pub(crate) object_data: <T as Object>::ObjectData,
-    parent: NonNull<T::Parent>,
-}
+// pub(crate) struct ObjectHeader<T: Object> {
+//     pub(crate) handle: T::Handle,
+//     pub(crate) info: T::CreateInfo,
+//     pub(crate) storage_data: <T::Storage as ObjectStorage<T>>::StorageData,
+//     pub(crate) object_data: <T as Object>::ObjectData,
+//     parent: NonNull<T::Parent>,
+// }
 
-impl<T: Object> ObjectHeader<T> {
-    // yep this is so safe
-    pub(crate) unsafe fn parent<'a, 'b>(&'a self) -> &'b T::Parent {
-        self.parent.as_ref()
-    }
-}
+// impl<T: Object> ObjectHeader<T> {
+//     // yep this is so safe
+//     pub(crate) unsafe fn parent<'a, 'b>(&'a self) -> &'b T::Parent {
+//         self.parent.as_ref()
+//     }
+// }
 
 #[repr(C)]
 pub(crate) struct ArcHeader<T: Object> {
     pub(crate) refcount: AtomicUsize,
-    pub(crate) header: ObjectHeader<T>,
+    pub(crate) object_data: T::Data,
+    pub(crate) storage_data: <T::Storage as ObjectStorage<T>>::StorageData,
+    pub(crate) parent: NonNull<T::Parent>,
 }
 
 // help
@@ -130,23 +131,6 @@ impl ReentrantMutex {
     pub fn lock<'a>(&'a self) -> SynchronizationLock<'a> {
         SynchronizationLock::ReentrantMutexGuard(self.0.lock())
     }
-}
-
-/// # Safety:
-/// the storage must be synchronized when calling this method
-unsafe fn create_header<T: Object>(
-    ctx: NonNull<T::Parent>,
-    info: T::CreateInfo,
-    supplemental_info: T::SupplementalInfo,
-    storage_data: <T::Storage as ObjectStorage<T>>::StorageData,
-) -> VulkanResult<ObjectHeader<T>> {
-    T::create(ctx.as_ref(), &info, &supplemental_info).map(|(handle, object_data)| ObjectHeader {
-        handle,
-        info,
-        storage_data,
-        object_data,
-        parent: ctx,
-    })
 }
 
 pub(crate) fn constant_ahash_randomstate() -> ahash::RandomState {
