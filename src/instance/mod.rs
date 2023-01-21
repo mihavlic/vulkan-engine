@@ -2,6 +2,7 @@ use std::{
     collections::{hash_map::RandomState, HashSet},
     ffi::CStr,
     fmt::Debug,
+    ops::Deref,
     sync::Arc,
 };
 
@@ -11,7 +12,7 @@ use pumice::{
         EntryLoader, InstanceLoader,
     },
     util::ApiLoadConfig,
-    vk, InstanceWrapper, VulkanResult,
+    vk, EntryWrapper, InstanceWrapper, VulkanResult,
 };
 use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
 
@@ -25,7 +26,7 @@ use crate::{
     },
 };
 
-pub(crate) struct InnerInstance {
+pub struct Instance {
     pub(crate) entry: pumice::EntryWrapper,
     pub(crate) instance: pumice::InstanceWrapper,
 
@@ -33,11 +34,12 @@ pub(crate) struct InnerInstance {
     pub(crate) physical_device_properties: Vec<vk::PhysicalDeviceProperties>,
 
     pub(crate) debug_messenger: Option<pumice::extensions::ext_debug_utils::DebugUtilsMessengerEXT>,
-    pub(crate) verbose: bool,
 
     pub(crate) allocation_callbacks: Option<vk::AllocationCallbacks>,
 
+    #[allow(unused)]
     pub(crate) instance_table: Box<InstanceTable>,
+    #[allow(unused)]
     pub(crate) entry_table: Box<EntryTable>,
     // at the bottom so that it is dropped last, the loader keeps the vulkan dll loaded
     pub(crate) entry_loader: EntryLoader,
@@ -52,10 +54,17 @@ pub struct InstanceCreateInfo<'a, 'b> {
 }
 
 #[derive(Clone)]
-pub struct Instance(Arc<InnerInstance>);
+pub struct OwnedInstance(Arc<Instance>);
+
+impl Deref for OwnedInstance {
+    type Target = Instance;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 impl Instance {
-    pub unsafe fn new(info: InstanceCreateInfo) -> Self {
+    pub unsafe fn new(info: InstanceCreateInfo) -> OwnedInstance {
         let allocation_callbacks = None;
 
         let InstanceCreateInfo {
@@ -250,33 +259,35 @@ impl Instance {
             info!("{} physical devices", physical_devices.len());
         }
 
-        let inner = InnerInstance {
+        let inner = Instance {
             entry,
             instance,
             physical_devices,
             physical_device_properties,
             debug_messenger,
-            verbose,
             allocation_callbacks,
             instance_table,
             entry_table,
             entry_loader,
         };
 
-        Self(Arc::new(inner))
-    }
-    pub(crate) fn inner(&self) -> &InnerInstance {
-        &self.0
+        OwnedInstance(Arc::new(inner))
     }
     pub fn handle(&self) -> &InstanceWrapper {
-        &self.0.instance
+        &self.instance
     }
     pub unsafe fn instance_loader(&self) -> InstanceLoader {
-        InstanceLoader::new(self.0.instance.handle(), &self.0.entry_loader)
+        InstanceLoader::new(self.instance.handle(), &self.entry_loader)
     }
     pub fn allocator_callbacks(&self) -> Option<&vk::AllocationCallbacks> {
-        self.0.allocation_callbacks.as_ref()
+        self.allocation_callbacks.as_ref()
     }
+    pub fn entry(&self) -> &EntryWrapper {
+        &self.entry
+    }
+}
+
+impl OwnedInstance {
     pub unsafe fn create_surface<W: HasRawDisplayHandle + HasRawWindowHandle>(
         &self,
         window: &W,
@@ -284,5 +295,16 @@ impl Instance {
         self.handle()
             .create_surface(window, self.allocator_callbacks())
             .map(|raw| object::Surface::from_raw(raw, self.clone()))
+    }
+}
+
+impl Drop for Instance {
+    fn drop(&mut self) {
+        if let Some(messenger) = self.debug_messenger.take() {
+            unsafe {
+                self.handle()
+                    .destroy_debug_utils_messenger_ext(messenger, self.allocator_callbacks());
+            }
+        }
     }
 }

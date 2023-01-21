@@ -43,20 +43,20 @@ pub(crate) trait Object: Sized {
 pub(crate) struct ArcHandle<T: Object>(pub(crate) NonNull<ArcHeader<T>>);
 
 impl<T: Object> ArcHandle<T> {
-    pub unsafe fn get_object_data(&self) -> &T::Data {
+    pub(crate) unsafe fn get_object_data(&self) -> &T::Data {
         &self.0.as_ref().object_data
     }
-    pub unsafe fn get_storage_data(&self) -> &<T::Storage as ObjectStorage<T>>::StorageData {
+    pub(crate) unsafe fn get_storage_data(&self) -> &<T::Storage as ObjectStorage<T>>::StorageData {
         &self.0.as_ref().storage_data
     }
-    pub unsafe fn get_parent_storage(&self) -> &T::Storage {
+    pub(crate) unsafe fn get_parent_storage(&self) -> &T::Storage {
         let parent = self.get_parent();
         T::get_storage(parent)
     }
-    pub unsafe fn get_handle(&self) -> <T::Data as ObjectData>::Handle {
+    pub(crate) unsafe fn get_handle(&self) -> <T::Data as ObjectData>::Handle {
         self.get_object_data().get_handle()
     }
-    pub unsafe fn get_create_info(&self) -> &<T::Data as ObjectData>::CreateInfo {
+    pub(crate) unsafe fn get_create_info(&self) -> &<T::Data as ObjectData>::CreateInfo {
         self.get_object_data().get_create_info()
     }
     pub(crate) unsafe fn get_arc_header(&self) -> &ArcHeader<T> {
@@ -148,14 +148,14 @@ impl<T: Object> Drop for CloneMany<T> {
             // if we just subtracted the same value as was in self.count, self.count is now 0, destroy the object
             if prev == self.count {
                 let storage = self.handle.get_parent_storage();
-                T::Storage::destroy(storage, &self.handle);
+                T::Storage::destroy(storage, &self.handle).unwrap();
             }
         }
     }
 }
 
 impl<T: Object> ArcHandle<T> {
-    pub fn clone_many<'a>(&'a self, count: usize) -> CloneMany<T> {
+    pub(crate) fn clone_many<'a>(&'a self, count: usize) -> CloneMany<T> {
         unsafe {
             let header = self.0;
             let prev = (*header.as_ptr())
@@ -199,7 +199,7 @@ impl<T: Object> Drop for ArcHandle<T> {
 
             if prev == 1 {
                 let storage = self.get_parent_storage();
-                T::Storage::destroy(storage, self);
+                T::Storage::destroy(storage, self).unwrap();
             }
         }
     }

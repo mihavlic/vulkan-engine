@@ -29,22 +29,22 @@ impl<'a, T> Deref for ObjectRead<'a, T> {
     }
 }
 
-pub(crate) struct ObjectMutable<'a, T>(NonNull<T>, SynchronizationLock<'a>);
+pub(crate) struct ObjectReadWrite<'a, T>(NonNull<T>, SynchronizationLock<'a>);
 
-impl<'a, T> ObjectMutable<'a, T> {
+impl<'a, T> ObjectReadWrite<'a, T> {
     pub(crate) fn get_lock(&self) -> &SynchronizationLock<'a> {
         &self.1
     }
 }
 
-impl<'a, T> Deref for ObjectMutable<'a, T> {
+impl<'a, T> Deref for ObjectReadWrite<'a, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         unsafe { self.0.as_ref() }
     }
 }
 
-impl<'a, T> DerefMut for ObjectMutable<'a, T> {
+impl<'a, T> DerefMut for ObjectReadWrite<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { self.0.as_mut() }
     }

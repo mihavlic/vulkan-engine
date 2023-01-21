@@ -206,9 +206,7 @@ impl SwapchainMutableState {
     pub fn get_image_data(&self, image_index: u32) -> &SwapchainImage {
         &self.images[image_index as usize]
     }
-    pub fn get_image_data_mut(&mut self, image_index: u32) -> &mut SwapchainImage {
-        &mut self.images[image_index as usize]
-    }
+
     pub unsafe fn destroy(&mut self, ctx: &Device) {
         for data in self.images.drain(..) {
             data.destroy(ctx);

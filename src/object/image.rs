@@ -30,22 +30,6 @@ impl Extent {
             Extent::D3(_, _, _) => vk::ImageType::T3D,
         }
     }
-    pub(crate) fn as_extent_2d(&self) -> vk::Extent2D {
-        match *self {
-            Extent::D1(w) => vk::Extent2D {
-                width: w,
-                height: 1,
-            },
-            Extent::D2(w, h) => vk::Extent2D {
-                width: w,
-                height: h,
-            },
-            Extent::D3(w, h, _) => vk::Extent2D {
-                width: w,
-                height: h,
-            },
-        }
-    }
     pub(crate) fn as_extent_3d(&self) -> vk::Extent3D {
         match *self {
             Extent::D1(w) => vk::Extent3D {

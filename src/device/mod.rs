@@ -5,8 +5,9 @@ pub mod submission;
 use self::{
     batch::GenerationManager, inflight::InflightResourceManager, submission::SubmissionManager,
 };
-use super::instance::{Instance, InstanceCreateInfo};
+use super::instance::InstanceCreateInfo;
 use crate::{
+    instance::Instance,
     object::{self, Buffer, Image, Swapchain},
     storage::{nostore::SimpleStorage, ObjectStorage},
     tracing::shim_macros::{info, trace},
@@ -48,7 +49,7 @@ pub struct QueueFamilySelection<'a> {
 }
 
 pub struct DeviceCreateInfo<'a> {
-    pub instance: super::instance::Instance,
+    pub instance: super::instance::OwnedInstance,
     pub config: &'a mut ApiLoadConfig<'a>,
     pub device_features: vk::PhysicalDeviceFeatures,
     pub queue_family_selection: &'a [QueueFamilySelection<'a>],
@@ -86,8 +87,9 @@ pub struct Device {
     pub(crate) pending_resources: parking_lot::RwLock<InflightResourceManager>,
 
     // at the bottom so that these are dropped last
+    #[allow(unused)]
     pub(crate) device_table: Box<DeviceTable>,
-    pub(crate) instance: super::instance::Instance,
+    pub(crate) instance: super::instance::OwnedInstance,
 }
 
 #[derive(Clone)]
@@ -114,7 +116,6 @@ impl Device {
         } = info;
 
         let allocation_callbacks = instance.allocator_callbacks();
-        let inner = instance.inner();
         let instance_handle = instance.handle();
 
         // (_, _, _, overlay over queue_family_selection and their associated queue families)
@@ -125,8 +126,8 @@ impl Device {
             queue_families,
             selected_queue_families,
         ) = select_device(
-            &inner.physical_devices,
-            &inner.physical_device_properties,
+            &instance.physical_devices,
+            &instance.physical_device_properties,
             &instance_handle,
             &conf,
             &queue_family_selection,
@@ -290,7 +291,13 @@ impl Device {
             .get(selection_index)
             .map(|(family, _)| *family as u32)
     }
-
+    pub fn get_queue_properties(
+        &self,
+        selection_index: usize,
+    ) -> Option<&vk::QueueFamilyProperties> {
+        self.queue_families
+            .get(self.queue_selection_mapping.get(selection_index)?.0)
+    }
     pub unsafe fn create_image(
         &self,
         info: object::ImageCreateInfo,
@@ -300,7 +307,6 @@ impl Device {
             .get_or_create((info, allocate), NonNull::from(self))
             .map(object::Image)
     }
-
     pub unsafe fn create_swapchain(
         &self,
         info: object::SwapchainCreateInfo,

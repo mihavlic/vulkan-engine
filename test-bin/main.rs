@@ -3,7 +3,7 @@
 use graph::device::{self, DeviceCreateInfo, QueueFamilySelection};
 use graph::graph::passes::ClearImage;
 use graph::graph::Graph;
-use graph::instance::{Instance, InstanceCreateInfo};
+use graph::instance::{Instance, InstanceCreateInfo, OwnedInstance};
 use graph::object::{self, ImageCreateInfo, SwapchainCreateInfo};
 use graph::tracing::tracing_subscriber::install_tracing_subscriber;
 use pumice::{util::ApiLoadConfig, vk};
@@ -136,7 +136,7 @@ fn main() {
                             ClearImage {
                                 image: swapchain,
                                 color: vk::ClearColorValue {
-                                    float_32: [0.4, 0.0, 1.0, 1.0],
+                                    float_32: [1.0, 0.0, 1.0, 1.0],
                                 },
                             },
                             "Swapchain clear",

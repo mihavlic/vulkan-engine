@@ -2,15 +2,15 @@ use std::mem::ManuallyDrop;
 
 use pumice::vk;
 
-use crate::instance::Instance;
+use crate::instance::OwnedInstance;
 
 pub struct Surface {
     handle: vk::SurfaceKHR,
-    instance: Instance,
+    instance: OwnedInstance,
 }
 
 impl Surface {
-    pub fn from_raw(handle: vk::SurfaceKHR, instance: Instance) -> Self {
+    pub fn from_raw(handle: vk::SurfaceKHR, instance: OwnedInstance) -> Self {
         Self { handle, instance }
     }
     pub unsafe fn handle(&self) -> vk::SurfaceKHR {
