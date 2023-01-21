@@ -70,7 +70,7 @@ pub unsafe extern "system" fn debug_callback(
             let color = Colored(level, &text);
             let mut formatter = FormatWriter::new(std::io::stdout(), "     ");
             use std::io::Write;
-            writeln!(formatter, "{color} {args}");
+            writeln!(formatter, "{color} {args}").unwrap();
         }
     };
 

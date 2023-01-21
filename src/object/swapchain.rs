@@ -11,7 +11,7 @@ use pumice::vk;
 use pumice::VulkanResult;
 use smallvec::SmallVec;
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, Hash)]
 pub struct SwapchainCreateInfo {
     pub surface: vk::SurfaceKHR,
     pub flags: vk::SwapchainCreateFlagsKHR,
@@ -64,7 +64,10 @@ impl SwapchainImage {
 
 pub(crate) struct SwapchainState {
     swapchain: vk::SwapchainKHR,
-    extent: vk::Extent2D,
+    current_extent: vk::Extent2D,
+    // signals that the surace has been resized and we need to recreate it the next time we acquire an image
+    // this extent overrides the extent provided in SwapchainCreateInfo
+    resized_to: Option<vk::Extent2D>,
     images: Vec<SwapchainImage>,
 }
 
@@ -72,7 +75,8 @@ impl SwapchainState {
     pub unsafe fn new(create_info: &SwapchainCreateInfo, ctx: &Device) -> VulkanResult<Self> {
         let mut state = Self {
             swapchain: vk::SwapchainKHR::null(),
-            extent: vk::Extent2D::default(),
+            current_extent: vk::Extent2D::default(),
+            resized_to: None,
             images: Vec::new(),
         };
 
@@ -92,33 +96,30 @@ impl SwapchainState {
                 create_info.surface,
             )?;
 
-        // vulkan requires weird extent tricks
-        // stolen from https://github.com/glfw/glfw/blob/57cbded0760a50b9039ee0cb3f3c14f60145567c/tests/triangle-vulkan.c#L598
+        // spec states:
+        //   "currentExtent [...] special value (0xFFFFFFFF, 0xFFFFFFFF) indicating that the surface size will be determined by the extent of a swapchain targeting the surface"
+        let extent = if (surface_info.current_extent.width == u32::MAX) {
+            let target_extent = self
+                .resized_to
+                .clone()
+                .unwrap_or(create_info.extent.clone());
 
-        let mut extent = create_info.extent.clone();
-        // width and height are either both 0xFFFFFFFF, or both not 0xFFFFFFFF
-        if (surface_info.current_extent.width == u32::MAX) {
-            // If the surface size is undefined, the size is set to the size
-            // of the images requested, which must fit within the minimum and
-            // maximum values.
+            let width = target_extent.width.clamp(
+                surface_info.min_image_extent.width,
+                surface_info.max_image_extent.width,
+            );
+            let height = target_extent.height.clamp(
+                surface_info.min_image_extent.height,
+                surface_info.max_image_extent.height,
+            );
 
-            if (extent.width < surface_info.min_image_extent.width) {
-                extent.width = surface_info.min_image_extent.width;
-            } else if (extent.width > surface_info.max_image_extent.width) {
-                extent.width = surface_info.max_image_extent.width;
-            }
-
-            if (extent.height < surface_info.min_image_extent.height) {
-                extent.height = surface_info.min_image_extent.height;
-            } else if (extent.height > surface_info.max_image_extent.height) {
-                extent.height = surface_info.max_image_extent.height;
-            }
+            vk::Extent2D { width, height }
         } else {
-            // If the surface size is defined, the swap chain size must match
-            extent = surface_info.current_extent.clone();
-        }
+            surface_info.current_extent.clone()
+        };
 
-        self.extent = extent.clone();
+        self.current_extent = extent.clone();
+        self.resized_to = None;
 
         let create_info = vk::SwapchainCreateInfoKHR {
             image_extent: extent,
@@ -176,6 +177,10 @@ impl SwapchainState {
         fence: vk::Fence,
         ctx: &Device,
     ) -> SwapchainAcquireStatus {
+        if self.resized_to.is_some() {
+            return SwapchainAcquireStatus::OutOfDate;
+        }
+
         let result = ctx
             .device()
             .acquire_next_image_khr(self.swapchain, timeout, semaphore, fence);
@@ -193,6 +198,9 @@ impl SwapchainState {
             Ok((_, res)) => unreachable!("Invalid Ok result value: {:?}", res),
         }
     }
+    pub fn surface_resized(&mut self, new_extent: vk::Extent2D) {
+        self.resized_to = Some(new_extent);
+    }
     pub fn get_swapchain(&self, image_index: u32) -> vk::SwapchainKHR {
         self.swapchain
     }
@@ -202,9 +210,13 @@ impl SwapchainState {
     pub fn get_image_data_mut(&mut self, image_index: u32) -> &mut SwapchainImage {
         &mut self.images[image_index as usize]
     }
-    pub unsafe fn destroy(self, ctx: &Device) {
-        for data in self.images {
+    pub unsafe fn destroy(&mut self, ctx: &Device) {
+        for data in self.images.drain(..) {
             data.destroy(ctx);
+        }
+        if self.swapchain != vk::SwapchainKHR::null() {
+            ctx.device()
+                .destroy_swapchain_khr(self.swapchain, ctx.allocator_callbacks());
         }
     }
 }
@@ -259,11 +271,7 @@ impl Object for Swapchain {
         header: &ObjectHeader<Self>,
         lock: &SynchronizationLock,
     ) -> VulkanResult<()> {
-        ctx.device.destroy_swapchain_khr(
-            header.object_data.get(lock).swapchain,
-            ctx.instance.allocator_callbacks(),
-        );
-
+        header.object_data.get_mut(lock).destroy(ctx);
         ctx.instance
             .handle()
             .destroy_surface_khr(header.info.surface, ctx.allocator_callbacks());
@@ -276,18 +284,9 @@ impl Object for Swapchain {
     }
 }
 
-// impl Swapchain {
-//     unsafe fn acquire_image(
-//         &self,
-//         timeout: u64,
-//         semaphore: vk::Semaphore,
-//         fence: vk::Fence,
-//         ctx: &Device,
-//     ) -> SwapchainAcquireStatus {
-//         let handle = self.0.get_header().handle;
-//         self.0.access_mutable(
-//             |d| d,
-//             |m| m.acquire_image(handle, timeout, semaphore, fence, ctx),
-//         )
-//     }
-// }
+impl Swapchain {
+    pub unsafe fn surface_resized(&self, new_extent: vk::Extent2D) {
+        self.0
+            .access_mutable(|d| d, |s| s.surface_resized(new_extent))
+    }
+}

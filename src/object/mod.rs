@@ -82,9 +82,6 @@ impl<T: Object> ArcHandle<T> {
 
         fun2(refmut.borrow_mut())
     }
-    pub fn address(&self) -> usize {
-        self.0.as_ptr() as usize
-    }
 }
 
 impl<T: Object> PartialEq for ArcHandle<T> {

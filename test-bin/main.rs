@@ -88,16 +88,9 @@ fn main() {
             }
         };
 
-        // let format = {
-        //     let formats = instance.handle().get_physical_device_surface_formats_khr(
-        //         device.physical_device(),
-        //         surface.handle(),
-        //         None,
-        //     );
-        // };
-
+        // TODO swapchain configuration fallback for formats, present modes, and color spaces
         let info = SwapchainCreateInfo {
-            surface: surface.to_raw(),
+            surface: surface.into_raw(),
             flags: vk::SwapchainCreateFlagsKHR::empty(),
             min_image_count: 2,
             format: vk::Format::B8G8R8A8_UNORM,
@@ -114,14 +107,23 @@ fn main() {
         let swapchain = device.create_swapchain(info).unwrap();
         let mut graph = Graph::new(device.clone());
 
-        event_loop.run_return(move |event, _, control_flow| {
+        event_loop.run(move |event, _, control_flow| {
             control_flow.set_poll();
 
             match event {
-                Event::WindowEvent {
-                    event: WindowEvent::CloseRequested,
-                    window_id,
-                } if window_id == window.id() => control_flow.set_exit(),
+                Event::WindowEvent { event, window_id } => match event {
+                    WindowEvent::CloseRequested if window_id == window.id() => {
+                        control_flow.set_exit()
+                    }
+                    WindowEvent::Resized(size) => {
+                        let extent = vk::Extent2D {
+                            width: size.width,
+                            height: size.height,
+                        };
+                        swapchain.surface_resized(extent);
+                    }
+                    _ => {}
+                },
                 Event::MainEventsCleared => {
                     window.request_redraw();
                 }
@@ -134,7 +136,7 @@ fn main() {
                             ClearImage {
                                 image: swapchain,
                                 color: vk::ClearColorValue {
-                                    uint_32: [255, 0, 255, 0],
+                                    float_32: [0.4, 0.0, 1.0, 1.0],
                                 },
                             },
                             "Swapchain clear",

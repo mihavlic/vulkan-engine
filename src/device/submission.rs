@@ -46,11 +46,11 @@ impl SemaphoreValue {
         #[cfg(target_endian = "big")]
         let _ = self.0 |= value >> 1;
     }
-    fn set_flag(&mut self, flag: bool) {
+    fn set_head(&mut self, flag: bool) {
         self.0 &= !1;
         self.0 |= flag as u64;
     }
-    fn flag(&self) -> bool {
+    fn is_head(&self) -> bool {
         (self.0 & 1) == 1
     }
 }
@@ -196,7 +196,7 @@ impl SubmissionManager {
         (self.push_submission(semaphore, true), semaphore.to_public())
     }
     fn push_submission(&mut self, mut semaphore: SemaphoreEntry, head: bool) -> QueueSubmission {
-        semaphore.value.set_flag(head);
+        semaphore.value.set_head(head);
         let key = self.submissions.insert(QueueSubmitData {
             finished: AtomicBool::new(false),
             semaphore,
@@ -226,15 +226,18 @@ impl SubmissionManager {
             }
         });
 
-        debug_assert!(semaphore.value.flag() == false);
+        debug_assert!(semaphore.value.is_head() == false);
 
         semaphore
     }
     fn collect(&mut self) {
         let drain = self
             .submissions
-            .drain_filter(|s| s.semaphore.value.flag() && s.finished.load(Ordering::Relaxed))
-            .map(|s| s.semaphore);
+            .drain_filter(|s| s.semaphore.value.is_head() && s.finished.load(Ordering::Relaxed))
+            .map(|mut s| {
+                s.semaphore.value.set_head(false);
+                s.semaphore
+            });
         self.free_semaphores.extend(drain);
     }
     /// Empty all pending submissions, this should be called after vkDeviceWaitIdle
@@ -267,7 +270,7 @@ impl<'a> Drop for AllocateSequential<'a> {
                 .unwrap()
                 .semaphore
                 .value
-                .set_flag(true);
+                .set_head(true);
         } else {
             // no submission was allocated, return the semaphore
             self.manager.free_semaphores.push(self.semaphore.clone())
@@ -305,13 +308,15 @@ impl Device {
         self.pending_resources.write().poll(self);
     }
     pub fn wait_idle(&self) {
-        let mut submissions = self.synchronization_manager.write();
-        let mut generations = self.generation_manager.write();
+        // let mut submissions = self.synchronization_manager.write();
+        // let mut generations = self.generation_manager.write();
 
         unsafe {
-            self.device().device_wait_idle();
-            submissions.clear();
-            generations.clear();
+            self.device().device_wait_idle().unwrap();
+            // it seems that device_wait_idle doesn't make validation layers consider all command buffers as having completed
+            // so not waiting on them while destroying their command buffer is an error
+            // submissions.clear();
+            // generations.clear();
         }
     }
 }

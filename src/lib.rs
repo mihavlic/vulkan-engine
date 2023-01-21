@@ -1,5 +1,5 @@
 #![feature(iter_array_chunks)]
-#![allow(unused)]
+// #![allow(unused)]
 
 pub mod util;
 // util goes first

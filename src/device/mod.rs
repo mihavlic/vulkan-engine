@@ -354,7 +354,7 @@ impl Drop for Device {
     // the users to not do that
     fn drop(&mut self) {
         unsafe {
-            self.device().device_wait_idle();
+            self.device().device_wait_idle().unwrap();
             self.device().destroy_device(self.allocator_callbacks());
         }
     }

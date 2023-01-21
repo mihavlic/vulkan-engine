@@ -1,3 +1,5 @@
+use std::mem::ManuallyDrop;
+
 use pumice::vk;
 
 use crate::instance::Instance;
@@ -11,12 +13,13 @@ impl Surface {
     pub fn from_raw(handle: vk::SurfaceKHR, instance: Instance) -> Self {
         Self { handle, instance }
     }
-    pub fn handle(&self) -> vk::SurfaceKHR {
+    pub unsafe fn handle(&self) -> vk::SurfaceKHR {
         self.handle
     }
-    pub unsafe fn to_raw(self) -> vk::SurfaceKHR {
-        let handle = self.handle;
-        std::mem::forget(self);
+    pub unsafe fn into_raw(self) -> vk::SurfaceKHR {
+        let prison = ManuallyDrop::new(self);
+        let handle = std::ptr::read(&prison.handle);
+        let instance = std::ptr::read(&prison.instance);
         handle
     }
 }

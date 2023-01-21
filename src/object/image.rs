@@ -11,8 +11,8 @@ use smallvec::{smallvec, SmallVec};
 
 use crate::{
     arena::uint::OptionalU32,
-    graph::resource_marker::{BufferMarker, ImageMarker, ResourceMarker, TypeOption},
     device::{batch::GenerationId, submission::QueueSubmission, Device},
+    graph::resource_marker::{BufferMarker, ImageMarker, ResourceMarker, TypeOption},
     storage::{
         constant_ahash_hasher, nostore::SimpleStorage, MutableShared, ObjectHeader, ObjectStorage,
         SynchronizationLock,
@@ -109,13 +109,10 @@ impl ImageCreateInfo {
     }
 }
 
-pub enum SynchronizeResult {
-    None,
-    Synchronize {
-        src_layout: Option<vk::ImageLayout>,
-        src_queue_family: Option<u32>,
-        against: SmallVec<[QueueSubmission; 4]>,
-    },
+pub struct SynchronizeResult {
+    pub transition_layout_from: Option<vk::ImageLayout>,
+    pub transition_ownership_from: Option<u32>,
+    pub prev_access: SmallVec<[QueueSubmission; 4]>,
 }
 
 pub struct SynchronizationState<T: ResourceMarker> {
@@ -161,25 +158,25 @@ impl<T: ResourceMarker> SynchronizationState<T> {
         let mut transition_layout = false;
         let mut transition_ownership = false;
 
-        if T::IS_IMAGE && self.layout != dst_layout {
+        if T::IS_IMAGE
+            && dst_layout.unwrap() != vk::ImageLayout::UNDEFINED
+            && self.layout != dst_layout
+        {
             transition_layout = true;
         }
 
         if !resource_concurrent
             && self.owning_family.is_some()
+            && (T::IS_BUFFER || dst_layout.unwrap() != vk::ImageLayout::UNDEFINED)
             && self.owning_family.unwrap() != dst_family
         {
             transition_ownership = true;
         }
 
-        let result = if self.access.is_empty() {
-            SynchronizeResult::None
-        } else {
-            SynchronizeResult::Synchronize {
-                src_layout: transition_layout.then(|| self.layout.unwrap()),
-                src_queue_family: transition_ownership.then(|| self.owning_family.unwrap()),
-                against: self.access.clone(),
-            }
+        let result = SynchronizeResult {
+            transition_layout_from: transition_layout.then(|| self.layout.unwrap()),
+            transition_ownership_from: transition_ownership.then(|| self.owning_family.unwrap()),
+            prev_access: self.access.clone(),
         };
 
         self.owning_family = OptionalU32::new_some(dst_family);

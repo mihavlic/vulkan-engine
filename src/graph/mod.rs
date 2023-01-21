@@ -4,6 +4,7 @@ pub mod passes;
 pub mod resource_marker;
 mod reverse_edges;
 
+use core::panic;
 use std::{
     borrow::{Borrow, Cow},
     cell::{Cell, RefCell, RefMut},
@@ -40,7 +41,7 @@ use crate::{
     },
     object::{
         self, BufferCreateInfo, ImageCreateInfo, Object, ResourceMutableState,
-        SwapchainAcquireStatus,
+        SwapchainAcquireStatus, SynchronizeResult,
     },
     storage::{
         constant_ahash_hasher, constant_ahash_hashmap, constant_ahash_hashset,
@@ -251,9 +252,17 @@ impl LegacySemaphoreStack {
         self.next_index += 1;
         semaphore
     }
-    unsafe fn destroy(self, ctx: &Device) {
-        for semaphore in self.semaphores {
+    unsafe fn destroy(mut self, ctx: &Device) {
+        for semaphore in self.semaphores.drain(..) {
             ctx.destroy_raw_semaphore(semaphore);
+        }
+    }
+}
+
+impl Drop for LegacySemaphoreStack {
+    fn drop(&mut self) {
+        if !self.semaphores.is_empty() {
+            panic!("LegacySemaphoreStack has not been destroyed before being dropped!");
         }
     }
 }
@@ -1025,7 +1034,7 @@ impl Graph {
 
         // separate the scheduled passes into specific submissions
         // this is a greedy process, but due to the previous scheduling it should yield somewhat decent results
-        let (submissions, image_last_state, buffer_last_state, accessors) = {
+        let (mut submissions, image_last_state, buffer_last_state, accessors) = {
             let mut image_rw: Vec<(ResourceState<ImageMarker>, bool)> =
                 vec![(ResourceState::default(), false); self.images.len()];
             let mut buffer_rw: Vec<(ResourceState<BufferMarker>, bool)> =
@@ -1818,7 +1827,8 @@ impl Graph {
             self.swapchain_semaphores.reset();
             self.device
                 .device()
-                .reset_command_pool(self.command_pool, None);
+                .reset_command_pool(self.command_pool, None)
+                .unwrap();
         }
 
         for pending in deferred_free {
@@ -1880,24 +1890,22 @@ impl Graph {
             match img.deref() {
                 ImageData::Imported(_) | ImageData::Swapchain(_) => {
                     let resource = GraphResource::Image(handle);
-                    let usage = accessors.get(&resource).unwrap();
+                    let first_access = accessors.get(&resource).unwrap();
 
                     let ResourceState::Normal { layout, queue_family, access } = &image_last_state[i].0 else {
                         panic!("Unsupported resource state (TODO should Uninit be allowed?)");
                     };
 
                     semaphore_scratch.clear();
-                    semaphore_scratch.extend(usage.accessors.iter().map(|a| {
+                    semaphore_scratch.extend(first_access.accessors.iter().map(|a| {
                         let pass = self.timeline[a.index()].get_pass().unwrap();
                         let submission =
                             self.get_pass_meta(pass).scheduled_submission.get().unwrap();
                         semaphores[submission as usize].0
                     }));
 
-                    // nothing is using the resource, continue
-                    // TODO is this even possible? wouldn't the resource be dead?
                     if semaphore_scratch.len() == 0 {
-                        continue;
+                        panic!("Nothing is using the resource? Is this even possible? wouldn't the resource be dead?");
                     }
 
                     semaphore_scratch.sort_unstable();
@@ -1905,7 +1913,7 @@ impl Graph {
 
                     match img.deref() {
                         ImageData::Imported(archandle) => unsafe {
-                            archandle
+                            let synchronize_result = archandle
                                 .0
                                 .get_header()
                                 .object_data
@@ -1913,13 +1921,26 @@ impl Graph {
                                 .get_mut(&image_storage_lock)
                                 .synchronization
                                 .update_state(
-                                    usage.dst_queue_family,
-                                    TypeSome::new_some(usage.dst_layout),
+                                    first_access.dst_queue_family,
+                                    TypeSome::new_some(first_access.dst_layout),
                                     &semaphore_scratch,
                                     *layout,
                                     *queue_family,
                                     img.is_sharing_concurrent(),
                                 );
+
+                            let SynchronizeResult {
+                                transition_layout_from,
+                                transition_ownership_from,
+                                prev_access,
+                            } = synchronize_result;
+
+                            if transition_layout_from.is_none()
+                                && transition_ownership_from.is_none()
+                                && prev_access.is_empty()
+                            {
+                                continue;
+                            }
                         },
                         ImageData::Swapchain(archandle) => unsafe {
                             assert!(semaphore_scratch.len() == 1, "Swapchains use legacy semaphores and do not support multiple signals or waits, using a swapchain in multiple submissions is disallowed (you should really just transfer the final image into it at the end of the frame)");
@@ -1971,6 +1992,7 @@ impl Graph {
                             };
 
                             let data = mutable.get_image_data(index);
+
                             submission_swapchains
                                 .entry(semaphore_scratch[0])
                                 .or_default()
@@ -1983,8 +2005,53 @@ impl Graph {
                                     image_release: release_semaphore,
                                 });
 
-                            // we do not update any synchronization state here, since we already get synchonization from swapchain image acquire and the subsequent present
+                            // we do not update any synchronization state here, since we already get synchronization from swapchain image acquire and the subsequent present
                             swapchain_indices.insert(handle, index);
+
+                            let first_access_submission = {
+                                let a = first_access.accessors[0];
+                                let pass = self.timeline[a.index()].get_pass().unwrap();
+                                let submission =
+                                    self.get_pass_meta(pass).scheduled_submission.get().unwrap();
+                                &mut submissions[submission as usize]
+                            };
+
+                            if first_access.dst_layout != vk::ImageLayout::UNDEFINED {
+                                // acquired images start out as UNDEFINED, since we are currently allowing swapchains to only be used in a single submission,
+                                // we can just transition the layout at the start of the submission
+                                first_access_submission.special_barriers.insert(
+                                    0,
+                                    (
+                                        SubmissionPass(0),
+                                        SpecialBarrier::LayoutTransition {
+                                            image: handle,
+                                            src_layout: vk::ImageLayout::UNDEFINED,
+                                            dst_layout: first_access.dst_layout,
+                                        },
+                                    ),
+                                )
+                            }
+
+                            let src_layout = match &image_last_state[handle.index()].0 {
+                                ResourceState::Uninit => {
+                                    panic!("Must write to swapchain before presenting")
+                                }
+                                ResourceState::Normal { layout, .. } => layout.unwrap(),
+                                ResourceState::MoveDst { .. } | ResourceState::Moved => {
+                                    panic!("Swapchains do not support moving")
+                                }
+                            };
+
+                            // swapchain images must be in PRESENT_SRC_KHR before presenting
+                            // FIXME if we support moving into external resources (which we should) this will have to be intergrated
+                            // with the full barrier emission logic because this is not enough for MoveDst states
+                            first_access_submission.add_final_special_barrier(
+                                SpecialBarrier::LayoutTransition {
+                                    image: handle,
+                                    src_layout: src_layout,
+                                    dst_layout: vk::ImageLayout::PRESENT_SRC_KHR,
+                                },
+                            )
                         },
                         _ => unreachable!(),
                     }
@@ -2180,7 +2247,8 @@ impl Graph {
                     self.passes[pass.index()]
                         .pass
                         .borrow_mut()
-                        .execute(&executor, &self.device);
+                        .execute(&executor, &self.device)
+                        .unwrap();
                 }
                 do_barriers(
                     i,
@@ -2267,7 +2335,8 @@ impl Graph {
                     std::slice::from_ref(&submit),
                     vk::Fence::null(),
                 )
-                .map_err(|e| panic!("Submit err {:?}", e));
+                .map_err(|e| panic!("Submit err {:?}", e))
+                .unwrap();
 
                 if let Some(swapchains) = swapchains {
                     let wait_semaphores = swapchains
@@ -2291,9 +2360,28 @@ impl Graph {
                     };
 
                     d.queue_present_khr(queue.raw(), &present_info).unwrap();
+                    let result = Ok(vk::Result::SUCCESS);
 
-                    for res in results {
-                        pumice::new_result((), res).unwrap();
+                    for result in std::iter::once(result).chain(
+                        results
+                            .iter()
+                            .map(|res| pumice::new_result(vk::Result::SUCCESS, *res)),
+                    ) {
+                        match result {
+                            Ok(vk::Result::SUCCESS) => {}
+                            // the window became suboptimal while we were rendering, nothing to be done, the swapchain will be recreated in the next loop
+                            Ok(vk::Result::SUBOPTIMAL_KHR)
+                            | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {}
+                            Err(
+                                err @ (vk::Result::ERROR_OUT_OF_HOST_MEMORY
+                                | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+                                | vk::Result::ERROR_DEVICE_LOST
+                                | vk::Result::ERROR_SURFACE_LOST_KHR),
+                            ) => panic!("Fatal error '{:?}' from queue_present_khr", err),
+                            Ok(huh) | Err(huh) => {
+                                panic!("queue_present_khr shouldn't return a result of '{:?}'", huh)
+                            }
+                        }
                     }
                 }
             }
@@ -2491,7 +2579,7 @@ impl Graph {
             ResourceState::MoveDst { parts } => {
                 assert!(ImageMarker::IS_IMAGE, "Only images can be moved");
                 let dst_layout = TypeSome::new_some(dst_layout.unwrap());
-                let mut written_parts_counter = 0;
+                let mut all_parts_written_to = true;
 
                 for subresource in parts.iter_mut() {
                     let ImageSubresource {
@@ -2518,14 +2606,15 @@ impl Graph {
                     );
 
                     if dst_writes {
-                        written_parts_counter += 1;
                         access.clear();
+                    } else {
+                        all_parts_written_to = false;
                     }
 
                     access.push(dst_touch);
                 }
 
-                if written_parts_counter == parts.len() {
+                if all_parts_written_to {
                     *state = normal_state();
                 }
             }
@@ -2704,9 +2793,9 @@ impl Graph {
         &mut self,
         submissions: &Vec<Submission>,
         writer: &mut dyn std::io::Write,
-    ) {
+    ) -> std::io::Result<()> {
         let clusters = Fun::new(|w| {
-            writeln!(w);
+            writeln!(w)?;
 
             // q0[label="Queue 0:"; peripheries=0; fontsize=15; fontname="Helvetica,Arial,sans-serif bold"];
             for q in 0..self.queues.len() {
@@ -2718,7 +2807,7 @@ impl Graph {
                 );
             }
 
-            writeln!(w);
+            writeln!(w)?;
 
             let queue_submitions = |queue_index: usize| {
                 submissions
@@ -2757,12 +2846,12 @@ impl Graph {
                 );
             }
 
-            writeln!(w);
+            writeln!(w)?;
 
             // next edges will serve as layout constraints, don't show them
-            write!(w, "edge[style=invis];");
+            write!(w, "edge[style=invis];")?;
 
-            writeln!(w);
+            writeln!(w)?;
 
             let heads = (0..self.queues.len())
                 .map(|q| queue_submitions(q).next())
@@ -2771,7 +2860,7 @@ impl Graph {
             // make sure that queues start vertically aligned
             if self.queues.len() > 1 {
                 for q in 1..self.queues.len() {
-                    write!(w, "q{} -> q{}[weight=99];", q - 1, q);
+                    write!(w, "q{} -> q{}[weight=99];", q - 1, q)?;
                 }
             }
 
@@ -2783,11 +2872,11 @@ impl Graph {
                     .filter_map(|(i, p)| p.as_ref().map(|p| (i, p)));
 
                 for (q, p) in heads {
-                    write!(w, "q{} -> p{};", q, p.index());
+                    write!(w, "q{} -> p{};", q, p.index())?;
                 }
             }
 
-            writeln!(w);
+            writeln!(w)?;
 
             // p0 -> p1 -> p2;
             for q in 0..self.queues.len() {
@@ -2795,24 +2884,24 @@ impl Graph {
                     let mut first = true;
                     for p in queue_submitions(q) {
                         if !first {
-                            write!(w, " -> ");
+                            write!(w, " -> ")?;
                         }
-                        write!(w, "p{}", p.index());
+                        write!(w, "p{}", p.index())?;
                         first = false;
                     }
-                    write!(w, ";");
+                    write!(w, ";")?;
                 }
             }
 
-            writeln!(w);
+            writeln!(w)?;
 
             // { rank = same; q1; p2; p3; }
             for q in 0..self.queues.len() {
                 let nodes = Fun::new(|w| {
-                    write!(w, "q{q}; ");
+                    write!(w, "q{q}; ")?;
 
                     for p in queue_submitions(q) {
-                        write!(w, "p{}; ", p.index());
+                        write!(w, "p{}; ", p.index())?;
                     }
                     Ok(())
                 });
@@ -2825,20 +2914,20 @@ impl Graph {
                 );
             }
 
-            writeln!(w);
-            write!(w, "edge[style=filled];");
-            writeln!(w);
+            writeln!(w)?;
+            write!(w, "edge[style=filled];")?;
+            writeln!(w)?;
 
             // the visible edges for the actual dependencies
             for q in 0..self.queues.len() {
                 for p in queue_submitions(q) {
                     let dependencies = &self.get_pass_data(p).dependencies;
                     for dep in dependencies {
-                        write!(w, "p{} -> p{}", dep.index(), p.index());
+                        write!(w, "p{} -> p{}", dep.index(), p.index())?;
                         if !dep.is_hard() {
-                            write!(w, "[color=darkgray]");
+                            write!(w, "[color=darkgray]")?;
                         }
-                        write!(w, ";");
+                        write!(w, ";")?;
                     }
                 }
             }
@@ -2860,20 +2949,21 @@ impl Graph {
                 $
             }
         );
+        Ok(())
     }
     fn write_submissions_dot_representation(
         submissions: &Vec<Submission>,
         writer: &mut dyn std::io::Write,
-    ) {
+    ) -> std::io::Result<()> {
         let clusters = Fun::new(|w| {
             for (i, sub) in submissions.iter().enumerate() {
-                write!(w, r##"s{i}[label="{i} (q{})"];"##, sub.queue.index());
+                write!(w, r##"s{i}[label="{i} (q{})"];"##, sub.queue.index())?;
                 if !sub.semaphore_dependencies.is_empty() {
-                    write!(w, "{{");
+                    write!(w, "{{")?;
                     for p in &sub.semaphore_dependencies {
-                        write!(w, "s{} ", p.index());
+                        write!(w, "s{} ", p.index())?;
                     }
-                    write!(w, "}} -> s{i};");
+                    write!(w, "}} -> s{i};")?;
                 }
             }
             Ok(())
@@ -2893,6 +2983,7 @@ impl Graph {
                 $
             }
         );
+        Ok(())
     }
 }
 
@@ -2909,6 +3000,7 @@ impl Drop for Graph {
 
         let memory = unsafe { ManuallyDrop::take(&mut *memory.borrow_mut()) };
         let command_pool = *command_pool;
+        let semaphores = std::mem::take(swapchain_semaphores);
 
         let device_ptr: *const Device = Arc::as_ptr(&device.0);
         let owned_device = unsafe { ManuallyDrop::take(device) };
@@ -2928,6 +3020,7 @@ impl Drop for Graph {
                                     owned_device.allocator().free_memory(block.allocation);
                                 }
                             }
+                            semaphores.destroy(&owned_device);
                         },
                     )))),
                 )
@@ -2951,7 +3044,7 @@ unsafe fn do_barriers(
 ) {
     memory_barriers.clear();
     while let Some((pass, barrier)) = barriers.clone().next() {
-        if flush || pass.index() == i {
+        if flush || pass.index() <= i {
             barriers.next();
             memory_barriers.push(vk::MemoryBarrier2KHR {
                 src_stage_mask: barrier.src_stages,
@@ -2967,7 +3060,7 @@ unsafe fn do_barriers(
     image_barriers.clear();
     buffer_barriers.clear();
     while let Some((pass, barrier)) = special_barriers.clone().next() {
-        if flush || pass.index() == i {
+        if flush || pass.index() <= i {
             special_barriers.next();
             // TODO support moves - ie non-whole subresource ranges
             let subresource_range = vk::ImageSubresourceRange {
@@ -3875,20 +3968,20 @@ impl PassDependency {
     fn is_hard(&self) -> bool {
         self.0.second() & 1 == 1
     }
-    fn set_hard(&self, hard: bool) -> Self {
-        Self(PackedUint::new(
+    fn set_hard(&mut self, hard: bool) {
+        *self = Self(PackedUint::new(
             self.0.first(),
             (self.0.second() & !1) | hard as u32,
-        ))
+        ));
     }
     fn is_real(&self) -> bool {
         self.0.second() & 2 == 2
     }
-    fn set_real(&self, real: bool) -> Self {
-        Self(PackedUint::new(
+    fn set_real(&mut self, real: bool) {
+        *self = Self(PackedUint::new(
             self.0.first(),
             (self.0.second() & !2) | (real as u32 * 2),
-        ))
+        ));
     }
     fn get_pass(&self) -> GraphPass {
         GraphPass(self.0.first())
