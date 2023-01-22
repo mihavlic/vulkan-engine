@@ -8,5 +8,6 @@ pub mod device;
 pub mod graph;
 pub mod instance;
 pub mod object;
+pub mod passes;
 pub mod storage;
 pub mod tracing;

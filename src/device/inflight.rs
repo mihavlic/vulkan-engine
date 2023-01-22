@@ -7,7 +7,7 @@ use super::{batch::GenerationId, submission::WaitResult, Device};
 pub enum InflightResource {
     Image(object::Image),
     Buffer(object::Buffer),
-    Closure(ManuallyDrop<Box<dyn FnOnce() + 'static>>),
+    Closure(ManuallyDrop<Box<dyn FnOnce() + Send + Sync + 'static>>),
 }
 
 impl Drop for InflightResource {

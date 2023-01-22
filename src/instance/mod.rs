@@ -1,6 +1,6 @@
 use std::{
     collections::{hash_map::RandomState, HashSet},
-    ffi::CStr,
+    ffi::{CStr, CString},
     fmt::Debug,
     ops::Deref,
     sync::Arc,
@@ -27,6 +27,8 @@ use crate::{
 };
 
 pub struct Instance {
+    pub(crate) application_name: String,
+
     pub(crate) entry: pumice::EntryWrapper,
     pub(crate) instance: pumice::InstanceWrapper,
 
@@ -45,11 +47,14 @@ pub struct Instance {
     pub(crate) entry_loader: EntryLoader,
 }
 
+unsafe impl Send for Instance {}
+unsafe impl Sync for Instance {}
+
 pub struct InstanceCreateInfo<'a, 'b> {
     pub config: &'a mut ApiLoadConfig<'b>,
     pub validation_layers: &'a [&'a CStr],
     pub enable_debug_callback: bool,
-    pub app_name: &'a CStr,
+    pub app_name: String,
     pub verbose: bool,
 }
 
@@ -174,10 +179,12 @@ impl Instance {
             info!("{} instance layers", instance_layer_properties.len());
         }
 
+        let app_cstr = CString::new(app_name.as_bytes()).unwrap();
+
         let app_info = pumice::vk::ApplicationInfo {
-            p_application_name: app_name.as_ptr(),
+            p_application_name: app_cstr.as_ptr(),
             application_version: 0,
-            p_engine_name: app_name.as_ptr(),
+            p_engine_name: app_cstr.as_ptr(),
             engine_version: 0,
             api_version: config.get_api_version(),
             ..Default::default()
@@ -260,6 +267,7 @@ impl Instance {
         }
 
         let inner = Instance {
+            application_name: app_name,
             entry,
             instance,
             physical_devices,
@@ -284,6 +292,9 @@ impl Instance {
     }
     pub fn entry(&self) -> &EntryWrapper {
         &self.entry
+    }
+    pub fn app_name(&self) -> &str {
+        &self.application_name
     }
 }
 

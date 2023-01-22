@@ -1,25 +1,30 @@
 mod allocator;
 mod lazy_sorted;
-pub mod passes;
 pub mod resource_marker;
 mod reverse_edges;
+pub mod task;
 
 use core::panic;
 use std::{
-    borrow::Cow,
+    any::Any,
+    borrow::{BorrowMut, Cow},
     cell::{Cell, RefCell, RefMut},
     collections::{hash_map::Entry, BinaryHeap},
     fmt::Display,
     hash::Hash,
+    marker::PhantomData,
     mem::ManuallyDrop,
     ops::{Deref, DerefMut, Range},
-    sync::Arc,
+    sync::{mpsc::channel, Arc},
 };
 
 use ahash::HashMap;
+use parking_lot::lock_api::RawRwLock;
 use pumice::{util::ObjectHandle, vk, vk10::CommandPoolCreateInfo, DeviceWrapper, VulkanResult};
 use pumice_vma::AllocationCreateInfo;
 
+use rayon::prelude::{IntoParallelIterator, IntoParallelRefIterator};
+use slice_group_by::GroupBy;
 use smallvec::{smallvec, SmallVec};
 
 use crate::{
@@ -34,11 +39,14 @@ use crate::{
         allocator::MemoryKind,
         resource_marker::{BufferMarker, ImageMarker, TypeOption, TypeSome},
         reverse_edges::{reverse_edges_into, ChildRelativeKey, NodeKey},
+        task::GraphicsPipelineResult,
     },
     object::{
-        self, BufferCreateInfo, BufferMutableState, ImageCreateInfo, ImageMutableState, ObjectData,
-        SwapchainAcquireStatus, SynchronizeResult,
+        self, BufferCreateInfo, BufferMutableState, ConcreteGraphicsPipeline, GetPipelineResult,
+        GraphicsPipeline, GraphicsPipelineCreateInfo, ImageCreateInfo, ImageMutableState,
+        ObjectData, RenderPassMode, SwapchainAcquireStatus, SynchronizeResult,
     },
+    passes::{CreatePass, RenderPass},
     storage::{constant_ahash_hashmap, constant_ahash_hashset, ObjectStorage},
     token_abuse,
     util::{format_utils::Fun, macro_abuse::WeirdFormatter},
@@ -48,44 +56,30 @@ use self::{
     allocator::{AvailabilityToken, RcPtrComparator, SuballocationUgh, Suballocator},
     resource_marker::{ResourceData, ResourceMarker},
     reverse_edges::{DFSCommand, ImmutableGraph, NodeGraph},
+    task::{
+        CompileGraphicsPipelinesTask, ComputePipelinePromise, ExecuteFnTask, FnPromiseHandle,
+        GraphicsPipelineModeEntry, GraphicsPipelinePromise, GraphicsPipelineSrc, Promise, SendAny,
+    },
 };
 
-pub trait RenderPass: 'static {
-    fn prepare(&mut self);
-    unsafe fn execute(self, executor: &GraphExecutor, device: &Device) -> VulkanResult<()>;
-}
-
-impl RenderPass for () {
-    fn prepare(&mut self) {
-        {}
-    }
-    unsafe fn execute(self, _executor: &GraphExecutor, _device: &Device) -> VulkanResult<()> {
-        VulkanResult::Ok(())
+struct StoredCreatePass<T: CreatePass>(Cell<Option<(T, T::PreparedData)>>);
+impl<T: CreatePass> StoredCreatePass<T> {
+    fn new(
+        mut pass: T,
+        builder: &mut GraphPassBuilder,
+        device: &Device,
+    ) -> Box<dyn ObjectSafeCreatePass> {
+        let data = pass.prepare(builder, device);
+        Box::new(Self(Cell::new(Some((pass, data)))))
     }
 }
-
-pub trait CreatePass {
-    type Pass: RenderPass;
-    fn create(self, builder: &mut GraphPassBuilder, device: &Device) -> Self::Pass;
+trait ObjectSafeCreatePass {
+    fn create(&self, ctx: &mut GraphContext) -> Box<dyn RenderPass>;
 }
-impl<P: RenderPass, F: FnOnce(&mut GraphPassBuilder, &Device) -> P> CreatePass for F {
-    type Pass = P;
-    fn create(self, builder: &mut GraphPassBuilder, device: &Device) -> Self::Pass {
-        self(builder, device)
-    }
-}
-
-struct StoredPass<T: RenderPass>(Option<T>);
-trait ObjectSafePass {
-    fn prepare(&mut self);
-    unsafe fn execute(&mut self, executor: &GraphExecutor, device: &Device) -> VulkanResult<()>;
-}
-impl<T: RenderPass> ObjectSafePass for StoredPass<T> {
-    fn prepare(&mut self) {
-        self.0.as_mut().unwrap().prepare()
-    }
-    unsafe fn execute(&mut self, executor: &GraphExecutor, device: &Device) -> VulkanResult<()> {
-        self.0.take().unwrap().execute(executor, device)
+impl<T: CreatePass> ObjectSafeCreatePass for StoredCreatePass<T> {
+    fn create(&self, ctx: &mut GraphContext) -> Box<dyn RenderPass> {
+        let (pass, prepared) = Cell::take(&self.0).unwrap();
+        pass.create(prepared, ctx)
     }
 }
 
@@ -250,6 +244,9 @@ impl Submission {
 }
 
 pub struct Graph {
+    graphics_pipeline_promises: RefCell<Vec<CompileGraphicsPipelinesTask>>,
+    function_promises: RefCell<Vec<ExecuteFnTask>>,
+
     queues: Vec<GraphObject<submission::Queue>>,
     images: Vec<GraphObject<ImageData>>,
     buffers: Vec<GraphObject<BufferData>>,
@@ -286,6 +283,8 @@ impl Graph {
             .collect::<Box<[_]>>();
 
         Graph {
+            graphics_pipeline_promises: RefCell::new(Vec::new()),
+            function_promises: RefCell::new(Vec::new()),
             queues: Vec::new(),
             images: Vec::new(),
             buffers: Vec::new(),
@@ -528,6 +527,121 @@ impl Graph {
         // sound because GraphBuilder is repr(transparent)
         let builder = unsafe { std::mem::transmute::<&mut Graph, &mut GraphBuilder>(self) };
         fun(builder);
+
+        // we need to schedule the promises that passes may have created
+        let mut graphic = std::mem::take(&mut *self.graphics_pipeline_promises.borrow_mut());
+        let mut funs = std::mem::take(&mut *self.function_promises.borrow_mut());
+
+        let (sender, receiver) = channel();
+        let owned_device = ManuallyDrop::into_inner(self.device.clone());
+        self.device.threadpool().spawn(move || {
+            use rayon::prelude::*;
+            let (a, b) = rayon::join(
+                move || {
+                    Vec::into_par_iter(graphic)
+                        .map(|batch| {
+                            let info = unsafe { batch.pipeline_handle.0.get_create_info() };
+                            let mut get_infos = Vec::new();
+
+                            let infos = batch
+                                .batch
+                                .into_iter()
+                                .filter_map(|comp| match comp.mode {
+                                    GraphicsPipelineSrc::Compile(mode, mode_hash) => {
+                                        let info = GraphicsPipelineCreateInfo {
+                                            render_pass: mode,
+                                            ..info.clone()
+                                        };
+
+                                        get_infos.push(GraphicsPipelineResult::Compile(mode_hash));
+
+                                        Some(info)
+                                    }
+                                    GraphicsPipelineSrc::Wait(lock, mode_hash) => {
+                                        get_infos
+                                            .push(GraphicsPipelineResult::Wait(lock, mode_hash));
+                                        None
+                                    }
+                                    GraphicsPipelineSrc::Ready(handle) => {
+                                        get_infos.push(GraphicsPipelineResult::Ready(handle));
+                                        None
+                                    }
+                                })
+                                .collect::<SmallVec<[_; 8]>>();
+
+                            let vec = if !infos.is_empty() {
+                                let mut create_infos = SmallVec::new();
+                                let mut stages = SmallVec::new();
+                                let mut dynamic_rendering_infos = SmallVec::new();
+
+                                let (vec, result) = unsafe {
+                                    GraphicsPipelineCreateInfo::create_multiple(
+                                        infos,
+                                        owned_device.pipeline_cache(),
+                                        &mut create_infos,
+                                        &mut stages,
+                                        &mut dynamic_rendering_infos,
+                                        &owned_device,
+                                    )
+                                    .unwrap()
+                                };
+
+                                assert_eq!(result, vk::Result::SUCCESS);
+
+                                vec
+                            } else {
+                                Vec::new()
+                            };
+
+                            let mut maybe_lock = None;
+
+                            let mut compiled_offset = 0;
+                            for i in &mut get_infos {
+                                match i {
+                                    GraphicsPipelineResult::Compile(mode_hash) => {
+                                        let handle = vec[compiled_offset];
+                                        let lock = maybe_lock.get_or_insert_with(|| unsafe {
+                                            batch.pipeline_handle.0.lock_storage()
+                                        });
+
+                                        unsafe {
+                                            batch
+                                                .pipeline_handle
+                                                .0
+                                                .get_object_data()
+                                                .mutable
+                                                .get_mut(lock)
+                                                .add_promised_pipeline(handle, *mode_hash);
+                                        }
+
+                                        drop(mode_hash);
+
+                                        *i = GraphicsPipelineResult::CompiledFinal(handle);
+                                        compiled_offset += 1;
+                                    }
+                                    GraphicsPipelineResult::Wait(_, _)
+                                    | GraphicsPipelineResult::Ready(_) => {}
+                                    GraphicsPipelineResult::CompiledFinal(_) => unreachable!(),
+                                }
+                            }
+
+                            drop(maybe_lock);
+
+                            assert_eq!(compiled_offset, vec.len());
+                            (batch.pipeline_handle, get_infos)
+                        })
+                        .collect::<Vec<_>>()
+                },
+                move || {
+                    Vec::into_par_iter(funs)
+                        .map(|task| Some((task.fun)()))
+                        .collect::<Vec<_>>()
+                },
+            );
+
+            sender.send((a, b)).unwrap();
+        });
+
         self.prepare_meta();
 
         // src dst
@@ -1752,12 +1866,6 @@ impl Graph {
                 .unwrap();
         }
 
-        for (pass, meta) in self.passes.iter_mut().zip(&self.pass_meta) {
-            if meta.alive.get() {
-                pass.pass.borrow_mut().prepare();
-            }
-        }
-
         // since we've now waited for all previous work to finish, we can safely reset the semaphores
         unsafe {
             self.swapchain_semaphores.reset();
@@ -1770,13 +1878,19 @@ impl Graph {
         for pending in deferred_free {
             unsafe {
                 match pending {
-                    DeferredResourceFree::Image { vkhandle, state } => {
+                    DeferredResourceFree::Image {
+                        vkhandle,
+                        mut state,
+                    } => {
                         state.destroy(&self.device);
                         self.device
                             .device()
                             .destroy_image(vkhandle, self.device.allocator_callbacks());
                     }
-                    DeferredResourceFree::Buffer { vkhandle, state } => {
+                    DeferredResourceFree::Buffer {
+                        vkhandle,
+                        mut state,
+                    } => {
                         state.destroy(&self.device);
                         self.device
                             .device()
@@ -1792,6 +1906,36 @@ impl Graph {
             .iter()
             .map(|_| self.device.make_submission())
             .collect::<Vec<_>>();
+
+        let (graphics_pipelines, function_promises): (
+            Vec<(GraphicsPipeline, Vec<GraphicsPipelineResult>)>,
+            Vec<Option<SendAny>>,
+        ) = receiver.recv().unwrap();
+
+        for result in graphics_pipelines.iter().flat_map(|p| &p.1) {
+            match result {
+                GraphicsPipelineResult::Wait(lock, _) => lock.lock_shared(),
+                _ => {}
+            }
+        }
+
+        let mut graph_context = GraphContext {
+            graphics_pipelines,
+            function_promises,
+        };
+
+        for (pass, meta) in self.passes.iter_mut().zip(&self.pass_meta) {
+            if meta.alive.get() {
+                pass.create_pass(&mut graph_context);
+            }
+        }
+
+        // TODO when we separate compiling and executing a graph, these two loops will be far away
+        for (pass, meta) in self.passes.iter_mut().zip(&self.pass_meta) {
+            if meta.alive.get() {
+                pass.on_created(|p| p.prepare());
+            }
+        }
 
         // TODO do something about this so that we don't hold the lock for all of execution
         let image_storage_lock = self.device.image_storage.acquire_all_exclusive();
@@ -2157,9 +2301,7 @@ impl Graph {
                         raw_buffers: &raw_buffers,
                     };
                     self.passes[pass.index()]
-                        .pass
-                        .borrow_mut()
-                        .execute(&executor, &self.device)
+                        .on_created(|p| p.execute(&executor, &self.device))
                         .unwrap();
                 }
                 do_barriers(
@@ -2911,7 +3053,14 @@ impl Drop for Graph {
             ..
         } = self;
 
-        let memory = unsafe { ManuallyDrop::take(&mut *memory.borrow_mut()) };
+        let memory: Box<[Suballocator; vk::MAX_MEMORY_TYPES as usize]> =
+            unsafe { ManuallyDrop::take(memory.get_mut()) };
+        let allocations = memory
+            .into_iter()
+            .flat_map(|m| m.collect_blocks())
+            .map(|b| b.0.allocation)
+            .collect::<Vec<_>>();
+
         let command_pool = *command_pool;
         let semaphores = std::mem::take(swapchain_semaphores);
 
@@ -2928,10 +3077,8 @@ impl Drop for Graph {
                                 command_pool,
                                 owned_device.allocator_callbacks(),
                             );
-                            for allocator in *memory {
-                                for RcPtrComparator(block) in allocator.collect_blocks() {
-                                    owned_device.allocator().free_memory(block.allocation);
-                                }
+                            for allocation in allocations {
+                                owned_device.allocator().free_memory(allocation);
                             }
                             semaphores.destroy(&owned_device);
                         },
@@ -3181,6 +3328,12 @@ impl PassBufferData {
     }
 }
 
+enum PassObjectState {
+    Initial(Box<dyn ObjectSafeCreatePass>),
+    Created(Box<dyn RenderPass>),
+    DummyNone,
+}
+
 struct PassData {
     queue: GraphQueue,
     force_run: bool,
@@ -3189,7 +3342,7 @@ struct PassData {
     stages: vk::PipelineStageFlags2KHR,
     access: vk::AccessFlags2KHR,
     dependencies: Vec<PassDependency>,
-    pass: RefCell<Box<dyn ObjectSafePass>>,
+    pass: Cell<PassObjectState>,
 }
 
 impl PassData {
@@ -3210,6 +3363,37 @@ impl PassData {
             self.dependencies
                 .push(PassDependency::new(dependency, hard, real));
         }
+    }
+    fn on_pass<A, F: FnOnce(&mut PassObjectState) -> A>(&self, fun: F) -> A {
+        // Cell::replace just moves a pointer, easy for compiler to optimize
+        let mut pass = Cell::replace(&self.pass, PassObjectState::DummyNone);
+        let ret = fun(&mut pass);
+        let _ = Cell::replace(&self.pass, pass);
+        ret
+    }
+    fn on_initial<A, F: FnOnce(&mut dyn ObjectSafeCreatePass) -> A>(&self, fun: F) -> A {
+        self.on_pass(|state| match state {
+            PassObjectState::Initial(initial) => fun(&mut **initial),
+            PassObjectState::Created(_) => panic!(),
+            PassObjectState::DummyNone => panic!(),
+        })
+    }
+    fn create_pass(&self, ctx: &mut GraphContext) {
+        self.on_pass(|state| match state {
+            PassObjectState::Initial(initial) => {
+                let created = initial.create(ctx);
+                *state = PassObjectState::Created(created);
+            }
+            PassObjectState::Created(_) => panic!(),
+            PassObjectState::DummyNone => panic!(),
+        })
+    }
+    fn on_created<A, F: FnOnce(&mut dyn RenderPass) -> A>(&self, fun: F) -> A {
+        self.on_pass(|state| match state {
+            PassObjectState::Initial(_) => panic!(),
+            PassObjectState::Created(created) => fun(&mut **created),
+            PassObjectState::DummyNone => panic!(),
+        })
     }
 }
 
@@ -3537,8 +3721,8 @@ impl GraphBuilder {
         let handle = GraphPass::new(self.0.passes.len());
         let data = {
             let mut builder = GraphPassBuilder::new(self, handle);
-            let pass = pass.create(&mut builder, &self.0.device);
-            builder.finish(queue, pass)
+            let objectified = StoredCreatePass::new(pass, &mut builder, &self.0.device);
+            builder.finish(queue, objectified)
         };
         // if the string is 0, we set the name to None
         let name = Some(name.into()).filter(|n| !n.is_empty());
@@ -3585,7 +3769,124 @@ impl<'a> GraphPassBuilder<'a> {
             dependencies: Vec::new(),
         }
     }
-    fn finish<T: RenderPass>(self, queue: GraphQueue, pass: T) -> PassData {
+    fn compile_graphics_pipeline(
+        &mut self,
+        pipeline: &GraphicsPipeline,
+        mode: &RenderPassMode,
+    ) -> GraphicsPipelinePromise {
+        let mode_hash = mode.get_hash();
+        let mut promises = self.graph_builder.0.graphics_pipeline_promises.borrow_mut();
+
+        // TODO do better than linear search
+        if let Some(found) = promises.iter().position(|b| &b.pipeline_handle == pipeline) {
+            let CompileGraphicsPipelinesTask {
+                pipeline_handle,
+                compiling_guard,
+                batch,
+            } = &mut promises[found];
+
+            if let Some(found_offset) = batch.iter().position(|b| b.mode_hash == mode_hash) {
+                GraphicsPipelinePromise {
+                    batch_index: found as u32,
+                    mode_offset: found_offset as u32,
+                }
+            } else {
+                let handle = GraphicsPipelinePromise {
+                    batch_index: found as u32,
+                    mode_offset: batch.len() as u32,
+                };
+
+                let lock = || {
+                    if let Some(lock) = compiling_guard {
+                        lock.clone()
+                    } else {
+                        let lock = Arc::new(parking_lot::RawRwLock::INIT);
+                        assert!(lock.try_lock_exclusive());
+
+                        *compiling_guard = Some(lock.clone());
+
+                        lock
+                    }
+                };
+
+                let result = unsafe {
+                    pipeline
+                        .0
+                        .access_mutable(|d| &d.mutable, |m| m.get_pipeline(mode_hash, lock))
+                };
+
+                let src = match result {
+                    GetPipelineResult::Ready(ok) => GraphicsPipelineSrc::Ready(ok),
+                    GetPipelineResult::Promised(lock) => GraphicsPipelineSrc::Wait(lock, mode_hash),
+                    GetPipelineResult::MustCreate(lock) => {
+                        GraphicsPipelineSrc::Compile(mode.clone(), mode_hash)
+                    }
+                };
+
+                batch.push(GraphicsPipelineModeEntry {
+                    mode: src,
+                    mode_hash,
+                });
+
+                handle
+            }
+        } else {
+            let handle = GraphicsPipelinePromise {
+                batch_index: promises.len() as u32,
+                mode_offset: 0,
+            };
+
+            let lock = || {
+                let lock = Arc::new(parking_lot::RawRwLock::INIT);
+                assert!(lock.try_lock_exclusive());
+                lock
+            };
+
+            let result = unsafe {
+                pipeline
+                    .0
+                    .access_mutable(|d| &d.mutable, |m| m.get_pipeline(mode_hash, lock))
+            };
+
+            let (src, lock) = match result {
+                GetPipelineResult::Ready(ok) => (GraphicsPipelineSrc::Ready(ok), None),
+                GetPipelineResult::Promised(lock) => {
+                    (GraphicsPipelineSrc::Wait(lock, mode_hash), None)
+                }
+                GetPipelineResult::MustCreate(lock) => (
+                    GraphicsPipelineSrc::Compile(mode.clone(), mode_hash),
+                    Some(lock),
+                ),
+            };
+
+            promises.push(CompileGraphicsPipelinesTask {
+                pipeline_handle: pipeline.clone(),
+                compiling_guard: lock,
+                batch: vec![GraphicsPipelineModeEntry {
+                    mode: src,
+                    mode_hash,
+                }],
+            });
+            handle
+        }
+    }
+    fn compile_compute_pipeline(&mut self) -> ComputePipelinePromise {
+        todo!()
+    }
+    fn run_task<T: 'static + Send, F: FnOnce() -> T + Send + Sync + 'static>(
+        &mut self,
+        fun: F,
+    ) -> Promise<T> {
+        let mut promises = self.graph_builder.0.function_promises.borrow_mut();
+        let handle = FnPromiseHandle::new(promises.len());
+
+        promises.push(ExecuteFnTask {
+            fun: Box::new(move || SendAny::new(fun())),
+        });
+
+        Promise(handle, PhantomData)
+    }
+    fn finish(self, queue: GraphQueue, pass: Box<dyn ObjectSafeCreatePass>) -> PassData {
         let mut access = vk::AccessFlags2KHR::default();
         let mut stages = vk::PipelineStageFlags2KHR::default();
         for i in &self.images {
@@ -3609,7 +3910,7 @@ impl<'a> GraphPassBuilder<'a> {
             stages,
             access,
             dependencies: self.dependencies,
-            pass: RefCell::new(Box::new(StoredPass(Some(pass)))),
+            pass: Cell::new(PassObjectState::Initial(pass)),
         }
     }
     // TODO check (possibly update for transients) usage flags against their create info
@@ -3699,6 +4000,57 @@ impl<'a> GraphExecutor<'a> {
     }
 }
 
+pub struct GraphContext {
+    graphics_pipelines: Vec<(GraphicsPipeline, Vec<GraphicsPipelineResult>)>,
+    function_promises: Vec<Option<SendAny>>,
+}
+
+impl GraphContext {
+    fn resolve_graphics_pipeline(
+        &mut self,
+        promise: GraphicsPipelinePromise,
+    ) -> ConcreteGraphicsPipeline {
+        let GraphicsPipelinePromise {
+            batch_index,
+            mode_offset,
+        } = promise;
+
+        let (archandle, entries) = &mut self.graphics_pipelines[batch_index as usize];
+        let entry = &mut entries[mode_offset as usize];
+        let concrete = match entry {
+            GraphicsPipelineResult::Compile(_) => unreachable!(),
+            GraphicsPipelineResult::CompiledFinal(handle) => *handle,
+            GraphicsPipelineResult::Wait(_, mode_hash) => {
+                let result = unsafe {
+                    archandle
+                        .0
+                        .access_mutable(|d| &d.mutable, |m| m.get_pipeline(*mode_hash, || panic!()))
+                };
+
+                let handle = match result {
+                    GetPipelineResult::Ready(handle) => handle,
+                    GetPipelineResult::Promised(_) => unreachable!(),
+                    GetPipelineResult::MustCreate(_) => unreachable!(),
+                };
+
+                *entry = GraphicsPipelineResult::Ready(handle);
+                handle
+            }
+            GraphicsPipelineResult::Ready(handle) => *handle,
+        };
+
+        ConcreteGraphicsPipeline(archandle.clone(), concrete)
+    }
+    fn resolve_promise<T: 'static>(&mut self, promise: Promise<T>) -> T {
+        *self.function_promises[promise.0.index()]
+            .take()
+            .unwrap()
+            .into_any()
+            .downcast()
+            .unwrap()
+    }
+}
+
 #[macro_export]
 macro_rules! simple_handle {
     ($($visibility:vis $name:ident),+) => {
@@ -3708,20 +4060,20 @@ macro_rules! simple_handle {
             $visibility struct $name(u32);
             #[allow(unused)]
             impl $name {
-                fn new(index: usize) -> Self {
+                $visibility fn new(index: usize) -> Self {
                     assert!(index <= u32::MAX as usize);
                     Self(index as u32)
                 }
                 #[inline]
-                fn index(&self) -> usize {
+                $visibility fn index(&self) -> usize {
                     self.0 as usize
                 }
                 #[inline]
-                fn to_raw(&self) -> $crate::graph::RawHandle {
+                $visibility fn to_raw(&self) -> $crate::graph::RawHandle {
                     $crate::graph::RawHandle(self.0)
                 }
                 #[inline]
-                fn from_raw(raw: $crate::graph::RawHandle) -> Self {
+                $visibility fn from_raw(raw: $crate::graph::RawHandle) -> Self {
                     Self(raw.0)
                 }
             }

@@ -1,10 +1,10 @@
 #![allow(unused)]
 
 use graph::device::{self, DeviceCreateInfo, QueueFamilySelection};
-use graph::graph::passes::ClearImage;
 use graph::graph::Graph;
 use graph::instance::{Instance, InstanceCreateInfo, OwnedInstance};
 use graph::object::{self, ImageCreateInfo, SwapchainCreateInfo};
+use graph::passes::ClearImage;
 use graph::tracing::tracing_subscriber::install_tracing_subscriber;
 use pumice::{util::ApiLoadConfig, vk};
 use pumice_vma::{AllocationCreateFlags, AllocationCreateInfo};
@@ -40,7 +40,7 @@ fn main() {
             config: &mut conf,
             validation_layers: &[pumice::cstr!("VK_LAYER_KHRONOS_validation")],
             enable_debug_callback: true,
-            app_name: pumice::cstr!("test application"),
+            app_name: "test application".to_owned(),
             verbose: false,
         };
 

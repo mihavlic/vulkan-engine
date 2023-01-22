@@ -8,14 +8,14 @@ use self::{
 use super::instance::InstanceCreateInfo;
 use crate::{
     instance::Instance,
-    object::{self, Buffer, Image, Swapchain},
+    object::{self, Buffer, GraphicsPipeline, Image, Swapchain},
     storage::{nostore::SimpleStorage, ObjectStorage},
     tracing::shim_macros::{info, trace},
     util::format_utils::{self},
 };
 use pumice::{
     loader::{tables::DeviceTable, DeviceLoader},
-    util::ApiLoadConfig,
+    util::{ApiLoadConfig, ObjectHandle},
     vk,
     vk10::QueueFamilyProperties,
     DeviceWrapper, VulkanResult,
@@ -61,6 +61,9 @@ pub struct DeviceCreateInfo<'a> {
 }
 
 pub struct Device {
+    thread_pool: rayon::ThreadPool,
+    pipeline_cache: vk::PipelineCache,
+
     pub(crate) device: pumice::DeviceWrapper,
     pub(crate) physical_device: vk::PhysicalDevice,
     pub(crate) physical_device_properties: vk::PhysicalDeviceProperties,
@@ -72,6 +75,7 @@ pub struct Device {
     pub(crate) queue_families: Vec<QueueFamilyProperties>,
 
     // object handle storage
+    pub(crate) graphics_pipelines: SimpleStorage<GraphicsPipeline>,
     pub(crate) image_storage: SimpleStorage<Image>,
     pub(crate) buffer_storage: SimpleStorage<Buffer>,
     pub(crate) swapchain_storage: SimpleStorage<Swapchain>,
@@ -234,7 +238,16 @@ impl Device {
             Allocator::new(&info).unwrap()
         };
 
+        let name = instance.app_name().to_owned();
+        let thread_pool = rayon::ThreadPoolBuilder::new()
+            .thread_name(move |i| format!("{name} worker #{i}"))
+            .build()
+            .unwrap();
+
         let inner = Device {
+            pipeline_cache: vk::PipelineCache::null(),
+            thread_pool,
+
             instance,
             device,
             physical_device,
@@ -245,6 +258,7 @@ impl Device {
             queue_selection_mapping,
             queues,
 
+            graphics_pipelines: SimpleStorage::new(),
             image_storage: SimpleStorage::new(),
             buffer_storage: SimpleStorage::new(),
             swapchain_storage: SimpleStorage::new(),
@@ -260,11 +274,17 @@ impl Device {
 
         OwnedDevice(Arc::new(inner))
     }
+    pub fn pipeline_cache(&self) -> vk::PipelineCache {
+        self.pipeline_cache
+    }
     pub fn device(&self) -> &pumice::DeviceWrapper {
         &self.device
     }
     pub fn physical_device(&self) -> vk::PhysicalDevice {
         self.physical_device
+    }
+    pub fn threadpool(&self) -> &rayon::ThreadPool {
+        &self.thread_pool
     }
     pub fn allocator(&self) -> &Allocator {
         &self.allocator
@@ -351,8 +371,14 @@ impl Drop for Device {
     // the users to not do that
     fn drop(&mut self) {
         unsafe {
+            let callbacks = self.allocator_callbacks();
+
             self.device().device_wait_idle().unwrap();
-            self.device().destroy_device(self.allocator_callbacks());
+            if self.pipeline_cache != vk::PipelineCache::null() {
+                self.device()
+                    .destroy_pipeline_cache(self.pipeline_cache, callbacks)
+            }
+            self.device().destroy_device(callbacks);
         }
     }
 }
@@ -411,7 +437,7 @@ pub(crate) unsafe fn __test_init_device(mock_device: bool) -> OwnedDevice {
         config: &mut conf,
         validation_layers: &[pumice::cstr!("VK_LAYER_KHRONOS_validation")],
         enable_debug_callback: true,
-        app_name: pumice::cstr!("test_context_new"),
+        app_name: "test_context_new".to_owned(),
         verbose: false,
     };
     let instance = Instance::new(info);

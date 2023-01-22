@@ -25,6 +25,10 @@ struct OpenGenerationEntry {
     submissions: UnsafeCell<ahash::HashSet<QueueSubmission>>,
 }
 
+/// Internally synchronized with a parking_lot::RawMutex
+unsafe impl Send for OpenGenerationEntry {}
+unsafe impl Sync for OpenGenerationEntry {}
+
 enum GenerationEntry {
     Open(Arc<OpenGenerationEntry>),
     Closed(Generation),

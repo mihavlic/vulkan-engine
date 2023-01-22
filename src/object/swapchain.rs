@@ -56,7 +56,7 @@ impl SwapchainImage {
             state: ImageMutableState::new(vk::ImageLayout::UNDEFINED),
         }
     }
-    unsafe fn destroy(self, ctx: &Device) {
+    unsafe fn destroy(&mut self, ctx: &Device) {
         self.state.destroy(ctx);
     }
 }
@@ -153,7 +153,7 @@ impl SwapchainMutableState {
             self.images
                 .resize_with(new_len, || SwapchainImage::new(vk::Image::null(), ctx));
         } else if new_len < old_len {
-            for image in self.images.drain(new_len..) {
+            for mut image in self.images.drain(new_len..) {
                 image.destroy(ctx);
             }
         }
@@ -206,9 +206,8 @@ impl SwapchainMutableState {
     pub fn get_image_data(&self, image_index: u32) -> &SwapchainImage {
         &self.images[image_index as usize]
     }
-
     pub unsafe fn destroy(&mut self, ctx: &Device) {
-        for data in self.images.drain(..) {
+        for mut data in self.images.drain(..) {
             data.destroy(ctx);
         }
         if self.swapchain != vk::SwapchainKHR::null() {
@@ -269,8 +268,7 @@ impl ObjectData for SwapchainState {
     }
 }
 
-#[derive(Clone)]
-pub struct Swapchain(pub(crate) ArcHandle<Self>);
+create_object! {Swapchain}
 impl Object for Swapchain {
     type Storage = SimpleStorage<Self>;
     type Parent = Device;

@@ -15,7 +15,8 @@ pumice-vma = {path = "../pumice-vma/pumice-vma"}
 
 ahash = {version = "0.8.2", default-features = false, features = ["std"]}
 smallvec = {version = "1.10.0", features = ["union", "const_generics"]}
-parking_lot = "0.12.1"
+parking_lot = {version = "0.12.1", features = ["send_guard"]}
+rayon = "1.6.1"
 slice-group-by = "0.3.0"
 
 raw-window-handle = "0.5.0"

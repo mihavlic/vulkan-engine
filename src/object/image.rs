@@ -185,14 +185,14 @@ impl ImageViewCreateInfo {
 }
 
 pub(crate) struct ImageViewEntry {
-    pub(crate) handle: vk::ImageView,
-    pub(crate) info_hash: u32,
-    pub(crate) last_use: GenerationId,
+    handle: vk::ImageView,
+    info_hash: u32,
+    last_use: GenerationId,
 }
 
 pub struct ImageMutableState {
-    pub(crate) views: SmallVec<[ImageViewEntry; 2]>,
-    pub(crate) synchronization: SynchronizationState<ImageMarker>,
+    views: SmallVec<[ImageViewEntry; 2]>,
+    synchronization: SynchronizationState<ImageMarker>,
 }
 
 impl ImageMutableState {
@@ -239,11 +239,10 @@ impl ImageMutableState {
             VulkanResult::Ok(view)
         }
     }
-    pub unsafe fn destroy(self, device: &Device) {
-        for view in self.views {
-            device
-                .device()
-                .destroy_image_view(view.handle, device.allocator_callbacks());
+    pub unsafe fn destroy(&mut self, ctx: &Device) {
+        for view in self.views.drain(..) {
+            ctx.device()
+                .destroy_image_view(view.handle, ctx.allocator_callbacks());
         }
     }
 }
@@ -292,8 +291,7 @@ impl ObjectData for ImageState {
     }
 }
 
-#[derive(Clone)]
-pub struct Image(pub(crate) ArcHandle<Self>);
+create_object! {Image}
 impl Object for Image {
     type Storage = SimpleStorage<Self>;
     type Parent = Device;
@@ -314,9 +312,10 @@ impl Object for Image {
     }
     unsafe fn destroy(
         data: &Self::Data,
-        _lock: &SynchronizationLock,
+        lock: &SynchronizationLock,
         ctx: &Self::Parent,
     ) -> VulkanResult<()> {
+        data.mutable.get_mut(lock).destroy(ctx);
         ctx.allocator.destroy_image(data.handle, data.allocation);
         VulkanResult::Ok(())
     }

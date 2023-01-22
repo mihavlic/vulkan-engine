@@ -128,11 +128,10 @@ impl BufferMutableState {
             VulkanResult::Ok(view)
         }
     }
-    pub unsafe fn destroy(self, device: &Device) {
-        for view in self.views {
-            device
-                .device()
-                .destroy_buffer_view(view.handle, device.allocator_callbacks());
+    pub unsafe fn destroy(&mut self, ctx: &Device) {
+        for view in self.views.drain(..) {
+            ctx.device()
+                .destroy_buffer_view(view.handle, ctx.allocator_callbacks());
         }
     }
 }
@@ -178,9 +177,7 @@ impl ObjectData for BufferState {
         self.handle
     }
 }
-
-#[derive(Clone)]
-pub struct Buffer(pub(crate) ArcHandle<Self>);
+create_object! {Buffer}
 impl Object for Buffer {
     type Storage = SimpleStorage<Self>;
     type Parent = Device;
@@ -201,9 +198,10 @@ impl Object for Buffer {
     }
     unsafe fn destroy(
         data: &Self::Data,
-        _lock: &SynchronizationLock,
+        lock: &SynchronizationLock,
         ctx: &Self::Parent,
     ) -> VulkanResult<()> {
+        data.mutable.get_mut(lock).destroy(ctx);
         ctx.allocator.destroy_buffer(data.handle, data.allocation);
         VulkanResult::Ok(())
     }

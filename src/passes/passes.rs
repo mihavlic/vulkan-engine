@@ -1,6 +1,8 @@
 use pumice::vk;
 
-use super::{CreatePass, GraphImage, RenderPass};
+use crate::graph::{GraphContext, GraphImage};
+
+use super::{CreatePass, RenderPass};
 
 pub struct ClearImage {
     pub image: GraphImage,
@@ -8,12 +10,12 @@ pub struct ClearImage {
 }
 
 impl CreatePass for ClearImage {
-    type Pass = Self;
-    fn create(
-        self,
-        builder: &mut super::GraphPassBuilder,
-        _device: &crate::device::Device,
-    ) -> Self::Pass {
+    type PreparedData = ();
+    fn prepare(
+        &mut self,
+        builder: &mut crate::graph::GraphPassBuilder,
+        device: &crate::device::Device,
+    ) -> Self::PreparedData {
         builder.use_image(
             self.image,
             vk::ImageUsageFlags::TRANSFER_DST,
@@ -22,7 +24,9 @@ impl CreatePass for ClearImage {
             vk::ImageLayout::GENERAL,
             None,
         );
-        self
+    }
+    fn create(self, prepared: Self::PreparedData, ctx: &mut GraphContext) -> Box<dyn RenderPass> {
+        Box::new(self)
     }
 }
 
@@ -31,7 +35,7 @@ impl RenderPass for ClearImage {
         {}
     }
     unsafe fn execute(
-        self,
+        &mut self,
         executor: &super::GraphExecutor,
         device: &crate::device::Device,
     ) -> pumice::VulkanResult<()> {

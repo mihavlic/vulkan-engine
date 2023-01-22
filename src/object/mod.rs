@@ -1,10 +1,32 @@
+macro_rules! create_object {
+    ($name:ident) => {
+        #[derive(Clone, PartialEq, Eq)]
+        pub struct $name(pub(crate) $crate::object::ArcHandle<Self>);
+
+        unsafe impl Send for $name {}
+        unsafe impl Sync for $name {}
+    };
+}
+
 mod buffer;
+mod descriptor_set_layout;
+mod graphics_pipeline;
 mod image;
+mod pipeline_layout;
+mod render_pass;
+mod sampler;
+mod shader_module;
 mod surface;
 mod swapchain;
 
 pub use buffer::*;
+pub use descriptor_set_layout::*;
+pub use graphics_pipeline::*;
 pub use image::*;
+pub use pipeline_layout::*;
+pub use render_pass::*;
+pub use sampler::*;
+pub use shader_module::*;
 pub use surface::*;
 pub use swapchain::*;
 
@@ -42,6 +64,10 @@ pub(crate) trait Object: Sized {
 
 pub(crate) struct ArcHandle<T: Object>(pub(crate) NonNull<ArcHeader<T>>);
 
+/// Pointed-to object is atomically reference counted, fields are either immutable or synchronized with MutableShared
+unsafe impl<T: Object + Send> Send for ArcHandle<T> {}
+unsafe impl<T: Object + Sync> Sync for ArcHandle<T> {}
+
 impl<T: Object> ArcHandle<T> {
     pub(crate) unsafe fn get_object_data(&self) -> &T::Data {
         &self.0.as_ref().object_data
@@ -71,6 +97,10 @@ impl<T: Object> ArcHandle<T> {
     pub(crate) unsafe fn make_weak_copy(&self) -> ManuallyDrop<Self> {
         ManuallyDrop::new(std::ptr::read(self))
     }
+    pub(crate) unsafe fn lock_storage(&self) -> SynchronizationLock<'_> {
+        let storage = self.get_parent_storage();
+        storage.acquire_exclusive(self)
+    }
     pub(crate) unsafe fn access_mutable<
         A,
         B,
@@ -81,8 +111,7 @@ impl<T: Object> ArcHandle<T> {
         fun1: F,
         fun2: F2,
     ) -> B {
-        let storage = self.get_parent_storage();
-        let lock = storage.acquire_exclusive(self);
+        let lock = self.lock_storage();
 
         let mutable = fun1(&self.get_object_data());
         let mut refmut = mutable.get_mut(&lock);
@@ -202,5 +231,31 @@ impl<T: Object> Drop for ArcHandle<T> {
                 T::Storage::destroy(storage, self).unwrap();
             }
         }
+    }
+}
+
+pub(crate) struct BasicObjectData<H: Copy, I> {
+    handle: H,
+    info: I,
+}
+
+impl<H: Copy, I> BasicObjectData<H, I> {
+    fn new_result(handle: VulkanResult<H>, info: I) -> VulkanResult<Self> {
+        handle.map(|handle| Self { handle, info })
+    }
+    fn new(handle: H, info: I) -> VulkanResult<Self> {
+        Ok(Self { handle, info })
+    }
+}
+
+impl<H: Copy, I> ObjectData for BasicObjectData<H, I> {
+    type CreateInfo = I;
+    type Handle = H;
+
+    fn get_create_info(&self) -> &Self::CreateInfo {
+        &self.info
+    }
+    fn get_handle(&self) -> Self::Handle {
+        self.handle
     }
 }
