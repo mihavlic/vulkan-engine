@@ -23,9 +23,9 @@ impl<T: Object> SimpleStorage<T> {
 impl<T: Object<Storage = Self>> ObjectStorage<T> for SimpleStorage<T> {
     type StorageData = ();
 
-    unsafe fn get_or_create(
+    unsafe fn get_or_create<'a>(
         &self,
-        data: T::InputData,
+        data: T::InputData<'a>,
         ctx: NonNull<T::Parent>,
     ) -> VulkanResult<ArcHandle<T>> {
         self.lock.with_locked(|lock| {

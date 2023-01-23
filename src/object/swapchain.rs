@@ -120,9 +120,18 @@ impl SwapchainMutableState {
         self.current_extent = extent.clone();
         self.resized_to = None;
 
+        let max_image_count = if surface_info.max_image_count == 0 {
+            u32::MAX
+        } else {
+            surface_info.max_image_count
+        };
+
         let create_info = vk::SwapchainCreateInfoKHR {
             image_extent: extent,
             old_swapchain: self.swapchain,
+            min_image_count: create_info
+                .min_image_count
+                .clamp(surface_info.min_image_count, max_image_count),
             ..create_info.to_vk()
         };
 
@@ -273,10 +282,13 @@ impl Object for Swapchain {
     type Storage = SimpleStorage<Self>;
     type Parent = Device;
 
-    type InputData = SwapchainCreateInfo;
+    type InputData<'a> = SwapchainCreateInfo;
     type Data = SwapchainState;
 
-    unsafe fn create(data: Self::InputData, ctx: &Self::Parent) -> VulkanResult<Self::Data> {
+    unsafe fn create<'a>(
+        data: Self::InputData<'a>,
+        ctx: &Self::Parent,
+    ) -> VulkanResult<Self::Data> {
         SwapchainMutableState::new(&data, ctx).map(|state| SwapchainState {
             info: data,
             mutable: MutableShared::new(state),

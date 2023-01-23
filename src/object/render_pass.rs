@@ -76,10 +76,13 @@ impl Object for RenderPass {
     type Storage = SimpleStorage<Self>;
     type Parent = Device;
 
-    type InputData = RenderPassCreateInfo;
+    type InputData<'a> = RenderPassCreateInfo;
     type Data = BasicObjectData<vk::RenderPass, RenderPassCreateInfo>;
 
-    unsafe fn create(data: Self::InputData, ctx: &Self::Parent) -> VulkanResult<Self::Data> {
+    unsafe fn create<'a>(
+        data: Self::InputData<'a>,
+        ctx: &Self::Parent,
+    ) -> VulkanResult<Self::Data> {
         BasicObjectData::new_result(data.create(ctx), data)
     }
 
@@ -94,6 +97,6 @@ impl Object for RenderPass {
     }
 
     unsafe fn get_storage(parent: &Self::Parent) -> &Self::Storage {
-        todo!()
+        &parent.render_passes
     }
 }

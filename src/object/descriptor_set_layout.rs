@@ -144,10 +144,13 @@ impl Object for DescriptorSetLayout {
     type Storage = SimpleStorage<Self>;
     type Parent = Device;
 
-    type InputData = DescriptorSetLayoutCreateInfo;
+    type InputData<'a> = DescriptorSetLayoutCreateInfo;
     type Data = BasicObjectData<vk::DescriptorSetLayout, DescriptorSetLayoutCreateInfo>;
 
-    unsafe fn create(data: Self::InputData, ctx: &Self::Parent) -> VulkanResult<Self::Data> {
+    unsafe fn create<'a>(
+        data: Self::InputData<'a>,
+        ctx: &Self::Parent,
+    ) -> VulkanResult<Self::Data> {
         BasicObjectData::new_result(data.create(ctx), data)
     }
 
@@ -162,6 +165,6 @@ impl Object for DescriptorSetLayout {
     }
 
     unsafe fn get_storage(parent: &Self::Parent) -> &Self::Storage {
-        todo!()
+        &parent.descriptor_set_layouts
     }
 }

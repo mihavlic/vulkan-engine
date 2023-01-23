@@ -52,9 +52,9 @@ impl<'a, T> DerefMut for ObjectReadWrite<'a, T> {
 
 pub(crate) trait ObjectStorage<T: Object>: Sized {
     type StorageData;
-    unsafe fn get_or_create(
+    unsafe fn get_or_create<'a>(
         &self,
-        data: T::InputData,
+        data: T::InputData<'a>,
         ctx: NonNull<T::Parent>,
     ) -> VulkanResult<ArcHandle<T>>;
 

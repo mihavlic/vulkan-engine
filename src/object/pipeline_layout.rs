@@ -14,11 +14,18 @@ use smallvec::SmallVec;
 
 pub struct PipelineLayoutCreateInfo {
     pub flags: vk::PipelineLayoutCreateFlags,
-    pub set_layouts: SmallVec<[super::descriptor_set_layout::DescriptorSetLayout; 4]>,
+    pub set_layouts: SmallVec<[super::DescriptorSetLayout; 4]>,
     pub push_constants: SmallVec<[vk::PushConstantRange; 4]>,
 }
 
 impl PipelineLayoutCreateInfo {
+    pub const fn empty() -> Self {
+        Self {
+            flags: vk::PipelineLayoutCreateFlags::empty(),
+            set_layouts: SmallVec::new(),
+            push_constants: SmallVec::new(),
+        }
+    }
     pub unsafe fn create(&self, ctx: &Device) -> VulkanResult<vk::PipelineLayout> {
         let mut layouts = self
             .set_layouts
@@ -45,10 +52,13 @@ impl Object for PipelineLayout {
     type Storage = SimpleStorage<Self>;
     type Parent = Device;
 
-    type InputData = PipelineLayoutCreateInfo;
+    type InputData<'a> = PipelineLayoutCreateInfo;
     type Data = BasicObjectData<vk::PipelineLayout, PipelineLayoutCreateInfo>;
 
-    unsafe fn create(data: Self::InputData, ctx: &Self::Parent) -> VulkanResult<Self::Data> {
+    unsafe fn create<'a>(
+        data: Self::InputData<'a>,
+        ctx: &Self::Parent,
+    ) -> VulkanResult<Self::Data> {
         BasicObjectData::new_result(data.create(ctx), data)
     }
 
@@ -63,6 +73,6 @@ impl Object for PipelineLayout {
     }
 
     unsafe fn get_storage(parent: &Self::Parent) -> &Self::Storage {
-        todo!()
+        &parent.pipeline_layouts
     }
 }

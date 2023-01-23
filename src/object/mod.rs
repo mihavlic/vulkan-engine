@@ -48,10 +48,11 @@ pub(crate) trait Object: Sized {
     type Storage: ObjectStorage<Self> + Sync;
     type Parent;
 
-    type InputData;
+    type InputData<'b>;
     type Data: ObjectData;
 
-    unsafe fn create(data: Self::InputData, ctx: &Self::Parent) -> VulkanResult<Self::Data>;
+    unsafe fn create<'a>(data: Self::InputData<'a>, ctx: &Self::Parent)
+        -> VulkanResult<Self::Data>;
 
     unsafe fn destroy(
         data: &Self::Data,

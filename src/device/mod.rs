@@ -8,7 +8,10 @@ use self::{
 use super::instance::InstanceCreateInfo;
 use crate::{
     instance::Instance,
-    object::{self, Buffer, GraphicsPipeline, Image, Swapchain},
+    object::{
+        self, Buffer, DescriptorSetLayout, GraphicsPipeline, Image, PipelineLayout, RenderPass,
+        ShaderModule, Swapchain,
+    },
     storage::{nostore::SimpleStorage, ObjectStorage},
     tracing::shim_macros::{info, trace},
     util::format_utils::{self},
@@ -75,6 +78,10 @@ pub struct Device {
     pub(crate) queue_families: Vec<QueueFamilyProperties>,
 
     // object handle storage
+    pub(crate) shader_modules: SimpleStorage<ShaderModule>,
+    pub(crate) render_passes: SimpleStorage<RenderPass>,
+    pub(crate) pipeline_layouts: SimpleStorage<PipelineLayout>,
+    pub(crate) descriptor_set_layouts: SimpleStorage<DescriptorSetLayout>,
     pub(crate) graphics_pipelines: SimpleStorage<GraphicsPipeline>,
     pub(crate) image_storage: SimpleStorage<Image>,
     pub(crate) buffer_storage: SimpleStorage<Buffer>,
@@ -258,6 +265,10 @@ impl Device {
             queue_selection_mapping,
             queues,
 
+            shader_modules: SimpleStorage::new(),
+            render_passes: SimpleStorage::new(),
+            pipeline_layouts: SimpleStorage::new(),
+            descriptor_set_layouts: SimpleStorage::new(),
             graphics_pipelines: SimpleStorage::new(),
             image_storage: SimpleStorage::new(),
             buffer_storage: SimpleStorage::new(),
@@ -317,6 +328,30 @@ impl Device {
     ) -> Option<&vk::QueueFamilyProperties> {
         self.queue_families
             .get(self.queue_selection_mapping.get(selection_index)?.0)
+    }
+    pub unsafe fn create_shader_module(
+        &self,
+        data: impl AsRef<[u32]>,
+    ) -> VulkanResult<object::ShaderModule> {
+        self.shader_modules
+            .get_or_create(data.as_ref(), NonNull::from(self))
+            .map(object::ShaderModule)
+    }
+    pub unsafe fn create_descriptor_set_layout(
+        &self,
+        info: object::DescriptorSetLayoutCreateInfo,
+    ) -> VulkanResult<object::DescriptorSetLayout> {
+        self.descriptor_set_layouts
+            .get_or_create(info, NonNull::from(self))
+            .map(object::DescriptorSetLayout)
+    }
+    pub unsafe fn create_pipeline_layout(
+        &self,
+        info: object::PipelineLayoutCreateInfo,
+    ) -> VulkanResult<object::PipelineLayout> {
+        self.pipeline_layouts
+            .get_or_create(info, NonNull::from(self))
+            .map(object::PipelineLayout)
     }
     pub unsafe fn create_image(
         &self,

@@ -296,10 +296,13 @@ impl Object for Image {
     type Storage = SimpleStorage<Self>;
     type Parent = Device;
 
-    type InputData = (ImageCreateInfo, pumice_vma::AllocationCreateInfo);
+    type InputData<'a> = (ImageCreateInfo, pumice_vma::AllocationCreateInfo);
     type Data = ImageState;
 
-    unsafe fn create(data: Self::InputData, ctx: &Self::Parent) -> VulkanResult<Self::Data> {
+    unsafe fn create<'a>(
+        data: Self::InputData<'a>,
+        ctx: &Self::Parent,
+    ) -> VulkanResult<Self::Data> {
         let image_info = data.0.to_vk();
         ctx.allocator
             .create_image(&image_info, &data.1)

@@ -182,10 +182,13 @@ impl Object for Buffer {
     type Storage = SimpleStorage<Self>;
     type Parent = Device;
 
-    type InputData = (BufferCreateInfo, pumice_vma::AllocationCreateInfo);
+    type InputData<'a> = (BufferCreateInfo, pumice_vma::AllocationCreateInfo);
     type Data = BufferState;
 
-    unsafe fn create(data: Self::InputData, ctx: &Self::Parent) -> VulkanResult<Self::Data> {
+    unsafe fn create<'a>(
+        data: Self::InputData<'a>,
+        ctx: &Self::Parent,
+    ) -> VulkanResult<Self::Data> {
         let buffer_info = data.0.to_vk();
         ctx.allocator
             .create_buffer(&buffer_info, &data.1)
