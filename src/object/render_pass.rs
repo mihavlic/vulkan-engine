@@ -72,6 +72,7 @@ impl RenderPassCreateInfo {
 }
 
 create_object! {RenderPass}
+derive_raw_handle! {RenderPass, vk::RenderPass}
 impl Object for RenderPass {
     type Storage = SimpleStorage<Self>;
     type Parent = Device;

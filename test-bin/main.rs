@@ -96,7 +96,7 @@ fn main() {
             .unwrap();
 
         let pipeline_info = object::GraphicsPipelineCreateInfo {
-            flags: vk::PipelineCreateFlags,
+            flags: vk::PipelineCreateFlags::empty(),
             stages: [
                 PipelineStage {
                     flags: vk::PipelineShaderStageCreateFlags::empty(),
@@ -113,23 +113,26 @@ fn main() {
                     specialization_info: None,
                 },
             ]
-            .to_owned(),
-            vertex_input_state: object::VertexInput {},
-            input_assembly_state: vk::PipelineInputAssemblyStateCreateInfo {
-                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-                primitive_restart_enable: vk::FALSE,
+            .to_vec(),
+            vertex_input: Default::default(),
+            input_assembly: Default::default(),
+            tessellation: Default::default(),
+            viewport: Default::default(),
+            rasterization: object::state::Rasterization {
+                depth_clamp_enable: false,
+                rasterizer_discard_enable: false,
+                polygon_mode: vk::PolygonMode::FILL,
+                cull_mode: vk::CullModeFlags::NONE,
+                front_face: vk::FrontFace::CLOCKWISE,
                 ..Default::default()
             },
-            tessellation_state: todo!(),
-            viewport_state: todo!(),
-            rasterization_state: todo!(),
-            multisample_state: todo!(),
-            depth_stencil_state: todo!(),
-            color_blend_state: todo!(),
-            dynamic_state: todo!(),
-            layout: todo!(),
-            render_pass: todo!(),
-            base_pipeline: todo!(),
+            multisample: Default::default(),
+            depth_stencil: Default::default(),
+            color_blend: Default::default(),
+            dynamic_state: Default::default(),
+            layout: empty_layout,
+            render_pass: object::RenderPassMode::Delayed,
+            base_pipeline: object::BasePipeline::None,
         };
 
         let mut graph = Graph::new(device.clone());

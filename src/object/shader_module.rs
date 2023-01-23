@@ -11,6 +11,7 @@ use pumice::vk;
 use pumice::VulkanResult;
 
 create_object! {ShaderModule}
+derive_raw_handle! {ShaderModule, vk::ShaderModule}
 impl Object for ShaderModule {
     type Storage = SimpleStorage<Self>;
     type Parent = Device;

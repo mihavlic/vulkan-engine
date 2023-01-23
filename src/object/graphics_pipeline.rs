@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    ffi::{c_char, CStr},
+    ffi::{c_char, c_void, CStr},
     hash::{Hash, Hasher},
     ptr, slice,
     sync::Arc,
@@ -29,22 +29,9 @@ pub struct SpecializationInfo {
 pub struct PipelineStage {
     pub flags: vk::PipelineShaderStageCreateFlags,
     pub stage: vk::ShaderStageFlags,
-    pub module: vk::ShaderModule,
+    pub module: super::ShaderModule,
     pub name: Cow<'static, str>,
     pub specialization_info: Option<SpecializationInfo>,
-}
-
-impl PipelineStage {
-    fn to_vk(&self) -> vk::PipelineShaderStageCreateInfo {
-        vk::PipelineShaderStageCreateInfo {
-            flags: self.flags,
-            stage: self.stage,
-            module: self.module,
-            p_name: self.name.as_ptr() as *const std::ffi::c_char,
-            p_specialization_info: todo!(),
-            ..Default::default()
-        }
-    }
 }
 
 pub struct PipelineRenderingCreateInfoKHR {
@@ -69,6 +56,7 @@ pub enum RenderPassMode {
         depth: vk::Format,
         stencil: vk::Format,
     },
+    Delayed,
 }
 
 impl RenderPassMode {
@@ -100,6 +88,9 @@ impl Hash for RenderPassMode {
                 colors.hash(state);
                 depth.hash(state);
                 stencil.hash(state);
+            }
+            RenderPassMode::Delayed => {
+                panic!("RenderPassMode::Delayed should only be used for Pipeline handle creation")
             }
         }
     }
@@ -243,7 +234,7 @@ struct CStrIterator<'a>(Option<slice::Iter<'a, u8>>);
 impl<'a> Iterator for CStrIterator<'a> {
     type Item = c_char;
     fn next(&mut self) -> Option<Self::Item> {
-        match self.0 {
+        match &mut self.0 {
             Some(iter) => match iter.next() {
                 Some(next) => Some(unsafe { std::mem::transmute::<u8, c_char>(*next) }),
                 None => {
@@ -258,7 +249,7 @@ impl<'a> Iterator for CStrIterator<'a> {
 
 impl<'a> ExactSizeIterator for CStrIterator<'a> {
     fn len(&self) -> usize {
-        match self.0 {
+        match &self.0 {
             Some(iter) => iter.len() + 1,
             None => 0,
         }
@@ -270,8 +261,8 @@ impl<'a> ExactSizeIterator for CStrIterator<'a> {
 }
 
 impl<'a> CStrIterator<'a> {
-    pub fn new(bytes: impl AsRef<[u8]>) -> Self {
-        Self(Some(bytes.as_ref().into_iter()))
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self(Some(bytes.into_iter()))
     }
 }
 
@@ -283,315 +274,242 @@ impl<F: FnOnce()> Drop for DropClosure<F> {
     }
 }
 
+macro_rules! add_pnext {
+    ($head:expr, $next:expr) => {
+        $next.p_next = $head;
+        $head = $next as *const _ as *const std::ffi::c_void;
+    };
+}
+
 impl GraphicsPipelineCreateInfo {
-    pub unsafe fn create_multiple<I: IntoIterator<Item = Self>>(
-        this: I,
-        pipeline_cache: vk::PipelineCache,
-        bump: &mut Bump,
-        ctx: &Device,
-    ) -> VulkanResult<(Vec<vk::Pipeline>, vk::Result)>
-    where
-        I::IntoIter: ExactSizeIterator,
-    {
-        let this = this.into_iter();
-        assert!(this.len() > 0);
+    pub unsafe fn to_vk(&self, bump: &Bump, ctx: &Device) -> vk::GraphicsPipelineCreateInfo {
+        let mut pnext_head: *const std::ffi::c_void = std::ptr::null();
 
-        let mut delayed_drop: SmallVec<[(*const (), std::alloc::Layout); 4]> = SmallVec::new();
+        let (render_pass, subpass) =
+            raw_info_handle_renderpass(&self.render_pass, &mut pnext_head, bump);
 
-        fn delay_dealloc<T>(
-            vec: Vec<T>,
-            delay: &mut SmallVec<[(*const (), std::alloc::Layout); 4]>,
-        ) -> (*const T, u32) {
-            if vec.is_empty() {
-                return (std::ptr::null(), 0);
-            }
-
-            let (ptr, len, capacity) = (vec.as_ptr(), vec.len(), vec.capacity());
-            std::mem::forget(vec);
-
-            let layout = std::alloc::Layout::array::<T>(capacity).unwrap();
-            delay.push((ptr.cast(), layout));
-
-            (ptr, len as u32)
-        }
-
-        fn delay_dealloc_small<T, A: Array<Item = T>>(
-            vec: SmallVec<A>,
-            delay: &mut SmallVec<[(*const (), std::alloc::Layout); 4]>,
-            bump: &Bump,
-        ) -> (*const T, u32) {
-            if vec.is_empty() {
-                return (std::ptr::null(), 0);
-            }
-
-            if vec.spilled() {
-                let (ptr, len, capacity) = (vec.as_ptr(), vec.len(), vec.capacity());
-                std::mem::forget(vec);
-
-                let layout = std::alloc::Layout::array::<T>(capacity).unwrap();
-                delay.push((ptr.cast(), layout));
-
-                (ptr, len as u32)
-            } else {
-                let len = vec.len();
-                let ptr = bump.alloc_slice_fill_iter(vec.into_iter());
-                (ptr.as_ptr(), len as u32)
-            }
-        }
-
-        let create_infos = this.map(|pipeline| {
-            let mut pnext_head: *const std::ffi::c_void = std::ptr::null();
-
-            macro_rules! add_pnext {
-                ($head:expr) => {
-                    let ptr = &mut $head;
-                    ptr.p_next = pnext_head;
-                    pnext_head = ptr as *const _ as *const std::ffi::c_void;
-                };
-            }
-
-            let mut handle = None;
-            let (render_pass, subpass) = match pipeline.render_pass {
-                RenderPassMode::Normal {
-                    render_pass,
-                    subpass,
-                } => {
-                    handle = Some(render_pass);
-                    (handle.as_ref().unwrap().0.get_handle(), subpass)
-                }
-                RenderPassMode::Dynamic {
-                    view_mask,
-                    colors,
-                    depth,
-                    stencil,
-                } => {
-                    let (p_colors, colors_len) =
-                        delay_dealloc_small(colors, &mut delayed_drop, bump);
-                    let info = vk::PipelineRenderingCreateInfoKHR {
-                        view_mask,
-                        color_attachment_count: colors_len,
-                        p_color_attachment_formats: p_colors,
-                        depth_attachment_format: depth,
-                        stencil_attachment_format: stencil,
-                        ..Default::default()
-                    };
-                    let info = bump.alloc(info);
-                    add_pnext!(info);
-                    (vk::RenderPass::null(), 0)
-                }
+        let stages = bump.alloc_slice_fill_iter(self.stages.iter().map(|s| {
+            const MAIN_CSTR: &CStr = pumice::cstr!("main");
+            let name = match s.name.as_ref() {
+                "main" => MAIN_CSTR.as_ptr(),
+                other => bump
+                    .alloc_slice_fill_iter(CStrIterator::new(s.name.as_bytes()))
+                    .as_ptr() as *const c_char,
             };
-
-            let stages = bump.alloc_slice_fill_iter(pipeline.stages.into_iter().map(|s| {
-                const MAIN_CSTR: &CStr = pumice::cstr!("main");
-                let name = match s.name.as_ref() {
-                    "main" => MAIN_CSTR.as_ptr(),
-                    other => bump
-                        .alloc_slice_fill_iter(CStrIterator::new(s.name.as_bytes()))
-                        .as_ptr() as *const c_char,
+            let info = |i: &SpecializationInfo| {
+                let info = vk::SpecializationInfo {
+                    map_entry_count: i.map_entries.len() as u32,
+                    p_map_entries: i.map_entries.as_ffi_ptr(),
+                    data_size: i.data.len(),
+                    p_data: i.data.as_ffi_ptr().cast(),
                 };
-                let info = |i: SpecializationInfo| {
-                    let data_len = i.data.len();
-                    let (p_entries, entries_len) = delay_dealloc(i.map_entries, &mut delayed_drop);
-                    let (p_data, _) = delay_dealloc(i.data, &mut delayed_drop);
-                    let info = vk::SpecializationInfo {
-                        map_entry_count: entries_len,
-                        p_map_entries: p_entries,
-                        data_size: data_len,
-                        p_data: p_data.cast(),
-                    };
-                    bump.alloc(info) as *const _
-                };
-                let p_specialization_info =
-                    s.specialization_info.map(info).unwrap_or(std::ptr::null());
-                vk::PipelineShaderStageCreateInfo {
-                    flags: s.flags,
-                    stage: s.stage,
-                    module: s.module,
-                    p_name: name,
-                    p_specialization_info,
-                    ..Default::default()
-                }
-            }));
-
-            let vertex_input = {
-                let a = pipeline.vertex_input;
-                let (p_vertex_binding_descriptions, vertex_binding_description_count) =
-                    delay_dealloc(a.vertex_bindings, &mut delayed_drop);
-                let (p_vertex_attribute_descriptions, vertex_attribute_description_count) =
-                    delay_dealloc(a.vertex_attributes, &mut delayed_drop);
-                let info = vk::PipelineVertexInputStateCreateInfo {
-                    vertex_binding_description_count,
-                    p_vertex_binding_descriptions,
-                    vertex_attribute_description_count,
-                    p_vertex_attribute_descriptions,
-                    ..Default::default()
-                };
-                bump.alloc(info)
+                bump.alloc(info) as *const _
             };
-
-            let input_assembly = {
-                let a = pipeline.input_assembly;
-                let info = vk::PipelineInputAssemblyStateCreateInfo {
-                    topology: a.topology,
-                    primitive_restart_enable: a.primitive_restart_enable as vk::Bool32,
-                    ..Default::default()
-                };
-                bump.alloc(info)
-            };
-
-            let tessellation = {
-                let a = pipeline.tessellation;
-                let info = vk::PipelineTessellationStateCreateInfo {
-                    patch_control_points: a.patch_control_points,
-                    ..Default::default()
-                };
-                bump.alloc(info)
-            };
-
-            let viewport = {
-                let a = pipeline.viewport;
-                let (p_viewports, viewport_count) = delay_dealloc(a.viewports, &mut delayed_drop);
-                let (p_scissors, scissor_count) = delay_dealloc(a.scissors, &mut delayed_drop);
-                let info = vk::PipelineViewportStateCreateInfo {
-                    viewport_count,
-                    p_viewports,
-                    scissor_count,
-                    p_scissors,
-                    ..Default::default()
-                };
-                bump.alloc(info)
-            };
-
-            let rasterization = {
-                let a = pipeline.rasterization;
-                let info = vk::PipelineRasterizationStateCreateInfo {
-                    depth_clamp_enable: a.depth_clamp_enable as vk::Bool32,
-                    rasterizer_discard_enable: a.rasterizer_discard_enable as vk::Bool32,
-                    polygon_mode: a.polygon_mode,
-                    cull_mode: a.cull_mode,
-                    front_face: a.front_face,
-                    depth_bias_enable: a.depth_bias_enable as vk::Bool32,
-                    depth_bias_constant_factor: a.depth_bias_constant_factor,
-                    depth_bias_clamp: a.depth_bias_clamp,
-                    depth_bias_slope_factor: a.depth_bias_slope_factor,
-                    line_width: a.line_width,
-                    ..Default::default()
-                };
-                bump.alloc(info)
-            };
-
-            let multisample = {
-                let a = pipeline.multisample;
-                let p_sample_mask = match a.sample_mask {
-                    Some(s) => {
-                        let (ptr, _) = delay_dealloc(s, &mut delayed_drop);
-                        ptr
-                    }
-                    None => std::ptr::null(),
-                };
-                let info = vk::PipelineMultisampleStateCreateInfo {
-                    rasterization_samples: a.rasterization_samples,
-                    sample_shading_enable: a.sample_shading_enable as vk::Bool32,
-                    min_sample_shading: a.min_sample_shading,
-                    p_sample_mask,
-                    alpha_to_coverage_enable: a.alpha_to_coverage_enable as vk::Bool32,
-                    alpha_to_one_enable: a.alpha_to_one_enable as vk::Bool32,
-                    ..Default::default()
-                };
-                bump.alloc(info)
-            };
-
-            let depth_stencil = {
-                let a = pipeline.depth_stencil;
-                let info = vk::PipelineDepthStencilStateCreateInfo {
-                    depth_test_enable: a.depth_test_enable as vk::Bool32,
-                    depth_write_enable: a.depth_write_enable as vk::Bool32,
-                    depth_compare_op: a.depth_compare_op,
-                    depth_bounds_test_enable: a.depth_bounds_test_enable as vk::Bool32,
-                    stencil_test_enable: a.stencil_test_enable as vk::Bool32,
-                    front: a.front,
-                    back: a.back,
-                    min_depth_bounds: a.min_depth_bounds,
-                    max_depth_bounds: a.max_depth_bounds,
-                    ..Default::default()
-                };
-                bump.alloc(info)
-            };
-
-            let color_blend = {
-                let a = pipeline.color_blend;
-                let (p_attachments, attachment_count) =
-                    delay_dealloc(a.attachments, &mut delayed_drop);
-                let info = vk::PipelineColorBlendStateCreateInfo {
-                    logic_op_enable: a.logic_op_enable as vk::Bool32,
-                    logic_op: a.logic_op,
-                    attachment_count,
-                    p_attachments,
-                    blend_constants: a.blend_constants,
-                    ..Default::default()
-                };
-                bump.alloc(info)
-            };
-
-            let dynamic_state = {
-                let a = pipeline.dynamic_state;
-                match a {
-                    None => std::ptr::null(),
-                    Some(a) => {
-                        let (p_dynamic_states, dynamic_state_count) =
-                            delay_dealloc(a.dynamic_states, &mut delayed_drop);
-                        let info = vk::PipelineDynamicStateCreateInfo {
-                            dynamic_state_count,
-                            p_dynamic_states,
-                            ..Default::default()
-                        };
-                        bump.alloc(info)
-                    }
-                }
-            };
-
-            let (base_pipeline_handle, base_pipeline_index) = match &pipeline.base_pipeline {
-                BasePipeline::Index(index) => (vk::Pipeline::null(), *index),
-                BasePipeline::Pipeline(handle) => (handle.get_handle(), -1),
-                BasePipeline::None => (vk::Pipeline::null(), -1),
-            };
-
-            vk::GraphicsPipelineCreateInfo {
-                p_next: pnext_head,
-                flags: pipeline.flags,
-                stage_count: stages.len() as u32,
-                p_stages: stages.as_ffi_ptr(),
-                p_vertex_input_state: vertex_input,
-                p_input_assembly_state: input_assembly,
-                p_tessellation_state: tessellation,
-                p_viewport_state: viewport,
-                p_rasterization_state: rasterization,
-                p_multisample_state: multisample,
-                p_depth_stencil_state: depth_stencil,
-                p_color_blend_state: color_blend,
-                p_dynamic_state: dynamic_state,
-                layout: pipeline.layout.0.get_handle(),
-                render_pass,
-                subpass,
-                base_pipeline_handle,
-                base_pipeline_index,
+            let p_specialization_info = s
+                .specialization_info
+                .as_ref()
+                .map(info)
+                .unwrap_or(std::ptr::null());
+            vk::PipelineShaderStageCreateInfo {
+                flags: s.flags,
+                stage: s.stage,
+                module: s.module.raw(),
+                p_name: name,
+                p_specialization_info,
                 ..Default::default()
             }
-        });
+        }));
 
-        let create_infos = bump.alloc_slice_fill_iter(create_infos);
+        let vertex_input = {
+            let a = &self.vertex_input;
+            let info = vk::PipelineVertexInputStateCreateInfo {
+                vertex_binding_description_count: a.vertex_bindings.len() as u32,
+                p_vertex_binding_descriptions: a.vertex_bindings.as_ffi_ptr(),
+                vertex_attribute_description_count: a.vertex_attributes.len() as u32,
+                p_vertex_attribute_descriptions: a.vertex_attributes.as_ffi_ptr(),
+                ..Default::default()
+            };
+            bump.alloc(info)
+        };
 
-        ctx.device().create_graphics_pipelines(
-            pipeline_cache,
-            create_infos,
-            ctx.allocator_callbacks(),
-        )
+        let input_assembly = {
+            let a = &self.input_assembly;
+            let info = vk::PipelineInputAssemblyStateCreateInfo {
+                topology: a.topology,
+                primitive_restart_enable: a.primitive_restart_enable as vk::Bool32,
+                ..Default::default()
+            };
+            bump.alloc(info)
+        };
+
+        let tessellation = {
+            let a = &self.tessellation;
+            let info = vk::PipelineTessellationStateCreateInfo {
+                patch_control_points: a.patch_control_points,
+                ..Default::default()
+            };
+            bump.alloc(info)
+        };
+
+        let viewport = {
+            let a = &self.viewport;
+            let info = vk::PipelineViewportStateCreateInfo {
+                viewport_count: a.viewports.len() as u32,
+                p_viewports: a.viewports.as_ffi_ptr(),
+                scissor_count: a.scissors.len() as u32,
+                p_scissors: a.scissors.as_ffi_ptr(),
+                ..Default::default()
+            };
+            bump.alloc(info)
+        };
+
+        let rasterization = {
+            let a = &self.rasterization;
+            let info = vk::PipelineRasterizationStateCreateInfo {
+                depth_clamp_enable: a.depth_clamp_enable as vk::Bool32,
+                rasterizer_discard_enable: a.rasterizer_discard_enable as vk::Bool32,
+                polygon_mode: a.polygon_mode,
+                cull_mode: a.cull_mode,
+                front_face: a.front_face,
+                depth_bias_enable: a.depth_bias_enable as vk::Bool32,
+                depth_bias_constant_factor: a.depth_bias_constant_factor,
+                depth_bias_clamp: a.depth_bias_clamp,
+                depth_bias_slope_factor: a.depth_bias_slope_factor,
+                line_width: a.line_width,
+                ..Default::default()
+            };
+            bump.alloc(info)
+        };
+
+        let multisample = {
+            let a = &self.multisample;
+            let p_sample_mask = match &a.sample_mask {
+                Some(s) => s.as_ffi_ptr(),
+                None => std::ptr::null(),
+            };
+            let info = vk::PipelineMultisampleStateCreateInfo {
+                rasterization_samples: a.rasterization_samples,
+                sample_shading_enable: a.sample_shading_enable as vk::Bool32,
+                min_sample_shading: a.min_sample_shading,
+                p_sample_mask,
+                alpha_to_coverage_enable: a.alpha_to_coverage_enable as vk::Bool32,
+                alpha_to_one_enable: a.alpha_to_one_enable as vk::Bool32,
+                ..Default::default()
+            };
+            bump.alloc(info)
+        };
+
+        let depth_stencil = {
+            let a = &self.depth_stencil;
+            let info = vk::PipelineDepthStencilStateCreateInfo {
+                depth_test_enable: a.depth_test_enable as vk::Bool32,
+                depth_write_enable: a.depth_write_enable as vk::Bool32,
+                depth_compare_op: a.depth_compare_op,
+                depth_bounds_test_enable: a.depth_bounds_test_enable as vk::Bool32,
+                stencil_test_enable: a.stencil_test_enable as vk::Bool32,
+                front: a.front.clone(),
+                back: a.back.clone(),
+                min_depth_bounds: a.min_depth_bounds,
+                max_depth_bounds: a.max_depth_bounds,
+                ..Default::default()
+            };
+            bump.alloc(info)
+        };
+
+        let color_blend = {
+            let a = &self.color_blend;
+            let info = vk::PipelineColorBlendStateCreateInfo {
+                logic_op_enable: a.logic_op_enable as vk::Bool32,
+                logic_op: a.logic_op,
+                attachment_count: a.attachments.len() as u32,
+                p_attachments: a.attachments.as_ffi_ptr(),
+                blend_constants: a.blend_constants,
+                ..Default::default()
+            };
+            bump.alloc(info)
+        };
+
+        let dynamic_state = {
+            let a = &self.dynamic_state;
+            match a {
+                None => std::ptr::null(),
+                Some(a) => {
+                    let info = vk::PipelineDynamicStateCreateInfo {
+                        dynamic_state_count: a.dynamic_states.len() as u32,
+                        p_dynamic_states: a.dynamic_states.as_ffi_ptr(),
+                        ..Default::default()
+                    };
+                    bump.alloc(info)
+                }
+            }
+        };
+
+        let (base_pipeline_handle, base_pipeline_index) = match &self.base_pipeline {
+            BasePipeline::Index(index) => (vk::Pipeline::null(), *index),
+            BasePipeline::Pipeline(handle) => (handle.get_handle(), -1),
+            BasePipeline::None => (vk::Pipeline::null(), -1),
+        };
+
+        vk::GraphicsPipelineCreateInfo {
+            p_next: pnext_head,
+            flags: self.flags,
+            stage_count: stages.len() as u32,
+            p_stages: stages.as_ffi_ptr(),
+            p_vertex_input_state: vertex_input,
+            p_input_assembly_state: input_assembly,
+            p_tessellation_state: tessellation,
+            p_viewport_state: viewport,
+            p_rasterization_state: rasterization,
+            p_multisample_state: multisample,
+            p_depth_stencil_state: depth_stencil,
+            p_color_blend_state: color_blend,
+            p_dynamic_state: dynamic_state,
+            layout: self.layout.0.get_handle(),
+            render_pass,
+            subpass,
+            base_pipeline_handle,
+            base_pipeline_index,
+            ..Default::default()
+        }
+    }
+}
+
+pub(crate) fn raw_info_handle_renderpass(
+    mode: &RenderPassMode,
+    pnext: &mut *const c_void,
+    bump: &Bump,
+) -> (vk::RenderPass, u32) {
+    match *mode {
+        RenderPassMode::Normal {
+            ref render_pass,
+            subpass,
+        } => (render_pass.raw(), subpass),
+        RenderPassMode::Dynamic {
+            view_mask,
+            ref colors,
+            depth,
+            stencil,
+        } => {
+            let info = vk::PipelineRenderingCreateInfoKHR {
+                view_mask,
+                color_attachment_count: colors.len() as u32,
+                p_color_attachment_formats: colors.as_ffi_ptr(),
+                depth_attachment_format: depth,
+                stencil_attachment_format: stencil,
+                ..Default::default()
+            };
+            let info = bump.alloc(info);
+            add_pnext!((*pnext), info);
+            (vk::RenderPass::null(), 0)
+        }
+        // the user must fill these themselves
+        RenderPassMode::Delayed => (vk::RenderPass::null(), 0),
     }
 }
 
 enum GraphicsPipelineEntryHandle {
     Promised(Arc<RawRwLock>),
-    Created(vk::Pipeline),
+    Created(vk::Pipeline, RenderPassMode),
 }
 
 pub(crate) struct GraphicsPipelineEntry {
@@ -628,7 +546,7 @@ impl GraphicsPipelineMutableState {
                 GraphicsPipelineEntryHandle::Promised(mutex) => {
                     GetPipelineResult::Promised(mutex.clone())
                 }
-                GraphicsPipelineEntryHandle::Created(ok) => GetPipelineResult::Ready(*ok),
+                GraphicsPipelineEntryHandle::Created(ok, _) => GetPipelineResult::Ready(*ok),
             }
         } else {
             let lock = make_lock();
@@ -641,13 +559,18 @@ impl GraphicsPipelineMutableState {
             GetPipelineResult::MustCreate(lock)
         }
     }
-    pub(crate) unsafe fn add_promised_pipeline(&mut self, handle: vk::Pipeline, mode_hash: u64) {
+    pub(crate) unsafe fn add_promised_pipeline(
+        &mut self,
+        handle: vk::Pipeline,
+        mode_hash: u64,
+        mode: RenderPassMode,
+    ) {
         if let Some(found) = self.pipelines.iter_mut().find(|e| e.mode_hash == mode_hash) {
             match &found.handle {
                 GraphicsPipelineEntryHandle::Promised(mutex) => {
-                    found.handle = GraphicsPipelineEntryHandle::Created(handle);
+                    found.handle = GraphicsPipelineEntryHandle::Created(handle, mode);
                 }
-                GraphicsPipelineEntryHandle::Created(_) => {
+                GraphicsPipelineEntryHandle::Created(_, _) => {
                     panic!("Promised pipeline already created!")
                 }
             }
@@ -661,7 +584,7 @@ impl GraphicsPipelineMutableState {
                 GraphicsPipelineEntryHandle::Promised(_) => {
                     panic!("Promised pipeline still pending during destruction")
                 }
-                GraphicsPipelineEntryHandle::Created(handle) => {
+                GraphicsPipelineEntryHandle::Created(handle, _) => {
                     ctx.device()
                         .destroy_pipeline(handle, ctx.allocator_callbacks());
                 }
@@ -699,6 +622,11 @@ impl Object for GraphicsPipeline {
         data: Self::InputData<'a>,
         ctx: &Self::Parent,
     ) -> VulkanResult<Self::Data> {
+        // TODO allow fully concrete pipelines?
+        assert!(
+            matches!(data.render_pass, RenderPassMode::Delayed),
+            "This code path currently only supports delayed pipeline creation"
+        );
         Ok(GraphicsPipelineState {
             info: data,
             mutable: MutableShared::new(GraphicsPipelineMutableState::new()),

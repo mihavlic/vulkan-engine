@@ -19,7 +19,7 @@ pub struct PipelineLayoutCreateInfo {
 }
 
 impl PipelineLayoutCreateInfo {
-    pub const fn empty() -> Self {
+    pub fn empty() -> Self {
         Self {
             flags: vk::PipelineLayoutCreateFlags::empty(),
             set_layouts: SmallVec::new(),
@@ -48,6 +48,7 @@ impl PipelineLayoutCreateInfo {
 }
 
 create_object! {PipelineLayout}
+derive_raw_handle! {PipelineLayout, vk::PipelineLayout}
 impl Object for PipelineLayout {
     type Storage = SimpleStorage<Self>;
     type Parent = Device;

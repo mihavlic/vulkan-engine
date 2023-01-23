@@ -178,6 +178,7 @@ impl ObjectData for BufferState {
     }
 }
 create_object! {Buffer}
+derive_raw_handle! {Buffer, vk::Buffer}
 impl Object for Buffer {
     type Storage = SimpleStorage<Self>;
     type Parent = Device;

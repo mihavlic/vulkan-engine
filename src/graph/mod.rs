@@ -19,6 +19,7 @@ use std::{
 };
 
 use ahash::HashMap;
+use bumpalo::Bump;
 use parking_lot::lock_api::RawRwLock;
 use pumice::{util::ObjectHandle, vk, vk10::CommandPoolCreateInfo, DeviceWrapper, VulkanResult};
 use pumice_vma::AllocationCreateInfo;
@@ -42,9 +43,10 @@ use crate::{
         task::GraphicsPipelineResult,
     },
     object::{
-        self, BufferCreateInfo, BufferMutableState, ConcreteGraphicsPipeline, GetPipelineResult,
-        GraphicsPipeline, GraphicsPipelineCreateInfo, ImageCreateInfo, ImageMutableState,
-        ObjectData, RenderPassMode, SwapchainAcquireStatus, SynchronizeResult,
+        self, raw_info_handle_renderpass, BufferCreateInfo, BufferMutableState,
+        ConcreteGraphicsPipeline, GetPipelineResult, GraphicsPipeline, GraphicsPipelineCreateInfo,
+        ImageCreateInfo, ImageMutableState, ObjectData, RenderPassMode, SwapchainAcquireStatus,
+        SynchronizeResult,
     },
     passes::{CreatePass, RenderPass},
     storage::{constant_ahash_hashmap, constant_ahash_hashset, ObjectStorage},
@@ -540,22 +542,16 @@ impl Graph {
                 move || {
                     Vec::into_par_iter(graphic)
                         .map(|batch| {
-                            let info = unsafe { batch.pipeline_handle.0.get_create_info() };
                             let mut get_infos = Vec::new();
 
-                            let infos = batch
+                            let modes = batch
                                 .batch
                                 .into_iter()
                                 .filter_map(|comp| match comp.mode {
                                     GraphicsPipelineSrc::Compile(mode, mode_hash) => {
-                                        let info = GraphicsPipelineCreateInfo {
-                                            render_pass: mode,
-                                            ..info.clone()
-                                        };
-
                                         get_infos.push(GraphicsPipelineResult::Compile(mode_hash));
 
-                                        Some(info)
+                                        Some(mode)
                                     }
                                     GraphicsPipelineSrc::Wait(lock, mode_hash) => {
                                         get_infos
@@ -569,21 +565,37 @@ impl Graph {
                                 })
                                 .collect::<SmallVec<[_; 8]>>();
 
-                            let vec = if !infos.is_empty() {
-                                let mut create_infos = SmallVec::new();
-                                let mut stages = SmallVec::new();
-                                let mut dynamic_rendering_infos = SmallVec::new();
+                            let vec = if !modes.is_empty() {
+                                let info = unsafe { batch.pipeline_handle.0.get_create_info() };
+
+                                assert!(matches!(info.render_pass, RenderPassMode::Delayed));
+
+                                // todo possibly try to keep this allocator alive longer
+                                let bump = Bump::new();
+                                let template = unsafe { info.to_vk(&bump, &owned_device) };
+                                // we clone the one info multiple times and then patch it with its RenderPassMode
+                                let mut infos = vec![template; modes.len()];
+
+                                for (info, mode) in infos.iter_mut().zip(&modes) {
+                                    let mut pnext_head: *const std::ffi::c_void = std::ptr::null();
+                                    let (render_pass, subpass) =
+                                        raw_info_handle_renderpass(&mode, &mut pnext_head, &bump);
+
+                                    assert!(info.p_next.is_null());
+                                    info.p_next = pnext_head;
+                                    info.render_pass = render_pass;
+                                    info.subpass = subpass;
+                                }
 
                                 let (vec, result) = unsafe {
-                                    GraphicsPipelineCreateInfo::create_multiple(
-                                        infos,
-                                        owned_device.pipeline_cache(),
-                                        &mut create_infos,
-                                        &mut stages,
-                                        &mut dynamic_rendering_infos,
-                                        &owned_device,
-                                    )
-                                    .unwrap()
+                                    owned_device
+                                        .device()
+                                        .create_graphics_pipelines(
+                                            owned_device.pipeline_cache(),
+                                            &infos,
+                                            owned_device.allocator_callbacks(),
+                                        )
+                                        .unwrap()
                                 };
 
                                 assert_eq!(result, vk::Result::SUCCESS);
@@ -595,11 +607,11 @@ impl Graph {
 
                             let mut maybe_lock = None;
 
-                            let mut compiled_offset = 0;
+                            let mut compiled_pipelines = vec.into_iter().zip(modes);
                             for i in &mut get_infos {
                                 match i {
                                     GraphicsPipelineResult::Compile(mode_hash) => {
-                                        let handle = vec[compiled_offset];
+                                        let (handle, mode) = compiled_pipelines.next().unwrap();
                                         let lock = maybe_lock.get_or_insert_with(|| unsafe {
                                             batch.pipeline_handle.0.lock_storage()
                                         });
@@ -611,13 +623,10 @@ impl Graph {
                                                 .get_object_data()
                                                 .mutable
                                                 .get_mut(lock)
-                                                .add_promised_pipeline(handle, *mode_hash);
+                                                .add_promised_pipeline(handle, *mode_hash, mode);
                                         }
 
-                                        drop(mode_hash);
-
                                         *i = GraphicsPipelineResult::CompiledFinal(handle);
-                                        compiled_offset += 1;
                                     }
                                     GraphicsPipelineResult::Wait(_, _)
                                     | GraphicsPipelineResult::Ready(_) => {}
@@ -627,7 +636,11 @@ impl Graph {
 
                             drop(maybe_lock);
 
-                            assert_eq!(compiled_offset, vec.len());
+                            assert!(
+                                compiled_pipelines.next().is_none(),
+                                "Not all compiled pipelines have been handled"
+                            );
+
                             (batch.pipeline_handle, get_infos)
                         })
                         .collect::<Vec<_>>()
@@ -3769,7 +3782,7 @@ impl<'a> GraphPassBuilder<'a> {
             dependencies: Vec::new(),
         }
     }
-    fn compile_graphics_pipeline(
+    pub fn compile_graphics_pipeline(
         &mut self,
         pipeline: &GraphicsPipeline,
         mode: &RenderPassMode,
@@ -3870,10 +3883,10 @@ impl<'a> GraphPassBuilder<'a> {
             handle
         }
     }
-    fn compile_compute_pipeline(&mut self) -> ComputePipelinePromise {
+    pub fn compile_compute_pipeline(&mut self) -> ComputePipelinePromise {
         todo!()
     }
-    fn run_task<T: 'static + Send, F: FnOnce() -> T + Send + Sync + 'static>(
+    pub fn run_task<T: 'static + Send, F: FnOnce() -> T + Send + Sync + 'static>(
         &mut self,
         fun: F,
     ) -> Promise<T> {
@@ -3886,31 +3899,14 @@ impl<'a> GraphPassBuilder<'a> {
 
         Promise(handle, PhantomData)
     }
-    fn finish(self, queue: GraphQueue, pass: Box<dyn ObjectSafeCreatePass>) -> PassData {
-        let mut access = vk::AccessFlags2KHR::default();
-        let mut stages = vk::PipelineStageFlags2KHR::default();
-        for i in &self.images {
-            if i.access.contains_write() {
-                access |= i.access;
-                stages |= i.stages;
-            }
-        }
-        for b in &self.buffers {
-            if b.access.contains_write() {
-                access |= b.access;
-                stages |= b.stages;
-            }
-        }
-
-        PassData {
-            queue: queue,
-            force_run: false,
-            images: self.images,
-            buffers: self.buffers,
-            stages,
-            access,
-            dependencies: self.dependencies,
-            pass: Cell::new(PassObjectState::Initial(pass)),
+    pub fn get_image_format(&self, image: GraphImage) -> vk::Format {
+        let data = self.graph_builder.0.get_image_data(image);
+        match data {
+            ImageData::TransientPrototype(info, _) => info.format,
+            ImageData::Transient(_) => panic!(),
+            ImageData::Imported(handle) => unsafe { handle.0.get_create_info().format },
+            ImageData::Swapchain(handle) => unsafe { handle.0.get_create_info().format },
+            ImageData::Moved(_, _, _) => panic!(),
         }
     }
     // TODO check (possibly update for transients) usage flags against their create info
@@ -3965,6 +3961,33 @@ impl<'a> GraphPassBuilder<'a> {
             stages,
         });
     }
+    fn finish(self, queue: GraphQueue, pass: Box<dyn ObjectSafeCreatePass>) -> PassData {
+        let mut access = vk::AccessFlags2KHR::default();
+        let mut stages = vk::PipelineStageFlags2KHR::default();
+        for i in &self.images {
+            if i.access.contains_write() {
+                access |= i.access;
+                stages |= i.stages;
+            }
+        }
+        for b in &self.buffers {
+            if b.access.contains_write() {
+                access |= b.access;
+                stages |= b.stages;
+            }
+        }
+
+        PassData {
+            queue: queue,
+            force_run: false,
+            images: self.images,
+            buffers: self.buffers,
+            stages,
+            access,
+            dependencies: self.dependencies,
+            pass: Cell::new(PassObjectState::Initial(pass)),
+        }
+    }
 }
 
 pub struct GraphExecutor<'a> {
@@ -4006,7 +4029,7 @@ pub struct GraphContext {
 }
 
 impl GraphContext {
-    fn resolve_graphics_pipeline(
+    pub fn resolve_graphics_pipeline(
         &mut self,
         promise: GraphicsPipelinePromise,
     ) -> ConcreteGraphicsPipeline {
@@ -4041,7 +4064,10 @@ impl GraphContext {
 
         ConcreteGraphicsPipeline(archandle.clone(), concrete)
     }
-    fn resolve_promise<T: 'static>(&mut self, promise: Promise<T>) -> T {
+    pub fn resolve_graphics_pipeline(&mut self, promise: ComputePipelinePromise) -> () {
+        todo!()
+    }
+    pub fn resolve_promise<T: 'static>(&mut self, promise: Promise<T>) -> T {
         *self.function_promises[promise.0.index()]
             .take()
             .unwrap()

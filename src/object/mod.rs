@@ -8,6 +8,16 @@ macro_rules! create_object {
     };
 }
 
+macro_rules! derive_raw_handle {
+    ($name:ident, $Handle:ty) => {
+        impl $name {
+            pub fn raw(&self) -> $Handle {
+                unsafe { self.0.get_handle() }
+            }
+        }
+    };
+}
+
 mod buffer;
 mod descriptor_set_layout;
 mod graphics_pipeline;

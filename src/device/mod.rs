@@ -10,7 +10,7 @@ use crate::{
     instance::Instance,
     object::{
         self, Buffer, DescriptorSetLayout, GraphicsPipeline, Image, PipelineLayout, RenderPass,
-        ShaderModule, Swapchain,
+        RenderPassMode, ShaderModule, Swapchain,
     },
     storage::{nostore::SimpleStorage, ObjectStorage},
     tracing::shim_macros::{info, trace},
@@ -352,6 +352,17 @@ impl Device {
         self.pipeline_layouts
             .get_or_create(info, NonNull::from(self))
             .map(object::PipelineLayout)
+    }
+    pub unsafe fn create_delayed_pipeline(
+        &self,
+        info: object::GraphicsPipelineCreateInfo,
+    ) -> object::GraphicsPipeline {
+        assert!(matches!(info.render_pass, RenderPassMode::Delayed));
+        self.graphics_pipelines
+            .get_or_create(info, NonNull::from(self))
+            .map(object::GraphicsPipeline)
+            // infallible
+            .unwrap()
     }
     pub unsafe fn create_image(
         &self,

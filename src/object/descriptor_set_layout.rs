@@ -140,6 +140,7 @@ impl DescriptorSetLayoutCreateInfo {
 }
 
 create_object! {DescriptorSetLayout}
+derive_raw_handle! {DescriptorSetLayout, vk::DescriptorSetLayout}
 impl Object for DescriptorSetLayout {
     type Storage = SimpleStorage<Self>;
     type Parent = Device;

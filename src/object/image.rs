@@ -292,6 +292,7 @@ impl ObjectData for ImageState {
 }
 
 create_object! {Image}
+derive_raw_handle! {Image, vk::Image}
 impl Object for Image {
     type Storage = SimpleStorage<Self>;
     type Parent = Device;
