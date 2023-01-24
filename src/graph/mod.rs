@@ -4064,7 +4064,7 @@ impl GraphContext {
 
         ConcreteGraphicsPipeline(archandle.clone(), concrete)
     }
-    pub fn resolve_graphics_pipeline(&mut self, promise: ComputePipelinePromise) -> () {
+    pub fn resolve_compute_pipeline(&mut self, promise: ComputePipelinePromise) -> () {
         todo!()
     }
     pub fn resolve_promise<T: 'static>(&mut self, promise: Promise<T>) -> T {

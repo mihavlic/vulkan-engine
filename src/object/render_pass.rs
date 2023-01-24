@@ -1,8 +1,10 @@
+use std::hash::{Hash, Hasher};
 use std::ptr;
 
 use crate::device::Device;
+use crate::storage::interned::ObjectCreateInfoFingerPrint;
 use crate::storage::nostore::SimpleStorage;
-use crate::storage::SynchronizationLock;
+use crate::storage::{constant_ahash_hasher, SynchronizationLock};
 use crate::util::ffi_ptr::AsFFiPtr;
 
 use super::{ArcHandle, Object};
@@ -14,19 +16,35 @@ use smallvec::SmallVec;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct SubpassDescription {
-    pub flags: vk::SubpassDescriptionFlags,
-    pub pipeline_bind_point: vk::PipelineBindPoint,
     pub input_attachments: Vec<vk::AttachmentReference>,
     pub color_attachments: Vec<vk::AttachmentReference>,
     pub resolve_attachments: Vec<vk::AttachmentReference>,
     pub depth_stencil_attachment: Option<vk::AttachmentReference>,
     pub preserve_attachments: Vec<u32>,
 }
+
+impl ObjectCreateInfoFingerPrint for SubpassDescription {
+    fn get_fingerprint(&self) -> u128 {
+        let mut hash = 0u128;
+        // we hash the struct two times, beginning with hashing the loop index
+        // to get different states and then pack the hash into a single u128
+        for i in 0..2 {
+            let mut state = constant_ahash_hasher();
+            i.hash(&mut state);
+            self.hash(&mut state);
+            hash |= (state.finish() as u128).rotate_left(i * 64);
+        }
+        hash
+    }
+}
+
 impl SubpassDescription {
     pub fn to_vk(&self) -> vk::SubpassDescription {
         vk::SubpassDescription {
-            flags: self.flags,
-            pipeline_bind_point: self.pipeline_bind_point,
+            flags: vk::SubpassDescriptionFlags::empty(),
+            // spec: pipelineBindPoint must be VK_PIPELINE_BIND_POINT_GRAPHICS or VK_PIPELINE_BIND_POINT_SUBPASS_SHADING_HUAWEI
+            // We don't really care about vendor extensions
+            pipeline_bind_point: vk::PipelineBindPoint::GRAPHICS,
             input_attachment_count: self.input_attachments.len() as u32,
             p_input_attachments: self.input_attachments.as_ffi_ptr(),
             color_attachment_count: self.color_attachments.len() as u32,

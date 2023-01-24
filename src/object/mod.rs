@@ -43,7 +43,10 @@ pub use swapchain::*;
 use pumice::VulkanResult;
 use std::{borrow::BorrowMut, hash::Hash, mem::ManuallyDrop, ptr::NonNull};
 
-use crate::storage::{ArcHeader, MutableShared, ObjectStorage, SynchronizationLock};
+use crate::storage::{
+    interned::ObjectCreateInfoFingerPrint, ArcHeader, MutableShared, ObjectStorage,
+    SynchronizationLock,
+};
 
 pub(crate) trait ObjectData {
     type CreateInfo;
@@ -245,7 +248,7 @@ impl<T: Object> Drop for ArcHandle<T> {
     }
 }
 
-pub(crate) struct BasicObjectData<H: Copy, I> {
+pub(crate) struct BasicObjectData<H, I> {
     handle: H,
     info: I,
 }
@@ -256,6 +259,12 @@ impl<H: Copy, I> BasicObjectData<H, I> {
     }
     fn new(handle: H, info: I) -> VulkanResult<Self> {
         Ok(Self { handle, info })
+    }
+}
+
+impl<I: ObjectCreateInfoFingerPrint, H> ObjectCreateInfoFingerPrint for BasicObjectData<H, I> {
+    fn get_fingerprint(&self) -> u128 {
+        self.info.get_fingerprint()
     }
 }
 

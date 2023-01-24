@@ -1,3 +1,4 @@
+pub mod interned;
 pub mod nostore;
 
 use crate::object::{ArcHandle, Object};
