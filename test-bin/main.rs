@@ -4,10 +4,10 @@ use std::fs::File;
 use std::{io, slice};
 
 use graph::device::{self, DeviceCreateInfo, QueueFamilySelection};
-use graph::graph::Graph;
+use graph::graph::compile::GraphCompiler;
 use graph::instance::{Instance, InstanceCreateInfo, OwnedInstance};
 use graph::object::{self, ImageCreateInfo, PipelineStage, SwapchainCreateInfo};
-use graph::passes::ClearImage;
+use graph::passes::{self, ClearImage, SimpleShader};
 use graph::tracing::tracing_subscriber::install_tracing_subscriber;
 use pumice::{util::ApiLoadConfig, vk};
 use pumice_vma::{AllocationCreateFlags, AllocationCreateInfo};
@@ -55,9 +55,14 @@ fn main() {
             synchronization_2: vk::TRUE,
             ..Default::default()
         };
-        let timeline = vk::PhysicalDeviceTimelineSemaphoreFeaturesKHR {
+        let mut timeline = vk::PhysicalDeviceTimelineSemaphoreFeaturesKHR {
             timeline_semaphore: vk::TRUE,
             p_next: (&mut sync) as *mut _ as *mut _,
+            ..Default::default()
+        };
+        let dynamic = vk::PhysicalDeviceDynamicRenderingFeaturesKHR {
+            dynamic_rendering: vk::TRUE,
+            p_next: (&mut timeline) as *mut _ as *mut _,
             ..Default::default()
         };
         let info = DeviceCreateInfo {
@@ -77,7 +82,7 @@ fn main() {
             }],
             device_substrings: &["NVIDIA"],
             verbose: false,
-            p_next: (&timeline) as *const _ as *const _,
+            p_next: (&dynamic) as *const _ as *const _,
         };
 
         let device = device::Device::new(info);
@@ -85,8 +90,8 @@ fn main() {
 
         let swapchain = make_swapchain(&window, surface, &device);
 
-        let vert_spirv = read_spv(&mut File::open("test-bin/shader.vs").unwrap()).unwrap();
-        let frag_spirv = read_spv(&mut File::open("test-bin/shader.fs").unwrap()).unwrap();
+        let vert_spirv = read_spv(&mut File::open("target/shader.vert.spv").unwrap()).unwrap();
+        let frag_spirv = read_spv(&mut File::open("target/shader.frag.spv").unwrap()).unwrap();
 
         let vert_module = device.create_shader_module(vert_spirv).unwrap();
         let frag_module = device.create_shader_module(frag_spirv).unwrap();
@@ -115,7 +120,10 @@ fn main() {
             ]
             .to_vec(),
             vertex_input: Default::default(),
-            input_assembly: Default::default(),
+            input_assembly: object::state::InputAssembly {
+                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+                ..Default::default()
+            },
             tessellation: Default::default(),
             viewport: Default::default(),
             rasterization: object::state::Rasterization {
@@ -124,9 +132,13 @@ fn main() {
                 polygon_mode: vk::PolygonMode::FILL,
                 cull_mode: vk::CullModeFlags::NONE,
                 front_face: vk::FrontFace::CLOCKWISE,
+                line_width: 1.0,
                 ..Default::default()
             },
-            multisample: Default::default(),
+            multisample: object::state::Multisample {
+                rasterization_samples: vk::SampleCountFlags::C1,
+                ..Default::default()
+            },
             depth_stencil: Default::default(),
             color_blend: Default::default(),
             dynamic_state: Default::default(),
@@ -135,7 +147,31 @@ fn main() {
             base_pipeline: object::BasePipeline::None,
         };
 
-        let mut graph = Graph::new(device.clone());
+        let pipeline = device.create_delayed_pipeline(pipeline_info);
+
+        let mut compiler = GraphCompiler::new();
+        let mut graph = compiler.compile(device.clone(), device.threadpool(), |b| {
+            let queue = b.import_queue(queue);
+            let swapchain = b.acquire_swapchain(swapchain.clone());
+            // b.add_pass(
+            //     queue,
+            //     ClearImage {
+            //         image: swapchain,
+            //         color: vk::ClearColorValue {
+            //             float_32: [1.0, 0.0, 1.0, 1.0],
+            //         },
+            //     },
+            //     "Swapchain clear",
+            // );
+            b.add_pass(
+                queue,
+                SimpleShader {
+                    pipeline,
+                    attachments: vec![swapchain],
+                },
+                "",
+            );
+        });
 
         event_loop.run(move |event, _, control_flow| {
             control_flow.set_poll();
@@ -158,20 +194,7 @@ fn main() {
                     window.request_redraw();
                 }
                 Event::RedrawRequested(req) => {
-                    graph.run(|b| {
-                        let queue = b.import_queue(queue);
-                        let swapchain = b.acquire_swapchain(swapchain.clone());
-                        b.add_pass(
-                            queue,
-                            ClearImage {
-                                image: swapchain,
-                                color: vk::ClearColorValue {
-                                    float_32: [1.0, 0.0, 1.0, 1.0],
-                                },
-                            },
-                            "Swapchain clear",
-                        );
-                    });
+                    graph.run();
                     device.idle_cleanup_poll();
                 }
                 _ => (),

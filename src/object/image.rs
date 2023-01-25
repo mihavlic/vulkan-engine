@@ -168,13 +168,23 @@ impl<T: ResourceMarker> SynchronizationState<T> {
 
 #[derive(Clone, Hash)]
 pub struct ImageViewCreateInfo {
-    view_type: vk::ImageViewType,
-    format: vk::Format,
-    components: vk::ComponentMapping,
-    subresource_range: vk::ImageSubresourceRange,
+    pub view_type: vk::ImageViewType,
+    pub format: vk::Format,
+    pub components: vk::ComponentMapping,
+    pub subresource_range: vk::ImageSubresourceRange,
 }
 
 impl ImageViewCreateInfo {
+    pub fn to_vk(&self, image: vk::Image) -> vk::ImageViewCreateInfo {
+        vk::ImageViewCreateInfo {
+            image,
+            view_type: self.view_type,
+            format: self.format,
+            components: self.components.clone(),
+            subresource_range: self.subresource_range.clone(),
+            ..Default::default()
+        }
+    }
     fn get_hash(&self) -> u32 {
         let mut hasher = constant_ahash_hasher();
         self.hash(&mut hasher);
@@ -215,14 +225,7 @@ impl ImageMutableState {
             found.last_use = batch_id;
             VulkanResult::Ok(found.handle)
         } else {
-            let raw = vk::ImageViewCreateInfo {
-                image: self_handle,
-                view_type: info.view_type,
-                format: info.format,
-                components: info.components.clone(),
-                subresource_range: info.subresource_range.clone(),
-                ..Default::default()
-            };
+            let raw = info.to_vk(self_handle);
 
             let view = device
                 .device()
@@ -329,15 +332,17 @@ impl Object for Image {
     }
 }
 
-// impl Image {
-//     unsafe fn get_view(
-//         &self,
-//         info: &ImageViewCreateInfo,
-//         batch_id: GenerationId,
-//     ) -> VulkanResult<vk::ImageView> {
-//         let storage = self.0.get_storage();
-//         let header = storage.read_object(&self.0);
-//         let mut data = header.object_data.1.get_mut(header.get_lock());
-//         data.get_view(header.handle, info, batch_id, self.0.get_parent())
-//     }
-// }
+impl Image {
+    unsafe fn get_view(
+        &self,
+        info: &ImageViewCreateInfo,
+        batch_id: GenerationId,
+    ) -> VulkanResult<vk::ImageView> {
+        let device = self.0.get_parent();
+        let data = self.0.get_object_data();
+        self.0.access_mutable(
+            |d| &d.mutable,
+            |m| m.get_view(data.handle, info, batch_id, device),
+        )
+    }
+}

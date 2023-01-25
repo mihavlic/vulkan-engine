@@ -1,4 +1,4 @@
-use super::SubmissionResourceReuse;
+use crate::graph::compile::SubmissionResourceReuse;
 use crate::storage::constant_ahash_hashset;
 use pumice::{vk, VulkanResult};
 use std::{cell::RefCell, collections::BTreeMap, hash::Hash, rc::Rc};

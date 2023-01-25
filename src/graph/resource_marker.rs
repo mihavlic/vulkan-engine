@@ -1,6 +1,11 @@
-use super::{CombinedResourceHandle, PassBufferData, PassImageData, RawHandle};
 use pumice::vk;
 use std::ops::{Deref, DerefMut};
+
+use super::{
+    compile::CombinedResourceHandle,
+    record::{PassBufferData, PassImageData},
+    RawHandle,
+};
 
 pub(crate) trait TypeOption<T>: From<T> {
     fn new_some(val: T) -> Self;
