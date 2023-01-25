@@ -5,7 +5,7 @@ use pumice::VulkanResult;
 
 use crate::{
     device::Device,
-    graph::{GraphContext, GraphExecutor, GraphPassBuilder},
+    graph::{compile::GraphContext, execute::GraphExecutor, record::GraphPassBuilder},
 };
 
 pub trait RenderPass: 'static {
@@ -15,7 +15,7 @@ pub trait RenderPass: 'static {
 
 pub trait CreatePass: 'static {
     type PreparedData: 'static;
-    fn prepare(&mut self, builder: &mut GraphPassBuilder, device: &Device) -> Self::PreparedData;
+    fn prepare(&mut self, builder: &mut GraphPassBuilder) -> Self::PreparedData;
     fn create(self, prepared: Self::PreparedData, ctx: &mut GraphContext) -> Box<dyn RenderPass>;
 }
 
@@ -28,10 +28,10 @@ impl RenderPass for () {
     }
 }
 
-impl<P: RenderPass, F: FnMut(&mut GraphPassBuilder, &Device) -> P + 'static> CreatePass for F {
+impl<P: RenderPass, F: FnMut(&mut GraphPassBuilder) -> P + 'static> CreatePass for F {
     type PreparedData = P;
-    fn prepare(&mut self, builder: &mut GraphPassBuilder, device: &Device) -> Self::PreparedData {
-        self(builder, device)
+    fn prepare(&mut self, builder: &mut GraphPassBuilder) -> Self::PreparedData {
+        self(builder)
     }
     fn create(self, prepared: Self::PreparedData, ctx: &mut GraphContext) -> Box<dyn RenderPass> {
         Box::new(prepared)

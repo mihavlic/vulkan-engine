@@ -1,8 +1,13 @@
-use pumice::vk;
+use pumice::{util::ObjectHandle, vk};
+use smallvec::SmallVec;
 
 use crate::{
-    graph::{task::GraphicsPipelinePromise, GraphContext, GraphImage},
-    object::{ConcreteGraphicsPipeline, GraphicsPipeline, RenderPassMode},
+    device::Device,
+    graph::{
+        compile::GraphContext, execute::GraphExecutor, record::GraphPassBuilder,
+        task::GraphicsPipelinePromise, GraphImage,
+    },
+    object::{self, ConcreteGraphicsPipeline, GraphicsPipeline, RenderPassMode},
 };
 
 use super::{CreatePass, RenderPass};
@@ -14,11 +19,7 @@ pub struct ClearImage {
 
 impl CreatePass for ClearImage {
     type PreparedData = ();
-    fn prepare(
-        &mut self,
-        builder: &mut crate::graph::GraphPassBuilder,
-        device: &crate::device::Device,
-    ) -> Self::PreparedData {
+    fn prepare(&mut self, builder: &mut GraphPassBuilder) -> Self::PreparedData {
         builder.use_image(
             self.image,
             vk::ImageUsageFlags::TRANSFER_DST,
@@ -63,11 +64,7 @@ pub struct SimpleShader {
 
 impl CreatePass for SimpleShader {
     type PreparedData = GraphicsPipelinePromise;
-    fn prepare(
-        &mut self,
-        builder: &mut crate::graph::GraphPassBuilder,
-        device: &crate::device::Device,
-    ) -> Self::PreparedData {
+    fn prepare(&mut self, builder: &mut GraphPassBuilder) -> Self::PreparedData {
         for &image in &self.attachments {
             builder.use_image(
                 image,
@@ -112,25 +109,71 @@ impl RenderPass for SimpleShaderPass {
     }
     unsafe fn execute(
         &mut self,
-        executor: &crate::graph::GraphExecutor,
-        device: &crate::device::Device,
+        executor: &GraphExecutor,
+        device: &Device,
     ) -> pumice::VulkanResult<()> {
         let d = device.device();
         let cmd = executor.command_buffer();
+        // executor.get_image(image)
 
-        let info = vk::RenderPassBeginInfo {
-            render_pass: todo!(),
-            framebuffer: todo!(),
-            render_area: todo!(),
-            clear_value_count: todo!(),
-            p_clear_values: todo!(),
+        let views = self.info.attachments.iter().map(|i| {
+            let handle = executor.get_image(*i);
+            device
+                .device()
+                .create_image_view(
+                    &object::ImageViewCreateInfo {
+                        view_type: vk::ImageViewType::T2D,
+                        format: vk::Format::B8G8R8A8_UNORM,
+                        components: vk::ComponentMapping::default(),
+                        subresource_range: executor.get_image_subresource_range(*i),
+                    }
+                    .to_vk(handle),
+                    None,
+                )
+                .unwrap()
+        });
+
+        let attachments = self
+            .info
+            .attachments
+            .iter()
+            .zip(views)
+            .map(|(i, view)| vk::RenderingAttachmentInfoKHR {
+                image_view: view,
+                image_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                resolve_mode: vk::ResolveModeFlagsKHR::NONE,
+                load_op: vk::AttachmentLoadOp::LOAD,
+                store_op: vk::AttachmentStoreOp::STORE,
+                clear_value: vk::ClearValue {
+                    color: vk::ClearColorValue { float_32: [0.0; 4] },
+                },
+                ..Default::default()
+            })
+            .collect::<SmallVec<[_; 8]>>();
+
+        let info = vk::RenderingInfoKHR {
+            render_area: vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D {
+                    width: 128,
+                    height: 128,
+                },
+            },
+            layer_count: 1,
+            view_mask: 0,
+            color_attachment_count: attachments.len() as u32,
+            p_color_attachments: attachments.as_ptr(),
+            p_depth_attachment: std::ptr::null(),
+            p_stencil_attachment: std::ptr::null(),
             ..Default::default()
         };
 
-        // vkCmdBeginRenderPass(command_buffer, &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
+        d.cmd_begin_rendering_khr(cmd, &info);
 
-        // Draw calls here
+        d.cmd_draw(cmd, 3, 1, 0, 0);
 
-        // vkCmdEndRenderPass(command_buffer);
+        d.cmd_end_rendering_khr(cmd);
+
+        Ok(())
     }
 }

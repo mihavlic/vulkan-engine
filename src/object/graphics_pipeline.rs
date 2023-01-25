@@ -206,29 +206,6 @@ pub struct GraphicsPipelineCreateInfo {
     pub base_pipeline: BasePipeline,
 }
 
-// // Is this a bad idea?
-// // Todo use an arena allocator
-// pub struct GraphicsPipelineCreateInfoScratch {
-//     create_infos: SmallVec<[vk::GraphicsPipelineCreateInfo; 4]>,
-//     stages: SmallVec<[vk::PipelineShaderStageCreateInfo; 4]>,
-//     vertex_input_states: SmallVec<[vk::PipelineVertexInputStateCreateInfo; 4]>,
-//     input_assembly_states: SmallVec<[vk::PipelineInputAssemblyStateCreateInfo; 4]>,
-//     tessellation_states: SmallVec<[vk::PipelineTessellationStateCreateInfo; 4]>,
-//     viewport_states: SmallVec<[vk::PipelineViewportStateCreateInfo; 4]>,
-//     rasterization_states: SmallVec<[vk::PipelineRasterizationStateCreateInfo; 4]>,
-//     multisample_states: SmallVec<[vk::PipelineMultisampleStateCreateInfo; 4]>,
-//     depth_stencil_states: SmallVec<[vk::PipelineDepthStencilStateCreateInfo; 4]>,
-//     color_blend_states: SmallVec<[vk::PipelineColorBlendStateCreateInfo; 4]>,
-//     dynamic_states: SmallVec<[vk::PipelineDynamicStateCreateInfo; 4]>,
-//     dynamic_rendering_infos: SmallVec<[vk::PipelineRenderingCreateInfoKHR; 4]>,
-// }
-
-// impl GraphicsPipelineCreateInfoScratch {
-//     fn get_create_infos(&self) -> &[vk::GraphicsPipelineCreateInfo] {
-//         &self.create_infos
-//     }
-// }
-
 struct CStrIterator<'a>(Option<slice::Iter<'a, u8>>);
 
 impl<'a> Iterator for CStrIterator<'a> {
@@ -491,6 +468,7 @@ pub(crate) fn raw_info_handle_renderpass(
             stencil,
         } => {
             let info = vk::PipelineRenderingCreateInfoKHR {
+                s_type: pumice::vk10::StructureType::PIPELINE_RENDERING_CREATE_INFO_KHR,
                 view_mask,
                 color_attachment_count: colors.len() as u32,
                 p_color_attachment_formats: colors.as_ffi_ptr(),
@@ -499,7 +477,9 @@ pub(crate) fn raw_info_handle_renderpass(
                 ..Default::default()
             };
             let info = bump.alloc(info);
+
             add_pnext!((*pnext), info);
+
             (vk::RenderPass::null(), 0)
         }
         // the user must fill these themselves
