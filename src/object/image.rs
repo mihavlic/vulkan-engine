@@ -333,7 +333,7 @@ impl Object for Image {
 }
 
 impl Image {
-    unsafe fn get_view(
+    pub unsafe fn get_view(
         &self,
         info: &ImageViewCreateInfo,
         batch_id: GenerationId,

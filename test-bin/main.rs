@@ -44,7 +44,10 @@ fn main() {
 
         let info = InstanceCreateInfo {
             config: &mut conf,
-            validation_layers: &[pumice::cstr!("VK_LAYER_KHRONOS_validation")],
+            validation_layers: &[
+                pumice::cstr!("VK_LAYER_KHRONOS_validation"),
+                // pumice::cstr!("VK_LAYER_LUNARG_api_dump"),
+            ],
             enable_debug_callback: true,
             app_name: "test application".to_owned(),
             verbose: false,
@@ -103,9 +106,8 @@ fn main() {
             .create_pipeline_layout(object::PipelineLayoutCreateInfo::empty())
             .unwrap();
 
-        let pipeline_info = object::GraphicsPipelineCreateInfo {
-            flags: vk::PipelineCreateFlags::empty(),
-            stages: [
+        let pipeline_info = object::GraphicsPipelineCreateInfo::builder()
+            .stages([
                 PipelineStage {
                     flags: vk::PipelineShaderStageCreateFlags::empty(),
                     stage: vk::ShaderStageFlags::VERTEX,
@@ -120,34 +122,17 @@ fn main() {
                     name: "main".into(),
                     specialization_info: None,
                 },
-            ]
-            .to_vec(),
-            vertex_input: Default::default(),
-            input_assembly: object::state::InputAssembly {
+            ])
+            .input_assembly(object::state::InputAssembly {
                 topology: vk::PrimitiveTopology::TRIANGLE_LIST,
                 primitive_restart_enable: false,
-            },
-            tessellation: Default::default(),
-            viewport: object::state::Viewport {
-                viewports: [vk::Viewport {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 128.0,
-                    height: 128.0,
-                    min_depth: 0.0,
-                    max_depth: 1.0,
-                }]
-                .into(),
-                scissors: [vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent: vk::Extent2D {
-                        width: 128,
-                        height: 128,
-                    },
-                }]
-                .into(),
-            },
-            rasterization: object::state::Rasterization {
+            })
+            .viewport(object::state::Viewport::default())
+            .vertex_input(object::state::VertexInput {
+                vertex_bindings: Vec::new(),
+                vertex_attributes: Vec::new(),
+            })
+            .rasterization(object::state::Rasterization {
                 depth_clamp_enable: false,
                 rasterizer_discard_enable: false,
                 polygon_mode: vk::PolygonMode::FILL,
@@ -155,18 +140,21 @@ fn main() {
                 front_face: vk::FrontFace::CLOCKWISE,
                 line_width: 1.0,
                 ..Default::default()
-            },
-            multisample: object::state::Multisample {
+            })
+            .multisample(object::state::Multisample {
                 rasterization_samples: vk::SampleCountFlags::C1,
                 ..Default::default()
-            },
-            depth_stencil: Default::default(),
-            color_blend: Default::default(),
-            dynamic_state: Default::default(),
-            layout: empty_layout,
-            render_pass: object::RenderPassMode::Delayed,
-            base_pipeline: object::BasePipeline::None,
-        };
+            })
+            .color_blend(object::state::ColorBlend {
+                attachments: vec![object::state::Attachment {
+                    color_write_mask: vk::ColorComponentFlags::all(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .dynamic_state([vk::DynamicState::SCISSOR, vk::DynamicState::VIEWPORT])
+            .layout(empty_layout)
+            .finish();
 
         let pipeline = device.create_delayed_pipeline(pipeline_info);
 
@@ -174,16 +162,16 @@ fn main() {
         let mut graph = compiler.compile(device.clone(), device.threadpool(), |b| {
             let queue = b.import_queue(queue);
             let swapchain = b.acquire_swapchain(swapchain.clone());
-            // b.add_pass(
-            //     queue,
-            //     ClearImage {
-            //         image: swapchain,
-            //         color: vk::ClearColorValue {
-            //             float_32: [1.0, 0.0, 1.0, 1.0],
-            //         },
-            //     },
-            //     "Swapchain clear",
-            // );
+            b.add_pass(
+                queue,
+                ClearImage {
+                    image: swapchain,
+                    color: vk::ClearColorValue {
+                        float_32: [1.0, 0.0, 1.0, 1.0],
+                    },
+                },
+                "Swapchain clear",
+            );
             b.add_pass(
                 queue,
                 SimpleShader {

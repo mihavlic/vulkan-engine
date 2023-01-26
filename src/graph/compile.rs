@@ -1,7 +1,9 @@
 use super::{
     allocator::{AvailabilityToken, Suballocator},
     execute::{CompiledGraph, LegacySemaphoreStack, PhysicalBufferData, PhysicalImageData},
-    record::{BufferData, CompilationInput, GraphBuilder, ImageData, ImageMove, PassData},
+    record::{
+        BufferData, CompilationInput, GraphBuilder, ImageData, ImageMove, MovedImageEntry, PassData,
+    },
     resource_marker::{ResourceData, ResourceMarker, TypeSome},
     reverse_edges::{ChildRelativeKey, DFSCommand, ImmutableGraph, NodeGraph, NodeKey},
     task::{
@@ -21,13 +23,13 @@ use crate::{
     },
     graph::{
         allocator::MemoryKind,
-        execute::{DeferredResourceFree, GraphExecutor},
+        execute::{CompiledGraphState, DeferredResourceFree, GraphExecutor},
         resource_marker::{BufferMarker, ImageMarker, TypeOption},
         reverse_edges::reverse_edges_into,
         task::GraphicsPipelineSrc,
     },
     object::{
-        raw_info_handle_renderpass, BufferMutableState, ConcreteGraphicsPipeline,
+        self, raw_info_handle_renderpass, BufferMutableState, ConcreteGraphicsPipeline,
         GetPipelineResult, GraphicsPipeline, ImageMutableState, RenderPassMode,
         SwapchainAcquireStatus, SynchronizeResult,
     },
@@ -421,11 +423,11 @@ impl OpenSubmision {
     pub(crate) fn add_pass(
         &mut self,
         timeline: TimelinePass,
-        graph: GraphPass,
+        pass: GraphPass,
         effects: PassEffects,
     ) {
         self.current_pass = Some(timeline);
-        self.passes.push(graph);
+        self.passes.push(pass);
         self.pass_effects.push(effects);
     }
     pub(crate) fn get_current_timeline_pass(&self) -> TimelinePass {
@@ -537,10 +539,10 @@ impl<'a> SubmissionRecorder<'a> {
     pub(crate) fn begin_pass<F: FnOnce(&mut Self)>(
         &mut self,
         timeline: TimelinePass,
-        graph: GraphPass,
+        pass: GraphPass,
         on_prev_end: F,
     ) -> SubmissionPass {
-        let data = self.graph.input.get_pass_data(graph);
+        let data = self.graph.input.get_pass_data(pass);
 
         // either we've started emitting passes into a different queue, or the user flushed the previously open queue
         if (self.current_queue.is_some() && self.current_queue.unwrap().1 != data.queue)
@@ -559,8 +561,16 @@ impl<'a> SubmissionRecorder<'a> {
             last_barrier: OptionalU32::NONE,
         };
 
+        // borrowchk woes
+        {
+            let submission = self.get_current_submission();
+            let meta = self.graph.get_pass_meta(pass);
+            meta.scheduled_submission_position
+                .set(OptionalU32::new_some(submission.passes.len() as u32))
+        }
+
         let submission = self.get_current_submission_mut();
-        submission.add_pass(timeline, graph, effects);
+        submission.add_pass(timeline, pass, effects);
 
         self.get_current_pass()
     }
@@ -811,6 +821,11 @@ pub(crate) struct ResourceFirstAccess {
     pub(crate) dst_queue_family: u32,
 }
 
+pub(crate) enum ImageKindCreateInfo<'a> {
+    Image(&'a object::ImageCreateInfo),
+    Swapchain(&'a object::SwapchainCreateInfo),
+}
+
 pub struct GraphCompiler {
     pub(crate) input: CompilationInput,
 
@@ -869,25 +884,41 @@ impl GraphCompiler {
             self.make_image_alive(image);
             match self.input.get_image_data(image) {
                 ImageData::Moved(to, ..) => {
-                    image = *to;
+                    image = to.get().dst;
                 }
                 _ => break,
             }
         }
     }
-    pub(crate) fn get_concrete_image_data(&self, image: GraphImage) -> &ImageData {
-        let mut image = image;
+    pub(crate) fn get_image_create_info(&self, image: GraphImage) -> ImageKindCreateInfo<'_> {
+        let mut data = self.input.get_image_data(image);
         loop {
-            match self.input.get_image_data(image) {
-                ImageData::Moved(to, ..) => {
-                    image = *to;
+            match data {
+                ImageData::TransientPrototype(info, _) => {
+                    return ImageKindCreateInfo::Image(info);
                 }
-                other => return other,
+                ImageData::Transient(physical) => {
+                    return ImageKindCreateInfo::Image(
+                        &self.physical_images[physical.index()].info,
+                    );
+                }
+                ImageData::Imported(archandle) => {
+                    return ImageKindCreateInfo::Image(unsafe { archandle.0.get_create_info() });
+                }
+                ImageData::Swapchain(archandle) => {
+                    return ImageKindCreateInfo::Swapchain(unsafe {
+                        archandle.0.get_create_info()
+                    });
+                }
+                ImageData::Moved(_) => {
+                    data = self.input.get_concrete_image_data(image);
+                    continue;
+                }
             }
         }
     }
     pub(crate) fn is_image_external<'a>(&'a self, image: GraphImage) -> bool {
-        match self.get_concrete_image_data(image) {
+        match self.input.get_concrete_image_data(image) {
             ImageData::TransientPrototype(..) => false,
             ImageData::Imported(_) => true,
             ImageData::Swapchain(_) => true,
@@ -2156,7 +2187,9 @@ impl GraphCompiler {
                                     info: create_info.clone(),
                                     memory: suballocation,
                                     vkhandle,
-                                    state: ImageMutableState::new(vk::ImageLayout::UNDEFINED),
+                                    state: RefCell::new(ImageMutableState::new(
+                                        vk::ImageLayout::UNDEFINED,
+                                    )),
                                 });
                                 *self.input.get_image_data_mut(handle) =
                                     ImageData::Transient(physical);
@@ -2184,7 +2217,7 @@ impl GraphCompiler {
                                     info: create_info.clone(),
                                     memory: suballocation,
                                     vkhandle,
-                                    state: BufferMutableState::new(),
+                                    state: RefCell::new(BufferMutableState::new()),
                                 });
                                 *self.input.get_buffer_data_mut(handle) =
                                     BufferData::Transient(physical);
@@ -2302,18 +2335,7 @@ impl GraphCompiler {
             alive_images: self.alive_images.take(),
             alive_buffers: self.alive_buffers.take(),
 
-            swapchain_semaphores: LegacySemaphoreStack::new(),
-            command_pool: unsafe {
-                device
-                    .device()
-                    .create_command_pool(
-                        &CommandPoolCreateInfo::default(),
-                        device.allocator_callbacks(),
-                    )
-                    .unwrap()
-            },
-            prev_generation: Cell::new(None),
-            device: ManuallyDrop::new(device),
+            state: CompiledGraphState::new(device),
         }
     }
 

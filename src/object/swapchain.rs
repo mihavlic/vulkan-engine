@@ -1,8 +1,9 @@
 use std::cell::RefMut;
 use std::ptr;
 
-use super::{ArcHandle, ImageMutableState, Object, ObjectData};
+use super::{ArcHandle, ImageMutableState, ImageViewCreateInfo, Object, ObjectData};
 
+use crate::device::batch::GenerationId;
 use crate::device::Device;
 use crate::storage::nostore::SimpleStorage;
 use crate::storage::{MutableShared, SynchronizationLock};
@@ -206,6 +207,18 @@ impl SwapchainMutableState {
             Ok((_, res)) => unreachable!("Invalid Ok result value: {:?}", res),
         }
     }
+    pub unsafe fn get_view(
+        &mut self,
+        image_index: u32,
+        info: &ImageViewCreateInfo,
+        batch_id: GenerationId,
+        device: &Device,
+    ) -> VulkanResult<vk::ImageView> {
+        let swapchain_image = &mut self.images[image_index as usize];
+        swapchain_image
+            .state
+            .get_view(swapchain_image.image, info, batch_id, device)
+    }
     pub fn surface_resized(&mut self, new_extent: vk::Extent2D) {
         self.resized_to = Some(new_extent);
     }
@@ -317,5 +330,25 @@ impl Swapchain {
     pub unsafe fn surface_resized(&self, new_extent: vk::Extent2D) {
         self.0
             .access_mutable(|d| &d.mutable, |s| s.surface_resized(new_extent))
+    }
+    pub unsafe fn get_view(
+        &self,
+        image_index: u32,
+        info: &ImageViewCreateInfo,
+        batch_id: GenerationId,
+    ) -> VulkanResult<vk::ImageView> {
+        let parent = self.0.get_parent();
+        self.0.access_mutable(
+            |d| &d.mutable,
+            |s| s.get_view(image_index, info, batch_id, parent),
+        )
+    }
+    pub fn get_extent(&self) -> vk::Extent2D {
+        unsafe {
+            self.0.access_mutable(
+                |d| &d.mutable,
+                |s| s.resized_to.clone().unwrap_or(s.current_extent.clone()),
+            )
+        }
     }
 }

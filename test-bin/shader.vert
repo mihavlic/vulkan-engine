@@ -3,7 +3,7 @@
 
 const vec2[] vertices = {
     vec2(-.5, -.5),
-    vec2(-.5, .5),
+    vec2(.5, .5),
     vec2(0, .5),
 };
 

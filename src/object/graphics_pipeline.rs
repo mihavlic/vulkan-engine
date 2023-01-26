@@ -44,7 +44,7 @@ pub struct PipelineRenderingCreateInfoKHR {
     pub stencil_attachment_format: vk::Format,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum RenderPassMode {
     Normal {
         subpass: u32,
@@ -56,6 +56,7 @@ pub enum RenderPassMode {
         depth: vk::Format,
         stencil: vk::Format,
     },
+    #[default]
     Delayed,
 }
 
@@ -183,7 +184,7 @@ pub mod state {
 
     #[derive(Clone, Default)]
     pub struct DynamicState {
-        pub dynamic_states: Vec<vk::DynamicState>,
+        pub dynamic_states: SmallVec<[vk::DynamicState; 4]>,
     }
 }
 
@@ -192,19 +193,126 @@ pub struct GraphicsPipelineCreateInfo {
     pub flags: vk::PipelineCreateFlags,
     pub stages: Vec<PipelineStage>,
 
-    pub vertex_input: state::VertexInput,
-    pub input_assembly: state::InputAssembly,
-    pub tessellation: state::Tessellation,
-    pub viewport: state::Viewport,
-    pub rasterization: state::Rasterization,
-    pub multisample: state::Multisample,
-    pub depth_stencil: state::DepthStencil,
-    pub color_blend: state::ColorBlend,
+    pub vertex_input: Option<state::VertexInput>,
+    pub input_assembly: Option<state::InputAssembly>,
+    pub tessellation: Option<state::Tessellation>,
+    pub viewport: Option<state::Viewport>,
+    pub rasterization: Option<state::Rasterization>,
+    pub multisample: Option<state::Multisample>,
+    pub depth_stencil: Option<state::DepthStencil>,
+    pub color_blend: Option<state::ColorBlend>,
     pub dynamic_state: Option<state::DynamicState>,
 
     pub layout: super::PipelineLayout,
     pub render_pass: RenderPassMode,
     pub base_pipeline: BasePipeline,
+}
+
+#[derive(Clone, Default)]
+pub struct GraphicsPipelineCreateInfoBuilder {
+    flags: vk::PipelineCreateFlags,
+    stages: Vec<PipelineStage>,
+
+    vertex_input: Option<state::VertexInput>,
+    input_assembly: Option<state::InputAssembly>,
+    tessellation: Option<state::Tessellation>,
+    viewport: Option<state::Viewport>,
+    rasterization: Option<state::Rasterization>,
+    multisample: Option<state::Multisample>,
+    depth_stencil: Option<state::DepthStencil>,
+    color_blend: Option<state::ColorBlend>,
+    dynamic_state: Option<state::DynamicState>,
+
+    layout: Option<super::PipelineLayout>,
+    render_pass: RenderPassMode,
+    base_pipeline: BasePipeline,
+}
+
+impl GraphicsPipelineCreateInfoBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn flags(mut self, flags: vk::PipelineCreateFlags) -> Self {
+        self.flags = flags;
+        self
+    }
+    pub fn stages(mut self, stages: impl Into<Vec<PipelineStage>>) -> Self {
+        self.stages = stages.into();
+        self
+    }
+    pub fn vertex_input(mut self, vertex_input: state::VertexInput) -> Self {
+        self.vertex_input = Some(vertex_input);
+        self
+    }
+    pub fn input_assembly(mut self, input_assembly: state::InputAssembly) -> Self {
+        self.input_assembly = Some(input_assembly);
+        self
+    }
+    pub fn tessellation(mut self, tessellation: state::Tessellation) -> Self {
+        self.tessellation = Some(tessellation);
+        self
+    }
+    pub fn viewport(mut self, viewport: state::Viewport) -> Self {
+        self.viewport = Some(viewport);
+        self
+    }
+    pub fn rasterization(mut self, rasterization: state::Rasterization) -> Self {
+        self.rasterization = Some(rasterization);
+        self
+    }
+    pub fn multisample(mut self, multisample: state::Multisample) -> Self {
+        self.multisample = Some(multisample);
+        self
+    }
+    pub fn depth_stencil(mut self, depth_stencil: state::DepthStencil) -> Self {
+        self.depth_stencil = Some(depth_stencil);
+        self
+    }
+    pub fn color_blend(mut self, color_blend: state::ColorBlend) -> Self {
+        self.color_blend = Some(color_blend);
+        self
+    }
+    pub fn dynamic_state(
+        mut self,
+        dynamic_state: impl IntoIterator<Item = vk::DynamicState>,
+    ) -> Self {
+        self.dynamic_state = Some(state::DynamicState {
+            dynamic_states: dynamic_state.into_iter().collect(),
+        });
+        self
+    }
+    pub fn layout(mut self, layout: super::PipelineLayout) -> Self {
+        self.layout = Some(layout);
+        self
+    }
+    pub fn render_pass(mut self, render_pass: RenderPassMode) -> Self {
+        self.render_pass = render_pass;
+        self
+    }
+    pub fn base_pipeline(mut self, base_pipeline: BasePipeline) -> Self {
+        self.base_pipeline = base_pipeline;
+        self
+    }
+    pub fn finish(self) -> GraphicsPipelineCreateInfo {
+        GraphicsPipelineCreateInfo {
+            flags: self.flags,
+            stages: self.stages,
+            vertex_input: self.vertex_input,
+            input_assembly: self.input_assembly,
+            tessellation: self.tessellation,
+            viewport: self.viewport,
+            rasterization: self.rasterization,
+            multisample: self.multisample,
+            depth_stencil: self.depth_stencil,
+            color_blend: self.color_blend,
+            dynamic_state: self.dynamic_state,
+            layout: self
+                .layout
+                .expect("Pipeline must have pipeline_layout provided"),
+            render_pass: self.render_pass,
+            base_pipeline: self.base_pipeline,
+        }
+    }
 }
 
 struct CStrIterator<'a>(Option<slice::Iter<'a, u8>>);
@@ -260,6 +368,9 @@ macro_rules! add_pnext {
 }
 
 impl GraphicsPipelineCreateInfo {
+    pub fn builder() -> GraphicsPipelineCreateInfoBuilder {
+        GraphicsPipelineCreateInfoBuilder::new()
+    }
     pub unsafe fn to_vk(&self, bump: &Bump, ctx: &Device) -> vk::GraphicsPipelineCreateInfo {
         let mut pnext_head: *const std::ffi::c_void = std::ptr::null();
 
@@ -299,127 +410,158 @@ impl GraphicsPipelineCreateInfo {
         }));
 
         let vertex_input = {
-            let a = &self.vertex_input;
-            let info = vk::PipelineVertexInputStateCreateInfo {
-                vertex_binding_description_count: a.vertex_bindings.len() as u32,
-                p_vertex_binding_descriptions: a.vertex_bindings.as_ffi_ptr(),
-                vertex_attribute_description_count: a.vertex_attributes.len() as u32,
-                p_vertex_attribute_descriptions: a.vertex_attributes.as_ffi_ptr(),
-                ..Default::default()
-            };
-            bump.alloc(info)
+            self.vertex_input
+                .as_ref()
+                .map(|a| {
+                    let info = vk::PipelineVertexInputStateCreateInfo {
+                        vertex_binding_description_count: a.vertex_bindings.len() as u32,
+                        p_vertex_binding_descriptions: a.vertex_bindings.as_ffi_ptr(),
+                        vertex_attribute_description_count: a.vertex_attributes.len() as u32,
+                        p_vertex_attribute_descriptions: a.vertex_attributes.as_ffi_ptr(),
+                        ..Default::default()
+                    };
+                    bump.alloc(info) as *const _
+                })
+                .unwrap_or(ptr::null())
         };
 
         let input_assembly = {
-            let a = &self.input_assembly;
-            let info = vk::PipelineInputAssemblyStateCreateInfo {
-                topology: a.topology,
-                primitive_restart_enable: a.primitive_restart_enable as vk::Bool32,
-                ..Default::default()
-            };
-            bump.alloc(info)
+            self.input_assembly
+                .as_ref()
+                .map(|a| {
+                    let info = vk::PipelineInputAssemblyStateCreateInfo {
+                        topology: a.topology,
+                        primitive_restart_enable: a.primitive_restart_enable as vk::Bool32,
+                        ..Default::default()
+                    };
+                    bump.alloc(info) as *const _
+                })
+                .unwrap_or(ptr::null())
         };
 
         let tessellation = {
-            let a = &self.tessellation;
-            let info = vk::PipelineTessellationStateCreateInfo {
-                patch_control_points: a.patch_control_points,
-                ..Default::default()
-            };
-            bump.alloc(info)
+            self.tessellation
+                .as_ref()
+                .map(|a| {
+                    let info = vk::PipelineTessellationStateCreateInfo {
+                        patch_control_points: a.patch_control_points,
+                        ..Default::default()
+                    };
+                    bump.alloc(info) as *const _
+                })
+                .unwrap_or(ptr::null())
         };
 
         let viewport = {
-            let a = &self.viewport;
-            let info = vk::PipelineViewportStateCreateInfo {
-                viewport_count: a.viewports.len() as u32,
-                p_viewports: a.viewports.as_ffi_ptr(),
-                scissor_count: a.scissors.len() as u32,
-                p_scissors: a.scissors.as_ffi_ptr(),
-                ..Default::default()
-            };
-            bump.alloc(info)
+            self.viewport
+                .as_ref()
+                .map(|a| {
+                    let info = vk::PipelineViewportStateCreateInfo {
+                        viewport_count: a.viewports.len() as u32,
+                        p_viewports: a.viewports.as_ffi_ptr(),
+                        scissor_count: a.scissors.len() as u32,
+                        p_scissors: a.scissors.as_ffi_ptr(),
+                        ..Default::default()
+                    };
+                    bump.alloc(info) as *const _
+                })
+                .unwrap_or(ptr::null())
         };
 
         let rasterization = {
-            let a = &self.rasterization;
-            let info = vk::PipelineRasterizationStateCreateInfo {
-                depth_clamp_enable: a.depth_clamp_enable as vk::Bool32,
-                rasterizer_discard_enable: a.rasterizer_discard_enable as vk::Bool32,
-                polygon_mode: a.polygon_mode,
-                cull_mode: a.cull_mode,
-                front_face: a.front_face,
-                depth_bias_enable: a.depth_bias_enable as vk::Bool32,
-                depth_bias_constant_factor: a.depth_bias_constant_factor,
-                depth_bias_clamp: a.depth_bias_clamp,
-                depth_bias_slope_factor: a.depth_bias_slope_factor,
-                line_width: a.line_width,
-                ..Default::default()
-            };
-            bump.alloc(info)
+            self.rasterization
+                .as_ref()
+                .map(|a| {
+                    let info = vk::PipelineRasterizationStateCreateInfo {
+                        depth_clamp_enable: a.depth_clamp_enable as vk::Bool32,
+                        rasterizer_discard_enable: a.rasterizer_discard_enable as vk::Bool32,
+                        polygon_mode: a.polygon_mode,
+                        cull_mode: a.cull_mode,
+                        front_face: a.front_face,
+                        depth_bias_enable: a.depth_bias_enable as vk::Bool32,
+                        depth_bias_constant_factor: a.depth_bias_constant_factor,
+                        depth_bias_clamp: a.depth_bias_clamp,
+                        depth_bias_slope_factor: a.depth_bias_slope_factor,
+                        line_width: a.line_width,
+                        ..Default::default()
+                    };
+                    bump.alloc(info) as *const _
+                })
+                .unwrap_or(ptr::null())
         };
 
         let multisample = {
-            let a = &self.multisample;
-            let p_sample_mask = match &a.sample_mask {
-                Some(s) => s.as_ffi_ptr(),
-                None => std::ptr::null(),
-            };
-            let info = vk::PipelineMultisampleStateCreateInfo {
-                rasterization_samples: a.rasterization_samples,
-                sample_shading_enable: a.sample_shading_enable as vk::Bool32,
-                min_sample_shading: a.min_sample_shading,
-                p_sample_mask,
-                alpha_to_coverage_enable: a.alpha_to_coverage_enable as vk::Bool32,
-                alpha_to_one_enable: a.alpha_to_one_enable as vk::Bool32,
-                ..Default::default()
-            };
-            bump.alloc(info)
+            self.multisample
+                .as_ref()
+                .map(|a| {
+                    let p_sample_mask = match &a.sample_mask {
+                        Some(s) => s.as_ffi_ptr(),
+                        None => std::ptr::null(),
+                    };
+                    let info = vk::PipelineMultisampleStateCreateInfo {
+                        rasterization_samples: a.rasterization_samples,
+                        sample_shading_enable: a.sample_shading_enable as vk::Bool32,
+                        min_sample_shading: a.min_sample_shading,
+                        p_sample_mask,
+                        alpha_to_coverage_enable: a.alpha_to_coverage_enable as vk::Bool32,
+                        alpha_to_one_enable: a.alpha_to_one_enable as vk::Bool32,
+                        ..Default::default()
+                    };
+                    bump.alloc(info) as *const _
+                })
+                .unwrap_or(ptr::null())
         };
 
         let depth_stencil = {
-            let a = &self.depth_stencil;
-            let info = vk::PipelineDepthStencilStateCreateInfo {
-                depth_test_enable: a.depth_test_enable as vk::Bool32,
-                depth_write_enable: a.depth_write_enable as vk::Bool32,
-                depth_compare_op: a.depth_compare_op,
-                depth_bounds_test_enable: a.depth_bounds_test_enable as vk::Bool32,
-                stencil_test_enable: a.stencil_test_enable as vk::Bool32,
-                front: a.front.clone(),
-                back: a.back.clone(),
-                min_depth_bounds: a.min_depth_bounds,
-                max_depth_bounds: a.max_depth_bounds,
-                ..Default::default()
-            };
-            bump.alloc(info)
+            self.depth_stencil
+                .as_ref()
+                .map(|a| {
+                    let info = vk::PipelineDepthStencilStateCreateInfo {
+                        depth_test_enable: a.depth_test_enable as vk::Bool32,
+                        depth_write_enable: a.depth_write_enable as vk::Bool32,
+                        depth_compare_op: a.depth_compare_op,
+                        depth_bounds_test_enable: a.depth_bounds_test_enable as vk::Bool32,
+                        stencil_test_enable: a.stencil_test_enable as vk::Bool32,
+                        front: a.front.clone(),
+                        back: a.back.clone(),
+                        min_depth_bounds: a.min_depth_bounds,
+                        max_depth_bounds: a.max_depth_bounds,
+                        ..Default::default()
+                    };
+                    bump.alloc(info) as *const _
+                })
+                .unwrap_or(ptr::null())
         };
 
         let color_blend = {
-            let a = &self.color_blend;
-            let info = vk::PipelineColorBlendStateCreateInfo {
-                logic_op_enable: a.logic_op_enable as vk::Bool32,
-                logic_op: a.logic_op,
-                attachment_count: a.attachments.len() as u32,
-                p_attachments: a.attachments.as_ffi_ptr(),
-                blend_constants: a.blend_constants,
-                ..Default::default()
-            };
-            bump.alloc(info)
+            self.color_blend
+                .as_ref()
+                .map(|a| {
+                    let info = vk::PipelineColorBlendStateCreateInfo {
+                        logic_op_enable: a.logic_op_enable as vk::Bool32,
+                        logic_op: a.logic_op,
+                        attachment_count: a.attachments.len() as u32,
+                        p_attachments: a.attachments.as_ffi_ptr(),
+                        blend_constants: a.blend_constants,
+                        ..Default::default()
+                    };
+                    bump.alloc(info) as *const _
+                })
+                .unwrap_or(ptr::null())
         };
 
         let dynamic_state = {
-            let a = &self.dynamic_state;
-            match a {
-                None => std::ptr::null(),
-                Some(a) => {
+            self.dynamic_state
+                .as_ref()
+                .map(|a| {
                     let info = vk::PipelineDynamicStateCreateInfo {
                         dynamic_state_count: a.dynamic_states.len() as u32,
                         p_dynamic_states: a.dynamic_states.as_ffi_ptr(),
                         ..Default::default()
                     };
-                    bump.alloc(info)
-                }
-            }
+                    bump.alloc(info) as *const _
+                })
+                .unwrap_or(ptr::null())
         };
 
         let (base_pipeline_handle, base_pipeline_index) = match &self.base_pipeline {
@@ -634,5 +776,8 @@ pub struct ConcreteGraphicsPipeline(pub(crate) GraphicsPipeline, pub(crate) vk::
 impl ConcreteGraphicsPipeline {
     pub fn get_handle(&self) -> vk::Pipeline {
         self.1
+    }
+    pub fn get_object(&self) -> &GraphicsPipeline {
+        &self.0
     }
 }

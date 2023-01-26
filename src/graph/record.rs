@@ -123,6 +123,13 @@ pub struct ImageMove {
     pub(crate) to: GraphImage,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct MovedImageEntry {
+    pub(crate) dst: GraphImage,
+    pub(crate) dst_layer_offset: u16,
+    pub(crate) dst_layer_count: u16,
+}
+
 // TODO merge ImageData and BufferData with ResourceMarker
 #[derive(Clone)]
 pub(crate) enum ImageData {
@@ -131,10 +138,10 @@ pub(crate) enum ImageData {
     Transient(PhysicalImage),
     Imported(object::Image),
     Swapchain(object::Swapchain),
-    // dst image, layer offset, layer count
     // TODO make GraphImage a Cell and update it when traversing to be a straight reference to the dst image
     // (if the dst image itself has  been moved, we will have to visit its dst image to get the final layer offset and such)
-    Moved(GraphImage, u16, u16),
+    // dst image, layer offset, layer count
+    Moved(Cell<MovedImageEntry>),
 }
 impl ImageData {
     pub(crate) fn get_variant_name(&self) -> &'static str {
@@ -241,6 +248,63 @@ impl CompilationInput {
     }
     pub(crate) fn get_buffer_display(&self, buffer: GraphBuffer) -> GraphObjectDisplay<'_> {
         self.buffers[buffer.index()].display(buffer.index())
+    }
+    pub(crate) fn get_concrete_image_data(
+        &self,
+        image: GraphImage,
+    ) -> &ImageData {
+        self.get_concrete_image_data_impl(image).1
+    }
+    fn get_concrete_image_data_impl(
+        &self,
+        image: GraphImage,
+    ) -> (MovedImageEntry, &ImageData) {
+        let mut image = image;
+        loop {
+            match self.get_image_data(image) {
+                ImageData::Moved(old_entry) => {
+                    let mut entry = old_entry.get();
+
+                    let (target_entry, data) = self.get_concrete_image_data_impl(entry.dst);
+
+                    entry.dst_layer_offset += target_entry.dst_layer_offset;
+                    entry.dst = target_entry.dst;
+                    old_entry.set(entry);
+
+                    return (entry, data);
+                }
+                other => {
+                    return (
+                        MovedImageEntry {
+                            dst: image,
+                            dst_layer_offset: 0,
+                            dst_layer_count: 0,
+                        },
+                        other,
+                    );
+                }
+            }
+        }
+    }
+    pub(crate) fn get_image_subresource_layer_offset(&self, image: GraphImage) -> u32 {
+        // we're calling this for the side effect of short circuiting all image move sequences (there's interior mutability)
+        let _  = self.get_concrete_image_data(image);
+        if let ImageData::Moved(entry) = self.get_image_data(image) {
+            entry.get().dst_layer_offset as u32
+        } else {
+            0
+        }
+    }
+    /// Returns the base array layer in the image and the count of following layers, None if it's the whole resource
+    pub(crate) fn get_image_subresource_layer_offset_count(&self, image: GraphImage) -> (u32, Option<u32>) {
+        // we're calling this for the side effect of short circuiting all image move sequences (there's interior mutability)
+        let _  = self.get_concrete_image_data(image);
+        if let ImageData::Moved(entry) = self.get_image_data(image) {
+            let entry = entry.get();
+            (entry.dst_layer_offset as u32, Some(entry.dst_layer_count as u32))
+        } else {
+            (0, None)
+        }
     }
 }
 
@@ -372,7 +436,11 @@ impl GraphBuilder {
 
                 let layer_count: u16 = info.array_layers.try_into().unwrap();
                 *self.0.input.images[i.index()].get_inner_mut() =
-                    ImageData::Moved(image, layer_offset, layer_count);
+                    ImageData::Moved(Cell::new(MovedImageEntry {
+                        dst: image, 
+                        dst_layer_offset: layer_offset,
+                        dst_layer_count: layer_count,
+                    }));
                 layer_offset += layer_count;
             }
 
@@ -582,7 +650,7 @@ impl<'a> GraphPassBuilder<'a> {
             ImageData::Transient(_) => panic!(),
             ImageData::Imported(handle) => unsafe { handle.0.get_create_info().format },
             ImageData::Swapchain(handle) => unsafe { handle.0.get_create_info().format },
-            ImageData::Moved(_, _, _) => panic!(),
+            ImageData::Moved(_) => panic!(),
         }
     }
     // TODO check (possibly update for transients) usage flags against their create info
@@ -600,7 +668,7 @@ impl<'a> GraphPassBuilder<'a> {
             ImageData::TransientPrototype(info, _) => info.usage,
             ImageData::Imported(archandle) => unsafe { archandle.0.get_create_info().usage },
             ImageData::Swapchain(archandle) => unsafe { archandle.0.get_create_info().usage },
-            ImageData::Transient(_) | ImageData::Moved(_, _, _) => unreachable!(),
+            ImageData::Transient(_) | ImageData::Moved(_) => unreachable!(),
         };
 
         assert!(resource_usage.contains(usage));

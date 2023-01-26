@@ -1,5 +1,5 @@
 use pumice::{util::ObjectHandle, vk};
-use smallvec::SmallVec;
+use smallvec::{smallvec, SmallVec};
 
 use crate::{
     device::Device,
@@ -7,7 +7,7 @@ use crate::{
         compile::GraphContext, execute::GraphExecutor, record::GraphPassBuilder,
         task::GraphicsPipelinePromise, GraphImage,
     },
-    object::{self, ConcreteGraphicsPipeline, GraphicsPipeline, RenderPassMode},
+    object::{self, ConcreteGraphicsPipeline, Extent, GraphicsPipeline, RenderPassMode},
 };
 
 use super::{CreatePass, RenderPass};
@@ -40,12 +40,12 @@ impl RenderPass for ClearImage {
     }
     unsafe fn execute(
         &mut self,
-        executor: &super::GraphExecutor,
-        device: &crate::device::Device,
+        executor: &GraphExecutor,
+        device: &Device,
     ) -> pumice::VulkanResult<()> {
         let cmd = executor.command_buffer();
         let image = executor.get_image(self.image);
-        let range = executor.get_image_subresource_range(self.image);
+        let range = executor.get_image_subresource_range(self.image, vk::ImageAspectFlags::COLOR);
         device.device().cmd_clear_color_image(
             cmd,
             image,
@@ -69,7 +69,7 @@ impl CreatePass for SimpleShader {
             builder.use_image(
                 image,
                 vk::ImageUsageFlags::COLOR_ATTACHMENT,
-                vk::PipelineStageFlags2KHR::FRAGMENT_SHADER,
+                vk::PipelineStageFlags2KHR::COLOR_ATTACHMENT_OUTPUT,
                 vk::AccessFlags2KHR::COLOR_ATTACHMENT_WRITE,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 None,
@@ -114,50 +114,35 @@ impl RenderPass for SimpleShaderPass {
     ) -> pumice::VulkanResult<()> {
         let d = device.device();
         let cmd = executor.command_buffer();
-        // executor.get_image(image)
-
-        let views = self.info.attachments.iter().map(|i| {
-            let handle = executor.get_image(*i);
-            device
-                .device()
-                .create_image_view(
-                    &object::ImageViewCreateInfo {
-                        view_type: vk::ImageViewType::T2D,
-                        format: vk::Format::B8G8R8A8_UNORM,
-                        components: vk::ComponentMapping::default(),
-                        subresource_range: executor.get_image_subresource_range(*i),
-                    }
-                    .to_vk(handle),
-                    None,
-                )
-                .unwrap()
-        });
 
         let attachments = self
             .info
             .attachments
             .iter()
-            .zip(views)
-            .map(|(i, view)| vk::RenderingAttachmentInfoKHR {
-                image_view: view,
+            .map(|&image| vk::RenderingAttachmentInfoKHR {
+                image_view: executor.get_default_image_view(image, vk::ImageAspectFlags::COLOR),
                 image_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 resolve_mode: vk::ResolveModeFlagsKHR::NONE,
                 load_op: vk::AttachmentLoadOp::LOAD,
                 store_op: vk::AttachmentStoreOp::STORE,
                 clear_value: vk::ClearValue {
-                    color: vk::ClearColorValue { float_32: [0.0; 4] },
+                    color: vk::ClearColorValue {
+                        float_32: [0.0, 0.0, 0.0, 1.0],
+                    },
                 },
                 ..Default::default()
             })
             .collect::<SmallVec<[_; 8]>>();
 
+        let (width, height) = match executor.get_image_extent(self.info.attachments[0]) {
+            Extent::D2(w, h) => (w, h),
+            Extent::D1(_) | Extent::D3(_, _, _) => panic!("Attachments must be 2D images"),
+        };
+
         let info = vk::RenderingInfoKHR {
             render_area: vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
-                extent: vk::Extent2D {
-                    width: 128,
-                    height: 128,
-                },
+                extent: vk::Extent2D { width, height },
             },
             layer_count: 1,
             view_mask: 0,
@@ -175,6 +160,32 @@ impl RenderPass for SimpleShaderPass {
             vk::PipelineBindPoint::GRAPHICS,
             self.pipeline.get_handle(),
         );
+
+        // TODO this kinda sucks, we should probably include a bitmask of dynamic states or something
+        let pipeline_info = self.pipeline.get_object().0.get_create_info();
+
+        if let Some(state) = &pipeline_info.dynamic_state {
+            if state.dynamic_states.contains(&vk::DynamicState::VIEWPORT) {
+                let viewport = vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: width as f32,
+                    height: height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                };
+                d.cmd_set_viewport(cmd, 0, std::slice::from_ref(&viewport));
+            }
+
+            if state.dynamic_states.contains(&vk::DynamicState::SCISSOR) {
+                let rect = vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D { width, height },
+                };
+                d.cmd_set_scissor(cmd, 0, std::slice::from_ref(&rect));
+            }
+        }
+
         d.cmd_draw(cmd, 3, 1, 0, 0);
 
         d.cmd_end_rendering_khr(cmd);

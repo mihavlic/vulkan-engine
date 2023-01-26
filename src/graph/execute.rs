@@ -1,5 +1,5 @@
 use std::{
-    borrow::Cow,
+    borrow::{BorrowMut, Cow},
     cell::{Cell, RefCell, RefMut},
     collections::{hash_map::Entry, BinaryHeap},
     fmt::Display,
@@ -41,8 +41,8 @@ use crate::{
 use super::{
     allocator::{AvailabilityToken, Suballocator},
     compile::{
-        GraphPassEvent, GraphResource, ResourceFirstAccess, ResourceState, SimpleBarrier,
-        SpecialBarrier, Submission, SwapchainPresent,
+        GraphPassEvent, GraphResource, ImageKindCreateInfo, ResourceFirstAccess, ResourceState,
+        SimpleBarrier, SpecialBarrier, Submission, SwapchainPresent,
     },
     record::{BufferData, CompilationInput, GraphBuilder, ImageData, ImageMove, PassData},
     resource_marker::{ResourceMarker, TypeOption, TypeSome},
@@ -68,7 +68,7 @@ pub(crate) struct PhysicalImageData {
     pub(crate) info: ImageCreateInfo,
     pub(crate) memory: SuballocationUgh,
     pub(crate) vkhandle: vk::Image,
-    pub(crate) state: ImageMutableState,
+    pub(crate) state: RefCell<ImageMutableState>,
 }
 
 impl PhysicalImageData {
@@ -81,7 +81,7 @@ pub(crate) struct PhysicalBufferData {
     pub(crate) info: BufferCreateInfo,
     pub(crate) memory: SuballocationUgh,
     pub(crate) vkhandle: vk::Buffer,
-    pub(crate) state: BufferMutableState,
+    pub(crate) state: RefCell<BufferMutableState>,
 }
 
 impl PhysicalBufferData {
@@ -132,34 +132,120 @@ impl Drop for LegacySemaphoreStack {
 pub struct GraphExecutor<'a> {
     graph: &'a CompiledGraph,
     command_buffer: vk::CommandBuffer,
+    swapchain_image_indices: &'a ahash::HashMap<GraphImage, u32>,
     raw_images: &'a [Option<vk::Image>],
     raw_buffers: &'a [Option<vk::Buffer>],
 }
 
 pub struct DescriptorState;
 impl<'a> GraphExecutor<'a> {
-    pub fn get_image_subresource_range(&self, _handle: GraphImage) -> vk::ImageSubresourceRange {
+    pub fn get_image_format(&self, image: GraphImage) -> vk::Format {
+        let info = self.graph.get_image_create_info(image);
+        match info {
+            ImageKindCreateInfo::Image(info) => info.format,
+            ImageKindCreateInfo::Swapchain(info) => info.format,
+        }
+    }
+    pub fn get_image_extent(&self, image: GraphImage) -> object::Extent {
+        let info = self.graph.get_image_create_info(image);
+        match info {
+            ImageKindCreateInfo::Image(info) => info.size,
+            ImageKindCreateInfo::Swapchain(info) => {
+                let ImageData::Swapchain(archandle) = self.graph.input.get_image_data(image) else {
+                    unreachable!()
+                };
+                let extent = archandle.get_extent();
+                object::Extent::D2(extent.width, extent.height)
+            }
+        }
+    }
+    pub fn get_image_subresource_range(
+        &self,
+        image: GraphImage,
+        aspect: vk::ImageAspectFlags,
+    ) -> vk::ImageSubresourceRange {
+        let (base_array_layer, layer_count) = self
+            .graph
+            .input
+            .get_image_subresource_layer_offset_count(image);
         vk::ImageSubresourceRange {
-            // TODO don't be dumb
-            aspect_mask: vk::ImageAspectFlags::COLOR,
+            aspect_mask: aspect,
             base_mip_level: 0,
             level_count: vk::REMAINING_MIP_LEVELS,
-            base_array_layer: 0,
-            layer_count: vk::REMAINING_ARRAY_LAYERS,
+            base_array_layer,
+            layer_count: layer_count.unwrap_or(vk::REMAINING_ARRAY_LAYERS),
         }
     }
     pub fn get_image(&self, image: GraphImage) -> vk::Image {
         self.raw_images[image.index()].unwrap()
     }
-    pub fn get_image_default_view(&self, image: GraphImage) -> vk::ImageView {
-        todo!()
-    }
-    pub fn get_image_view(
+    pub unsafe fn get_image_view(
         &self,
         image: GraphImage,
         info: &object::ImageViewCreateInfo,
     ) -> vk::ImageView {
-        todo!()
+        assert!(
+            self.graph.is_image_alive(image),
+            "Attempt to access dead image"
+        );
+
+        let mut info = info.clone();
+        let layer_offset = self.graph.input.get_image_subresource_layer_offset(image);
+        info.subresource_range.base_array_layer += layer_offset;
+
+        let batch_id = self.graph.state.current_generation;
+
+        // TODO implement some sort of cache for views, since we will be using GenerationId's to garbage collect views
+        // we can rely on them being present for our entire generation and don't need to keep locking the handle
+        let data = self.graph.input.get_concrete_image_data(image);
+        match data {
+            ImageData::TransientPrototype(_, _) => {
+                panic!("A compiled graph cannot have prototype transient resources")
+            }
+            ImageData::Transient(physical) => {
+                let data = &self.graph.physical_images[physical.index()];
+                data.state
+                    .borrow_mut()
+                    .get_view(data.vkhandle, &info, batch_id, &self.graph.state.device)
+                    .unwrap()
+            }
+            ImageData::Imported(archandle) => archandle.get_view(&info, batch_id).unwrap(),
+            ImageData::Swapchain(archandle) => {
+                let index = *self.swapchain_image_indices.get(&image).unwrap();
+                archandle.get_view(index, &info, batch_id).unwrap()
+            }
+            ImageData::Moved(_) => {
+                panic!("get_concrete_image_data should resolve moved images into their targets")
+            }
+        }
+    }
+    pub unsafe fn get_default_image_view(
+        &self,
+        image: GraphImage,
+        aspect: vk::ImageAspectFlags,
+    ) -> vk::ImageView {
+        let info = self.graph.get_image_create_info(image);
+        let (kind, format) = match info {
+            ImageKindCreateInfo::Image(info) => (
+                match info.size {
+                    object::Extent::D1(_) => vk::ImageViewType::T1D,
+                    object::Extent::D2(_, _) => vk::ImageViewType::T2D,
+                    object::Extent::D3(_, _, _) => vk::ImageViewType::T3D,
+                },
+                info.format,
+            ),
+            ImageKindCreateInfo::Swapchain(info) => (vk::ImageViewType::T2D, info.format),
+        };
+        let subresource_range = self.get_image_subresource_range(image, aspect);
+        self.get_image_view(
+            image,
+            &object::ImageViewCreateInfo {
+                view_type: kind,
+                format,
+                components: vk::ComponentMapping::default(),
+                subresource_range,
+            },
+        )
     }
     pub fn get_buffer(&self, buffer: GraphBuffer) -> vk::Buffer {
         self.raw_buffers[buffer.index()].unwrap()
@@ -183,6 +269,38 @@ pub(crate) enum DeferredResourceFree {
     },
 }
 
+pub(crate) struct CompiledGraphState {
+    // semaphores used for presenting:
+    //  to synchronize the moment when we aren't using the swapchain image anymore
+    //  to start the submission only after the presentation engine is done with it
+    // https://vulkan-tutorial.com/Drawing_a_triangle/Drawing/Rendering_and_presentation#page_Creating-the-synchronization-objects
+    pub(crate) swapchain_semaphores: LegacySemaphoreStack,
+    pub(crate) command_pool: vk::CommandPool,
+    pub(crate) current_generation: GenerationId,
+    pub(crate) prev_generation: Cell<Option<GenerationId>>,
+    pub(crate) device: ManuallyDrop<OwnedDevice>,
+}
+
+impl CompiledGraphState {
+    pub(crate) fn new(device: OwnedDevice) -> Self {
+        Self {
+            swapchain_semaphores: LegacySemaphoreStack::new(),
+            command_pool: unsafe {
+                device
+                    .device()
+                    .create_command_pool(
+                        &CommandPoolCreateInfo::default(),
+                        device.allocator_callbacks(),
+                    )
+                    .unwrap()
+            },
+            current_generation: GenerationId::EARLIEST,
+            prev_generation: Cell::new(None),
+            device: ManuallyDrop::new(device),
+        }
+    }
+}
+
 pub struct CompiledGraph {
     pub(crate) input: CompilationInput,
 
@@ -202,32 +320,64 @@ pub struct CompiledGraph {
     pub(crate) alive_images: FixedBitSet,
     pub(crate) alive_buffers: FixedBitSet,
 
-    // semaphores used for presenting:
-    //  to synchronize the moment when we aren't using the swapchain image anymore
-    //  to start the submission only after the presentation engine is done with it
-    // https://vulkan-tutorial.com/Drawing_a_triangle/Drawing/Rendering_and_presentation#page_Creating-the-synchronization-objects
-    pub(crate) swapchain_semaphores: LegacySemaphoreStack,
-    pub(crate) command_pool: vk::CommandPool,
-    pub(crate) prev_generation: Cell<Option<GenerationId>>,
-    pub(crate) device: ManuallyDrop<OwnedDevice>,
+    pub(crate) state: CompiledGraphState,
 }
 
 impl CompiledGraph {
+    pub(crate) fn is_pass_alive(&self, pass: GraphPass) -> bool {
+        self.alive_passes.contains(pass.index())
+    }
+    pub(crate) fn is_image_alive(&self, image: GraphImage) -> bool {
+        self.alive_images.contains(image.index())
+    }
+    pub(crate) fn is_buffer_alive(&self, buffer: GraphBuffer) -> bool {
+        self.alive_buffers.contains(buffer.index())
+    }
+    // FIXME code duplication with compile.rs
+    pub(crate) fn get_image_create_info(&self, image: GraphImage) -> ImageKindCreateInfo<'_> {
+        let mut data = self.input.get_image_data(image);
+        loop {
+            match data {
+                ImageData::TransientPrototype(info, _) => {
+                    return ImageKindCreateInfo::Image(info);
+                }
+                ImageData::Transient(physical) => {
+                    return ImageKindCreateInfo::Image(
+                        &self.physical_images[physical.index()].info,
+                    );
+                }
+                ImageData::Imported(archandle) => {
+                    return ImageKindCreateInfo::Image(unsafe { archandle.0.get_create_info() });
+                }
+                ImageData::Swapchain(archandle) => {
+                    return ImageKindCreateInfo::Swapchain(unsafe {
+                        archandle.0.get_create_info()
+                    });
+                }
+                ImageData::Moved(_) => {
+                    data = self.input.get_concrete_image_data(image);
+                    continue;
+                }
+            }
+        }
+    }
     pub fn run(&mut self) {
         // we can now start executing the graph (TODO move this to another function, allow the built graph to be executed multiple times)
         // wait for previously submitted work to finish
-        if let Some(id) = self.prev_generation.get() {
-            self.device
+        if let Some(id) = self.state.prev_generation.get() {
+            self.state
+                .device
                 .wait_for_generation_single(id, u64::MAX)
                 .unwrap();
         }
 
         // since we've now waited for all previous work to finish, we can safely reset the semaphores
         unsafe {
-            self.swapchain_semaphores.reset();
-            self.device
+            self.state.swapchain_semaphores.reset();
+            self.state
+                .device
                 .device()
-                .reset_command_pool(self.command_pool, None)
+                .reset_command_pool(self.state.command_pool, None)
                 .unwrap();
         }
 
@@ -236,7 +386,7 @@ impl CompiledGraph {
         let semaphores = self
             .submissions
             .iter()
-            .map(|_| self.device.make_submission())
+            .map(|_| self.state.device.make_submission())
             .collect::<Vec<_>>();
 
         // TODO when we separate compiling and executing a graph, these two loops will be far away
@@ -247,12 +397,12 @@ impl CompiledGraph {
         }
 
         // TODO do something about this so that we don't hold the lock for all of execution
-        let image_storage_lock = self.device.image_storage.acquire_all_exclusive();
-        let buffer_storage_lock = self.device.buffer_storage.acquire_all_exclusive();
-        let swapchain_storage_lock = self.device.swapchain_storage.acquire_all_exclusive();
+        let image_storage_lock = self.state.device.image_storage.acquire_all_exclusive();
+        let buffer_storage_lock = self.state.device.buffer_storage.acquire_all_exclusive();
+        let swapchain_storage_lock = self.state.device.swapchain_storage.acquire_all_exclusive();
 
         let mut waited_idle = false;
-        let mut swapchain_indices: ahash::HashMap<GraphImage, u32> = constant_ahash_hashmap();
+        let mut swapchain_image_indices: ahash::HashMap<GraphImage, u32> = constant_ahash_hashmap();
         let mut submission_swapchains: ahash::HashMap<QueueSubmission, Vec<SwapchainPresent>> =
             constant_ahash_hashmap();
 
@@ -310,8 +460,10 @@ impl CompiledGraph {
                                 .get_object_data()
                                 .get_mutable_state(&swapchain_storage_lock);
 
-                            let acquire_semaphore = self.swapchain_semaphores.next(&self.device);
-                            let release_semaphore = self.swapchain_semaphores.next(&self.device);
+                            let acquire_semaphore =
+                                self.state.swapchain_semaphores.next(&self.state.device);
+                            let release_semaphore =
+                                self.state.swapchain_semaphores.next(&self.state.device);
 
                             let mut attempt = 0;
                             let index = loop {
@@ -319,7 +471,7 @@ impl CompiledGraph {
                                     u64::MAX,
                                     acquire_semaphore,
                                     vk::Fence::null(),
-                                    &self.device,
+                                    &self.state.device,
                                 ) {
                                     SwapchainAcquireStatus::Ok(index, false) => break index,
                                     SwapchainAcquireStatus::OutOfDate
@@ -330,12 +482,15 @@ impl CompiledGraph {
                                         }
 
                                         if !waited_idle {
-                                            self.device.wait_idle();
+                                            self.state.device.wait_idle();
                                             waited_idle = true;
                                         }
 
                                         mutable
-                                            .recreate(&archandle.0.get_create_info(), &self.device)
+                                            .recreate(
+                                                &archandle.0.get_create_info(),
+                                                &self.state.device,
+                                            )
                                             .unwrap();
 
                                         attempt += 1;
@@ -361,7 +516,7 @@ impl CompiledGraph {
                                 });
 
                             // we do not update any synchronization state here, since we already get synchronization from swapchain image acquire and the subsequent present
-                            swapchain_indices.insert(image, index);
+                            swapchain_image_indices.insert(image, index);
                         },
                         _ => unreachable!("Not an external resource"),
                     }
@@ -419,7 +574,7 @@ impl CompiledGraph {
                     }
                     ImageData::Imported(archandle) => Some(archandle.0.get_handle()),
                     ImageData::Swapchain(archandle) => {
-                        let image_index = *swapchain_indices.get(&image).unwrap();
+                        let image_index = *swapchain_image_indices.get(&image).unwrap();
                         Some(
                             archandle
                                 .0
@@ -429,7 +584,7 @@ impl CompiledGraph {
                                 .image,
                         )
                     }
-                    ImageData::Moved(_, _, _) => todo!("TODO implement this"),
+                    ImageData::Moved(_) => todo!("TODO implement this"),
                 }
             })
             .collect::<Vec<_>>();
@@ -456,12 +611,12 @@ impl CompiledGraph {
             })
             .collect::<Vec<_>>();
 
-        let current_generation = self.device.open_generation();
+        let current_generation = self.state.device.open_generation();
         current_generation.add_submissions(semaphores.iter().map(|(s, _)| *s));
         let id = current_generation.id();
         current_generation.finish();
 
-        self.prev_generation.set(Some(id));
+        self.state.prev_generation.set(Some(id));
 
         // TODO multithreaded execution
         let mut memory_barriers = Vec::new();
@@ -471,18 +626,19 @@ impl CompiledGraph {
         unsafe {
             for (i, sub) in self.submissions.iter().enumerate() {
                 let info = vk::CommandBufferAllocateInfo {
-                    command_pool: self.command_pool,
+                    command_pool: self.state.command_pool,
                     level: vk::CommandBufferLevel::PRIMARY,
                     command_buffer_count: 1,
                     ..Default::default()
                 };
                 let command_buffer = self
+                    .state
                     .device
                     .device()
                     .allocate_command_buffers(&info)
                     .unwrap()[0];
 
-                let d = self.device.device();
+                let d = self.state.device.device();
                 let Submission {
                     queue: _,
                     passes,
@@ -523,11 +679,12 @@ impl CompiledGraph {
                     let executor = GraphExecutor {
                         graph: self,
                         command_buffer,
+                        swapchain_image_indices: &swapchain_image_indices,
                         raw_images: &raw_images,
                         raw_buffers: &raw_buffers,
                     };
                     self.input.passes[pass.index()]
-                        .on_created(|p| p.execute(&executor, &self.device))
+                        .on_created(|p| p.execute(&executor, &self.state.device))
                         .unwrap();
                 }
                 do_barriers(
@@ -779,17 +936,16 @@ unsafe fn do_barriers(
 
 impl Drop for CompiledGraph {
     fn drop(&mut self) {
-        let Self {
-            memory,
+        let CompiledGraphState {
             prev_generation,
             swapchain_semaphores,
             command_pool,
             device,
             ..
-        } = self;
+        } = &mut self.state;
 
         let memory: Box<[Suballocator; vk::MAX_MEMORY_TYPES as usize]> =
-            unsafe { ManuallyDrop::take(memory) };
+            unsafe { ManuallyDrop::take(&mut self.memory) };
         let allocations = memory
             .into_iter()
             .flat_map(|m| m.collect_blocks())

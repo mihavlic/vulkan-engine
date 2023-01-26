@@ -19,6 +19,10 @@ use super::submission::{QueueSubmission, WaitResult};
 #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GenerationId(u32);
 
+impl GenerationId {
+    pub const EARLIEST: Self = Self(0);
+}
+
 struct OpenGenerationEntry {
     id: GenerationId,
     mutex: parking_lot::RawMutex,
