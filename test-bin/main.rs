@@ -38,6 +38,9 @@ fn main() {
         conf.add_extension(vk::KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
         conf.add_extension(vk::KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
         conf.add_extension(vk::KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+        conf.add_extension(vk::KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+
+        conf.fill_in_extensions();
 
         let info = InstanceCreateInfo {
             config: &mut conf,
@@ -122,10 +125,28 @@ fn main() {
             vertex_input: Default::default(),
             input_assembly: object::state::InputAssembly {
                 topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-                ..Default::default()
+                primitive_restart_enable: false,
             },
             tessellation: Default::default(),
-            viewport: Default::default(),
+            viewport: object::state::Viewport {
+                viewports: [vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 128.0,
+                    height: 128.0,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }]
+                .into(),
+                scissors: [vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D {
+                        width: 128,
+                        height: 128,
+                    },
+                }]
+                .into(),
+            },
             rasterization: object::state::Rasterization {
                 depth_clamp_enable: false,
                 rasterizer_discard_enable: false,
