@@ -170,6 +170,11 @@ impl RenderPass for SimpleShaderPass {
 
         d.cmd_begin_rendering_khr(cmd, &info);
 
+        d.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::GRAPHICS,
+            self.pipeline.get_handle(),
+        );
         d.cmd_draw(cmd, 3, 1, 0, 0);
 
         d.cmd_end_rendering_khr(cmd);

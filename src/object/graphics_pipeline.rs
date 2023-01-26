@@ -106,6 +106,7 @@ pub enum BasePipeline {
 
 pub mod state {
     use pumice::vk;
+    use smallvec::SmallVec;
 
     pub type InputBinding = vk::VertexInputBindingDescription;
     pub type InputAttribute = vk::VertexInputAttributeDescription;
@@ -129,8 +130,8 @@ pub mod state {
 
     #[derive(Clone, Default)]
     pub struct Viewport {
-        pub viewports: Vec<vk::Viewport>,
-        pub scissors: Vec<vk::Rect2D>,
+        pub viewports: SmallVec<[vk::Viewport; 1]>,
+        pub scissors: SmallVec<[vk::Rect2D; 1]>,
     }
 
     #[derive(Clone, Default)]
