@@ -29,8 +29,10 @@ use std::{
     collections::{hash_map::RandomState, HashSet},
     ffi::{c_void, CStr},
     fmt::Display,
+    io,
     ops::Deref,
     ptr::NonNull,
+    slice,
     sync::Arc,
 };
 
@@ -328,6 +330,15 @@ impl Device {
     ) -> Option<&vk::QueueFamilyProperties> {
         self.queue_families
             .get(self.queue_selection_mapping.get(selection_index)?.0)
+    }
+    pub unsafe fn create_shader_module_read<R: io::Read + io::Seek>(
+        &self,
+        data: &mut R,
+    ) -> VulkanResult<object::ShaderModule> {
+        let data = read_spirv(data).map_err(|_| vk::Result::ERROR_UNKNOWN)?;
+        self.shader_modules
+            .get_or_create(data.as_ref(), NonNull::from(self))
+            .map(object::ShaderModule)
     }
     pub unsafe fn create_shader_module(
         &self,
@@ -750,4 +761,40 @@ unsafe fn select_device(
         queue_families,
         selected_queue_families,
     )
+}
+
+// stolen from ash
+fn read_spirv<R: io::Read + io::Seek>(x: &mut R) -> io::Result<Vec<u32>> {
+    let size = x.seek(io::SeekFrom::End(0))?;
+    if size % 4 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "input length not divisible by 4",
+        ));
+    }
+    if size > usize::max_value() as u64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "input too long"));
+    }
+    let words = (size / 4) as usize;
+    // https://github.com/MaikKlein/ash/issues/354:
+    // Zero-initialize the result to prevent read_exact from possibly
+    // reading uninitialized memory.
+    let mut result = vec![0u32; words];
+    x.seek(io::SeekFrom::Start(0))?;
+    x.read_exact(unsafe {
+        std::slice::from_raw_parts_mut(result.as_mut_ptr().cast::<u8>(), words * 4)
+    })?;
+    const MAGIC_NUMBER: u32 = 0x0723_0203;
+    if !result.is_empty() && result[0] == MAGIC_NUMBER.swap_bytes() {
+        for word in &mut result {
+            *word = word.swap_bytes();
+        }
+    }
+    if result.is_empty() || result[0] != MAGIC_NUMBER {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "input missing SPIR-V magic number",
+        ));
+    }
+    Ok(result)
 }

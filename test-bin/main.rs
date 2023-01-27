@@ -96,11 +96,12 @@ fn main() {
 
         let swapchain = make_swapchain(&window, surface, &device);
 
-        let vert_spirv = read_spv(&mut File::open("target/shader.vert.spv").unwrap()).unwrap();
-        let frag_spirv = read_spv(&mut File::open("target/shader.frag.spv").unwrap()).unwrap();
-
-        let vert_module = device.create_shader_module(vert_spirv).unwrap();
-        let frag_module = device.create_shader_module(frag_spirv).unwrap();
+        let vert_module = device
+            .create_shader_module_read(&mut File::open("test-bin/shader.vert.spv").unwrap())
+            .unwrap();
+        let frag_module = device
+            .create_shader_module_read(&mut File::open("test-bin/shader.frag.spv").unwrap())
+            .unwrap();
 
         let empty_layout = device
             .create_pipeline_layout(object::PipelineLayoutCreateInfo::empty())
@@ -242,40 +243,4 @@ unsafe fn make_swapchain(
     };
 
     device.create_swapchain(info).unwrap()
-}
-
-// stolen from ash
-pub fn read_spv<R: io::Read + io::Seek>(x: &mut R) -> io::Result<Vec<u32>> {
-    let size = x.seek(io::SeekFrom::End(0))?;
-    if size % 4 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "input length not divisible by 4",
-        ));
-    }
-    if size > usize::max_value() as u64 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "input too long"));
-    }
-    let words = (size / 4) as usize;
-    // https://github.com/MaikKlein/ash/issues/354:
-    // Zero-initialize the result to prevent read_exact from possibly
-    // reading uninitialized memory.
-    let mut result = vec![0u32; words];
-    x.seek(io::SeekFrom::Start(0))?;
-    x.read_exact(unsafe {
-        slice::from_raw_parts_mut(result.as_mut_ptr().cast::<u8>(), words * 4)
-    })?;
-    const MAGIC_NUMBER: u32 = 0x0723_0203;
-    if !result.is_empty() && result[0] == MAGIC_NUMBER.swap_bytes() {
-        for word in &mut result {
-            *word = word.swap_bytes();
-        }
-    }
-    if result.is_empty() || result[0] != MAGIC_NUMBER {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "input missing SPIR-V magic number",
-        ));
-    }
-    Ok(result)
 }
