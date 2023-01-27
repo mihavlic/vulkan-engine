@@ -1,8 +1,10 @@
 #version 450
 #extension GL_ARB_separate_shader_objects : enable
 
+layout (location = 0) in vec3 inColor;
+
 layout(location = 0) out vec4 color;
 
 void main() {
-    color = vec4(0., 0., 1., 1.);
+    color = vec4(inColor, 1.);
 }

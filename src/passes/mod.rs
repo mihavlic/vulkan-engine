@@ -8,15 +8,19 @@ use crate::{
     graph::{compile::GraphContext, execute::GraphExecutor, record::GraphPassBuilder},
 };
 
-pub trait RenderPass: 'static {
+pub trait RenderPass: 'static + Send {
     fn prepare(&mut self);
     unsafe fn execute(&mut self, executor: &GraphExecutor, device: &Device) -> VulkanResult<()>;
 }
 
-pub trait CreatePass: 'static {
-    type PreparedData: 'static;
+pub trait CreatePass: 'static + Send {
+    type PreparedData: 'static + Send;
     fn prepare(&mut self, builder: &mut GraphPassBuilder) -> Self::PreparedData;
-    fn create(self, prepared: Self::PreparedData, ctx: &mut GraphContext) -> Box<dyn RenderPass>;
+    fn create(
+        self,
+        prepared: Self::PreparedData,
+        ctx: &mut GraphContext,
+    ) -> Box<dyn RenderPass + Send>;
 }
 
 impl RenderPass for () {
@@ -28,12 +32,16 @@ impl RenderPass for () {
     }
 }
 
-impl<P: RenderPass, F: FnMut(&mut GraphPassBuilder) -> P + 'static> CreatePass for F {
+impl<P: RenderPass + Send, F: FnMut(&mut GraphPassBuilder) -> P + Send + 'static> CreatePass for F {
     type PreparedData = P;
     fn prepare(&mut self, builder: &mut GraphPassBuilder) -> Self::PreparedData {
         self(builder)
     }
-    fn create(self, prepared: Self::PreparedData, ctx: &mut GraphContext) -> Box<dyn RenderPass> {
+    fn create(
+        self,
+        prepared: Self::PreparedData,
+        ctx: &mut GraphContext,
+    ) -> Box<dyn RenderPass + Send> {
         Box::new(prepared)
     }
 }

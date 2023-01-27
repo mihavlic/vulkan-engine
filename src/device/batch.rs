@@ -1,5 +1,4 @@
 use std::{
-    cell::UnsafeCell,
     collections::VecDeque,
     sync::Arc,
     time::{Duration, Instant},
@@ -11,6 +10,7 @@ use pumice::VulkanResult;
 
 use crate::{
     device::Device,
+    graph::task::SendUnsafeCell,
     storage::{constant_ahash_hashset, constant_ahash_randomstate},
 };
 
@@ -26,12 +26,9 @@ impl GenerationId {
 struct OpenGenerationEntry {
     id: GenerationId,
     mutex: parking_lot::RawMutex,
-    submissions: UnsafeCell<ahash::HashSet<QueueSubmission>>,
+    submissions: SendUnsafeCell<ahash::HashSet<QueueSubmission>>,
+    finalizer: SendUnsafeCell<Option<Box<dyn FnOnce() + Send>>>,
 }
-
-/// Internally synchronized with a parking_lot::RawMutex
-unsafe impl Send for OpenGenerationEntry {}
-unsafe impl Sync for OpenGenerationEntry {}
 
 enum GenerationEntry {
     Open(Arc<OpenGenerationEntry>),
@@ -50,19 +47,15 @@ impl GenerationEntry {
 struct Generation {
     id: GenerationId,
     submissions: ahash::HashSet<QueueSubmission>,
+    finalizer: SendUnsafeCell<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Generation {
-    fn new() -> Self {
-        Self {
-            id: GenerationId(0),
-            submissions: HashSet::with_hasher(constant_ahash_randomstate()),
-        }
-    }
-    fn next(prev: GenerationId) -> Self {
-        Self {
-            id: GenerationId(prev.0 + 1),
-            submissions: HashSet::with_hasher(constant_ahash_randomstate()),
+    fn finalize(&mut self) {
+        unsafe {
+            if let Some(finalizer) = self.finalizer.get_mut().take() {
+                finalizer();
+            }
         }
     }
 }
@@ -75,14 +68,7 @@ impl OpenGeneration {
     }
     pub fn add_submissions(&self, submissions: impl IntoIterator<Item = QueueSubmission>) {
         // safe because as long as OpenGeneration exists, its lock is locked, and it cannot be cloned
-        unsafe {
-            self.0
-                .submissions
-                .get()
-                .as_mut()
-                .unwrap()
-                .extend(submissions)
-        };
+        unsafe { self.0.submissions.get_mut().extend(submissions) };
     }
     pub fn finish(self) {
         drop(self)
@@ -116,13 +102,10 @@ impl GenerationManager {
             batches: VecDeque::new(),
         }
     }
-    fn make_generation(&mut self) -> Generation {
-        let generation = Generation {
-            id: self.next_id,
-            submissions: constant_ahash_hashset(),
-        };
-        self.next_id = GenerationId(self.next_id.0 + 1);
-        generation
+    fn make_generation_id(&mut self) -> GenerationId {
+        let id = self.next_id;
+        self.next_id = GenerationId(id.0 + 1);
+        id
     }
     pub fn get_front_id(&self) -> Option<GenerationId> {
         self.batches.front().map(|a| a.id())
@@ -130,18 +113,22 @@ impl GenerationManager {
     pub fn get_back_id(&self) -> Option<GenerationId> {
         self.batches.back().map(|a| a.id())
     }
-    pub fn open_generation(&mut self, device: &Device) -> OpenGeneration {
+    pub fn open_generation(
+        &mut self,
+        finalizer: Option<Box<dyn FnOnce() + Send>>,
+        device: &Device,
+    ) -> OpenGeneration {
         if self.batches.len() as u32 == self.max_in_flight {
             let id = self.get_front_id().unwrap();
             self.wait_for_generation_sequential(id, u64::MAX, device)
                 .unwrap();
         }
 
-        let generation = self.make_generation();
         let generation = Arc::new(OpenGenerationEntry {
-            id: generation.id,
+            id: self.make_generation_id(),
             mutex: parking_lot::RawMutex::INIT,
-            submissions: UnsafeCell::new(constant_ahash_hashset()),
+            submissions: SendUnsafeCell::new(constant_ahash_hashset()),
+            finalizer: SendUnsafeCell::new(finalizer),
         });
         unsafe { generation.mutex.lock() };
 
@@ -158,7 +145,7 @@ impl GenerationManager {
     ) -> VulkanResult<WaitResult> {
         let next = &mut self.batches[index];
 
-        let next = match next {
+        let closed = match next {
             GenerationEntry::Open(arc) => {
                 if timeout_ns == 0 && arc.mutex.is_locked() {
                     return VulkanResult::Ok(WaitResult::Timeout);
@@ -174,6 +161,7 @@ impl GenerationManager {
                 let OpenGenerationEntry {
                     id,
                     mutex: _,
+                    finalizer,
                     submissions,
                 } = Arc::try_unwrap(inner)
                     .ok()
@@ -184,7 +172,8 @@ impl GenerationManager {
                         next,
                         GenerationEntry::Closed(Generation {
                             id,
-                            submissions: UnsafeCell::into_inner(submissions),
+                            submissions: SendUnsafeCell::into_inner(submissions),
+                            finalizer,
                         }),
                     );
                 }
@@ -199,11 +188,14 @@ impl GenerationManager {
         };
 
         let res =
-            device.wait_for_submissions(next.submissions.iter().cloned(), timeout_ns, false)?;
+            device.wait_for_submissions(closed.submissions.iter().cloned(), timeout_ns, false)?;
 
         match res {
             WaitResult::Timeout => VulkanResult::Ok(WaitResult::Timeout),
-            WaitResult::AllFinished => VulkanResult::Ok(WaitResult::AllFinished),
+            WaitResult::AllFinished => {
+                closed.finalize();
+                VulkanResult::Ok(WaitResult::AllFinished)
+            }
             WaitResult::AnyFinished => unreachable!(),
         }
     }
@@ -233,7 +225,9 @@ impl GenerationManager {
         timeout_ns: u64,
         device: &Device,
     ) -> VulkanResult<WaitResult> {
-        let start = Instant::now();
+        // u64::MAX is specially cased by the specification to never ever end, try to preserve it
+        let skip_time = timeout_ns == 0 || timeout_ns == u64::MAX;
+        let start = skip_time.then(|| std::time::Instant::now());
         let mut remaining_timeout_ns = timeout_ns;
 
         while let Some(next) = self.batches.front() {
@@ -248,10 +242,9 @@ impl GenerationManager {
                 WaitResult::AnyFinished => unreachable!(),
             }
 
-            // u64::MAX is specially cased by the specification to never ever end, try to preserve it
-            if timeout_ns != u64::MAX {
+            if !skip_time {
                 remaining_timeout_ns = (timeout_ns as u128)
-                    .saturating_sub(start.elapsed().as_nanos())
+                    .saturating_sub(start.unwrap().elapsed().as_nanos())
                     .try_into()
                     .unwrap();
             }
@@ -264,11 +257,33 @@ impl GenerationManager {
     pub(crate) unsafe fn clear(&mut self) {
         self.batches.clear();
     }
+    pub(crate) unsafe fn destroy(&mut self, device: &Device) {
+        for i in 0..self.batches.len() {
+            match &mut self.batches[i] {
+                GenerationEntry::Open(_) => {
+                    // try to close the generation
+                    self.inner_wait_for_generation(i, 0, device);
+                }
+                GenerationEntry::Closed(gen) => {
+                    gen.finalize();
+                }
+            }
+            // try again
+            match &mut self.batches[i] {
+                GenerationEntry::Open(_) => {
+                    panic!("Generation is not closed! Is there some thread still running?")
+                }
+                GenerationEntry::Closed(gen) => gen.finalize(),
+            }
+        }
+    }
 }
 
 impl Device {
-    pub fn open_generation(&self) -> OpenGeneration {
-        self.generation_manager.write().open_generation(self)
+    pub fn open_generation(&self, finalizer: Option<Box<dyn FnOnce() + Send>>) -> OpenGeneration {
+        self.generation_manager
+            .write()
+            .open_generation(finalizer, self)
     }
     /// Returns the id of the oldest generation that is possibly still unfinished,
     /// this is useful for bulk lifetime comparison, the finer grained alternative is `is_generation_finished`

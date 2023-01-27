@@ -76,11 +76,11 @@ impl<T: CreatePass> StoredCreatePass<T> {
         Box::new(Self(Cell::new(Some((pass, data)))))
     }
 }
-pub(crate) trait ObjectSafeCreatePass {
-    fn create(&self, ctx: &mut GraphContext) -> Box<dyn RenderPass>;
+pub(crate) trait ObjectSafeCreatePass: Send {
+    fn create(&self, ctx: &mut GraphContext) -> Box<dyn RenderPass + Send>;
 }
 impl<T: CreatePass> ObjectSafeCreatePass for StoredCreatePass<T> {
-    fn create(&self, ctx: &mut GraphContext) -> Box<dyn RenderPass> {
+    fn create(&self, ctx: &mut GraphContext) -> Box<dyn RenderPass + Send> {
         let (pass, prepared) = Cell::take(&self.0).unwrap();
         pass.create(prepared, ctx)
     }

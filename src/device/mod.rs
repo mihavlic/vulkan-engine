@@ -78,11 +78,11 @@ pub struct Device {
     pub(crate) queue_families: Vec<QueueFamilyProperties>,
 
     // object handle storage
+    pub(crate) graphics_pipelines: SimpleStorage<GraphicsPipeline>,
     pub(crate) shader_modules: SimpleStorage<ShaderModule>,
     pub(crate) render_passes: SimpleStorage<RenderPass>,
     pub(crate) pipeline_layouts: SimpleStorage<PipelineLayout>,
     pub(crate) descriptor_set_layouts: SimpleStorage<DescriptorSetLayout>,
-    pub(crate) graphics_pipelines: SimpleStorage<GraphicsPipeline>,
     pub(crate) image_storage: SimpleStorage<Image>,
     pub(crate) buffer_storage: SimpleStorage<Buffer>,
     pub(crate) swapchain_storage: SimpleStorage<Swapchain>,
@@ -419,11 +419,26 @@ impl Drop for Device {
         unsafe {
             let callbacks = self.allocator_callbacks();
 
-            self.device().device_wait_idle().unwrap();
+            // we do both device_wait_idle and then also wait on all the registered semaphores
+            // since validation layers complain otherwise
+            self.wait_idle();
+            self.synchronization_manager.write().destroy(self);
+            self.generation_manager.write().destroy(self);
+
             if self.pipeline_cache != vk::PipelineCache::null() {
                 self.device()
-                    .destroy_pipeline_cache(self.pipeline_cache, callbacks)
+                    .destroy_pipeline_cache(self.pipeline_cache, callbacks);
             }
+
+            self.graphics_pipelines.cleanup();
+            self.shader_modules.cleanup();
+            self.render_passes.cleanup();
+            self.pipeline_layouts.cleanup();
+            self.descriptor_set_layouts.cleanup();
+            self.image_storage.cleanup();
+            self.buffer_storage.cleanup();
+            self.swapchain_storage.cleanup();
+
             self.device().destroy_device(callbacks);
         }
     }

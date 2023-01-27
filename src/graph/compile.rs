@@ -23,10 +23,10 @@ use crate::{
     },
     graph::{
         allocator::MemoryKind,
-        execute::{CompiledGraphState, DeferredResourceFree, GraphExecutor},
+        execute::{CompiledGraphVulkanState, DeferredResourceFree, GraphExecutor},
         resource_marker::{BufferMarker, ImageMarker, TypeOption},
         reverse_edges::reverse_edges_into,
-        task::GraphicsPipelineSrc,
+        task::{GraphicsPipelineSrc, SendUnsafeCell},
     },
     object::{
         self, raw_info_handle_renderpass, BufferMutableState, ConcreteGraphicsPipeline,
@@ -50,6 +50,7 @@ use std::{
     fmt::Display,
     mem::ManuallyDrop,
     ops::{Deref, Range},
+    sync::Arc,
 };
 
 #[derive(Clone)]
@@ -80,6 +81,40 @@ pub(crate) enum PassObjectState {
     Initial(Box<dyn ObjectSafeCreatePass>),
     Created(Box<dyn RenderPass>),
     DummyNone,
+}
+
+impl PassObjectState {
+    // pub(crate) fn on_pass<A, F: FnOnce(&mut PassObjectState) -> A>(&mut self, fun: F) -> A {
+    //     // Cell::replace just moves a pointer, easy for compiler to optimize
+    //     let mut pass = Cell::replace(self, PassObjectState::DummyNone);
+    //     let ret = fun(&mut pass);
+    //     let _ = Cell::replace(self, pass);
+    //     ret
+    // }
+    fn on_initial<A, F: FnOnce(&mut dyn ObjectSafeCreatePass) -> A>(&mut self, fun: F) -> A {
+        match self {
+            PassObjectState::Initial(initial) => fun(&mut **initial),
+            PassObjectState::Created(_) => panic!(),
+            PassObjectState::DummyNone => panic!(),
+        }
+    }
+    pub(crate) fn create_pass(&mut self, ctx: &mut GraphContext) {
+        match self {
+            PassObjectState::Initial(initial) => {
+                let created = initial.create(ctx);
+                *self = PassObjectState::Created(created);
+            }
+            PassObjectState::Created(_) => panic!(),
+            PassObjectState::DummyNone => panic!(),
+        }
+    }
+    pub(crate) fn on_created<A, F: FnOnce(&mut dyn RenderPass) -> A>(&mut self, fun: F) -> A {
+        match self {
+            PassObjectState::Initial(_) => panic!(),
+            PassObjectState::Created(created) => fun(&mut **created),
+            PassObjectState::DummyNone => panic!(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -829,6 +864,8 @@ pub(crate) enum ImageKindCreateInfo<'a> {
 pub struct GraphCompiler {
     pub(crate) input: CompilationInput,
 
+    pub(crate) pass_objects: Vec<PassObjectState>,
+
     pub(crate) pass_meta: Vec<PassMeta>,
     pub(crate) image_meta: Vec<ImageMeta>,
     pub(crate) buffer_meta: Vec<BufferMeta>,
@@ -1036,18 +1073,19 @@ impl GraphCompiler {
     pub fn new() -> Self {
         GraphCompiler {
             input: Default::default(),
+            pass_objects: Default::default(),
             pass_meta: Default::default(),
             image_meta: Default::default(),
             buffer_meta: Default::default(),
+            alive_passes: Default::default(),
+            alive_images: Default::default(),
+            alive_buffers: Default::default(),
             pass_children: Default::default(),
             graphics_pipeline_promises: Default::default(),
             function_promises: Default::default(),
             memory: RefCell::new(ManuallyDrop::new(create_memory_suballocators())),
             physical_images: Default::default(),
             physical_buffers: Default::default(),
-            alive_passes: Default::default(),
-            alive_images: Default::default(),
-            alive_buffers: Default::default(),
         }
     }
     fn compilation_prepare(&mut self) {
@@ -2169,7 +2207,6 @@ impl GraphCompiler {
                                 let ImageData::TransientPrototype(create_info, _allocation_info) = data else {
                                     unreachable!()
                                 };
-                                let _allocation = suballocation.memory.allocation;
 
                                 unsafe {
                                     // TODO consider using bind_image_memory2
@@ -2185,7 +2222,7 @@ impl GraphCompiler {
                                 let physical = PhysicalImage::new(self.physical_images.len());
                                 self.physical_images.push(PhysicalImageData {
                                     info: create_info.clone(),
-                                    memory: suballocation,
+                                    // memory: suballocation,
                                     vkhandle,
                                     state: RefCell::new(ImageMutableState::new(
                                         vk::ImageLayout::UNDEFINED,
@@ -2215,7 +2252,7 @@ impl GraphCompiler {
                                 let physical = PhysicalBuffer::new(self.physical_buffers.len());
                                 self.physical_buffers.push(PhysicalBufferData {
                                     info: create_info.clone(),
-                                    memory: suballocation,
+                                    // memory: suballocation,
                                     vkhandle,
                                     state: RefCell::new(BufferMutableState::new()),
                                 });
@@ -2246,7 +2283,7 @@ impl GraphCompiler {
 
         for i in 0..self.input.passes.len() {
             if self.is_pass_alive(GraphPass::new(i)) {
-                self.input.passes[i].create_pass(&mut graph_context);
+                self.pass_objects[i].create_pass(&mut graph_context);
             }
         }
 
@@ -2318,24 +2355,34 @@ impl GraphCompiler {
             }
         }
 
+        let suballocators = ManuallyDrop::into_inner(RefCell::into_inner(std::mem::replace(
+            &mut self.memory,
+            RefCell::new(ManuallyDrop::new(create_memory_suballocators())),
+        )));
+
         CompiledGraph {
             input: std::mem::take(&mut self.input),
             timeline: std::mem::take(&mut self.input.timeline),
             submissions,
             external_resource_initial_access: accessors,
-            physical_images: std::mem::take(&mut self.physical_images),
-            physical_buffers: std::mem::take(&mut self.physical_buffers),
-            memory: RefCell::into_inner(std::mem::replace(
-                &mut self.memory,
-                RefCell::new(ManuallyDrop::new(create_memory_suballocators())),
-            )),
             image_last_state,
             buffer_last_state,
             alive_passes: self.alive_passes.take(),
             alive_images: self.alive_images.take(),
             alive_buffers: self.alive_buffers.take(),
 
-            state: CompiledGraphState::new(device),
+            current_generation: Cell::new(None),
+            prev_generation: Cell::new(None),
+
+            state: ManuallyDrop::new(Arc::new(SendUnsafeCell::new(
+                CompiledGraphVulkanState::new(
+                    device,
+                    &*suballocators,
+                    std::mem::take(&mut self.pass_objects),
+                    std::mem::take(&mut self.physical_images),
+                    std::mem::take(&mut self.physical_buffers),
+                ),
+            ))),
         }
     }
 

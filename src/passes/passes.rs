@@ -29,7 +29,11 @@ impl CreatePass for ClearImage {
             None,
         );
     }
-    fn create(self, prepared: Self::PreparedData, ctx: &mut GraphContext) -> Box<dyn RenderPass> {
+    fn create(
+        self,
+        prepared: Self::PreparedData,
+        ctx: &mut GraphContext,
+    ) -> Box<dyn RenderPass + Send> {
         Box::new(self)
     }
 }
@@ -89,7 +93,11 @@ impl CreatePass for SimpleShader {
         builder.compile_graphics_pipeline(&self.pipeline, &mode)
     }
 
-    fn create(self, prepared: Self::PreparedData, ctx: &mut GraphContext) -> Box<dyn RenderPass> {
+    fn create(
+        self,
+        prepared: Self::PreparedData,
+        ctx: &mut GraphContext,
+    ) -> Box<dyn RenderPass + Send> {
         let pipeline = ctx.resolve_graphics_pipeline(prepared);
         Box::new(SimpleShaderPass {
             info: self,

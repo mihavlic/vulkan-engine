@@ -1,4 +1,4 @@
-use std::{any::Any, marker::PhantomData, sync::Arc};
+use std::{any::Any, cell::UnsafeCell, marker::PhantomData, sync::Arc};
 
 use parking_lot::RawRwLock;
 use pumice::vk;
@@ -65,7 +65,6 @@ impl SendAny {
 }
 
 unsafe impl Send for SendAny {}
-unsafe impl Sync for SendAny {}
 
 fn is_send_sync<T: Send + Sync>() {}
 
@@ -73,3 +72,49 @@ fn assert_guard_is_send_sync<'a>() {
     // we need to unlock RwLocks on threads other than the one where it was locked because we're criminals
     is_send_sync::<parking_lot::lock_api::RwLockWriteGuard<'a, parking_lot::RawRwLock, ()>>();
 }
+
+pub(crate) struct SendSyncUnsafeCell<T: Send + Sync>(UnsafeCell<T>);
+
+impl<T: Send + Sync> SendSyncUnsafeCell<T> {
+    pub fn new(val: T) -> Self {
+        Self(UnsafeCell::new(val))
+    }
+    pub unsafe fn get(&self) -> &T {
+        &*self.0.get()
+    }
+    pub unsafe fn get_mut(&self) -> &mut T {
+        &mut *self.0.get()
+    }
+    pub fn into_unsafecell(self) -> UnsafeCell<T> {
+        self.0
+    }
+    pub fn into_inner(self) -> T {
+        UnsafeCell::into_inner(self.0)
+    }
+}
+
+unsafe impl<T: Send + Sync> Send for SendSyncUnsafeCell<T> {}
+unsafe impl<T: Send + Sync> Sync for SendSyncUnsafeCell<T> {}
+
+pub(crate) struct SendUnsafeCell<T: Send>(UnsafeCell<T>);
+
+impl<T: Send> SendUnsafeCell<T> {
+    pub fn new(val: T) -> Self {
+        Self(UnsafeCell::new(val))
+    }
+    pub unsafe fn get(&self) -> &T {
+        &*self.0.get()
+    }
+    pub unsafe fn get_mut(&self) -> &mut T {
+        &mut *self.0.get()
+    }
+    pub fn into_unsafecell(self) -> UnsafeCell<T> {
+        self.0
+    }
+    pub fn into_inner(self) -> T {
+        UnsafeCell::into_inner(self.0)
+    }
+}
+
+unsafe impl<T: Send> Send for SendUnsafeCell<T> {}
+unsafe impl<T: Send> Sync for SendUnsafeCell<T> {}

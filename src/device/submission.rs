@@ -1,5 +1,6 @@
 use std::{
     ffi::c_void,
+    mem::ManuallyDrop,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -9,6 +10,7 @@ use smallvec::SmallVec;
 use crate::{
     arena::arena::{GenArena, U32Key},
     device::Device,
+    graph::task::SendUnsafeCell,
 };
 
 // little endian:
@@ -93,9 +95,58 @@ impl SemaphoreEntry {
     }
 }
 
+pub struct AtomicOption<T: Send> {
+    empty: AtomicBool,
+    data: SendUnsafeCell<ManuallyDrop<T>>,
+}
+
+// https://users.rust-lang.org/t/atomic-option-like-take/33880
+impl<T: Send> AtomicOption<T> {
+    pub fn new(data: T) -> Self {
+        Self {
+            empty: AtomicBool::new(false),
+            data: SendUnsafeCell::new(ManuallyDrop::new(data)),
+        }
+    }
+    pub fn take(&self) -> Option<T> {
+        let empty = self.empty.swap(true, Ordering::Relaxed);
+        if empty {
+            return None;
+        } else {
+            let data = unsafe { ManuallyDrop::take(self.data.get_mut()) };
+            return Some(data);
+        }
+    }
+    pub fn is_none(&self) -> bool {
+        self.empty.load(Ordering::Relaxed)
+    }
+    pub fn is_some(&self) -> bool {
+        !self.empty.load(Ordering::Relaxed)
+    }
+}
+
+impl<T: Send> Drop for AtomicOption<T> {
+    fn drop(&mut self) {
+        let _ = self.take();
+    }
+}
+
+unsafe impl<T: Send> Send for AtomicOption<T> {}
+
 pub struct QueueSubmitData {
-    finished: AtomicBool,
+    finalizer: AtomicOption<Option<Box<dyn FnOnce() + Send>>>,
     semaphore: SemaphoreEntry,
+}
+
+impl QueueSubmitData {
+    fn is_finished(&self) -> bool {
+        self.finalizer.is_none()
+    }
+    fn mark_finished(&self) {
+        if let Some(finalizer) = self.finalizer.take().unwrap() {
+            finalizer();
+        }
+    }
 }
 
 pub enum WaitResult {
@@ -124,7 +175,9 @@ impl SubmissionManager {
         device: &Device,
     ) -> VulkanResult<WaitResult> {
         let mut remaining_timeout_ns = timeout_ns;
-        let start = std::time::Instant::now();
+        // avoid the syscall(?) when the timeout is infinite
+        let skip_time = timeout_ns == 0 || timeout_ns == u64::MAX;
+        let start = skip_time.then(|| std::time::Instant::now());
 
         let mut timeout = false;
 
@@ -134,7 +187,7 @@ impl SubmissionManager {
         // it is said that applications normally poll synchronization primitives so it should be reasonably efficient
         for s in submissions {
             let data = self.submissions.get(s.0);
-            let finished = data.is_none() || data.unwrap().finished.load(Ordering::Relaxed) || {
+            let finished = data.is_none() || data.unwrap().is_finished() || {
                 let data = data.unwrap();
 
                 let semaphore = data.semaphore.raw;
@@ -156,7 +209,7 @@ impl SubmissionManager {
 
                 match result {
                     vk::Result::SUCCESS => {
-                        data.finished.store(true, Ordering::Relaxed);
+                        data.mark_finished();
                         true
                     }
                     vk::Result::TIMEOUT => {
@@ -172,9 +225,9 @@ impl SubmissionManager {
             }
 
             // u64::MAX is specially cased by the specification to never ever end, try to preserve it
-            if timeout_ns != u64::MAX {
+            if !skip_time {
                 remaining_timeout_ns = (timeout_ns as u128)
-                    .saturating_sub(start.elapsed().as_nanos())
+                    .saturating_sub(start.unwrap().elapsed().as_nanos())
                     .try_into()
                     .unwrap();
             }
@@ -186,15 +239,27 @@ impl SubmissionManager {
             return VulkanResult::Ok(WaitResult::AllFinished);
         }
     }
-    fn allocate(&mut self, device: &Device) -> (QueueSubmission, TimelineSemaphore) {
+    fn allocate(
+        &mut self,
+        finalizer: Option<Box<dyn FnOnce() + Send>>,
+        device: &Device,
+    ) -> (QueueSubmission, TimelineSemaphore) {
         let mut semaphore = self.get_fresh_semaphore(device);
         semaphore.bump_value();
-        (self.push_submission(semaphore, true), semaphore.to_public())
+        (
+            self.push_submission(semaphore, finalizer, true),
+            semaphore.to_public(),
+        )
     }
-    fn push_submission(&mut self, mut semaphore: SemaphoreEntry, head: bool) -> QueueSubmission {
+    fn push_submission(
+        &mut self,
+        mut semaphore: SemaphoreEntry,
+        finalizer: Option<Box<dyn FnOnce() + Send>>,
+        head: bool,
+    ) -> QueueSubmission {
         semaphore.value.set_head(head);
         let key = self.submissions.insert(QueueSubmitData {
-            finished: AtomicBool::new(false),
+            finalizer: AtomicOption::new(finalizer),
             semaphore,
         });
         QueueSubmission(key)
@@ -229,7 +294,7 @@ impl SubmissionManager {
     fn collect(&mut self) {
         let drain = self
             .submissions
-            .drain_filter(|s| s.semaphore.value.is_head() && s.finished.load(Ordering::Relaxed))
+            .drain_filter(|s| s.semaphore.value.is_head() && s.is_finished())
             .map(|mut s| {
                 s.semaphore.value.set_head(false);
                 s.semaphore
@@ -238,7 +303,33 @@ impl SubmissionManager {
     }
     /// Empty all pending submissions, this should be called after vkDeviceWaitIdle
     unsafe fn clear(&mut self) {
-        self.submissions.clear()
+        self.submissions.clear();
+    }
+    /// This waits on all currently active semaphores, essentially a vkDeviceWaitIdle that doesn't bother validation layers
+    pub(crate) fn wait_all(&mut self, device: &Device) -> VulkanResult<()> {
+        for (k, s) in self.submissions.iter() {
+            if s.semaphore.value.is_head() {
+                self.wait_for_submissions(
+                    std::iter::once(QueueSubmission(k)),
+                    u64::MAX,
+                    false,
+                    device,
+                )?;
+                let mut semaphore = s.semaphore;
+                semaphore.value.set_head(false);
+                self.free_semaphores.push(semaphore);
+            }
+        }
+
+        self.submissions.clear();
+        Ok(())
+    }
+    pub(crate) unsafe fn destroy(&mut self, device: &Device) {
+        for semaphore in self.free_semaphores.drain(..) {
+            device
+                .device()
+                .destroy_semaphore(semaphore.raw, device.allocator_callbacks());
+        }
     }
 }
 
@@ -249,9 +340,14 @@ pub struct AllocateSequential<'a> {
 }
 
 impl<'a> AllocateSequential<'a> {
-    fn alloc(&mut self, _queue: Queue) -> (QueueSubmission, TimelineSemaphore) {
+    fn alloc(
+        &mut self,
+        finalizer: Option<Box<dyn FnOnce() + Send>>,
+    ) -> (QueueSubmission, TimelineSemaphore) {
         self.semaphore.bump_value();
-        let key = self.manager.push_submission(self.semaphore, false);
+        let key = self
+            .manager
+            .push_submission(self.semaphore, finalizer, false);
         self.last = Some(key);
         (key, self.semaphore.to_public())
     }
@@ -296,8 +392,13 @@ impl Device {
             last: None,
         }
     }
-    pub fn make_submission(&self) -> (QueueSubmission, TimelineSemaphore) {
-        self.synchronization_manager.write().allocate(self)
+    pub fn make_submission(
+        &self,
+        finalizer: Option<Box<dyn FnOnce() + Send>>,
+    ) -> (QueueSubmission, TimelineSemaphore) {
+        self.synchronization_manager
+            .write()
+            .allocate(finalizer, self)
     }
     pub fn idle_cleanup_poll(&self) {
         self.synchronization_manager.write().collect();
@@ -314,6 +415,12 @@ impl Device {
             // submissions.clear();
             // generations.clear();
         }
+    }
+    /// This achieves the idle state by waiting for all registered semaphores to finish.
+    /// It likely has large overhead, however the validation layers do not consider device_wait_idle
+    /// to make all command buffer not pending so it throws warnings during teardown.
+    pub fn wait_idle_precise(&self) {
+        self.synchronization_manager.write().wait_all(self);
     }
 }
 

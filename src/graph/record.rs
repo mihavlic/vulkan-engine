@@ -34,7 +34,6 @@ pub struct PassData {
     pub(crate) stages: vk::PipelineStageFlags2KHR,
     pub(crate) access: vk::AccessFlags2KHR,
     pub(crate) dependencies: Vec<PassDependency>,
-    pub(crate) pass: Cell<PassObjectState>,
 }
 
 #[derive(Clone)]
@@ -83,37 +82,7 @@ impl PassData {
                 .push(PassDependency::new(dependency, hard, real));
         }
     }
-    pub(crate) fn on_pass<A, F: FnOnce(&mut PassObjectState) -> A>(&self, fun: F) -> A {
-        // Cell::replace just moves a pointer, easy for compiler to optimize
-        let mut pass = Cell::replace(&self.pass, PassObjectState::DummyNone);
-        let ret = fun(&mut pass);
-        let _ = Cell::replace(&self.pass, pass);
-        ret
-    }
-    fn on_initial<A, F: FnOnce(&mut dyn ObjectSafeCreatePass) -> A>(&self, fun: F) -> A {
-        self.on_pass(|state| match state {
-            PassObjectState::Initial(initial) => fun(&mut **initial),
-            PassObjectState::Created(_) => panic!(),
-            PassObjectState::DummyNone => panic!(),
-        })
-    }
-    pub(crate) fn create_pass(&self, ctx: &mut GraphContext) {
-        self.on_pass(|state| match state {
-            PassObjectState::Initial(initial) => {
-                let created = initial.create(ctx);
-                *state = PassObjectState::Created(created);
-            }
-            PassObjectState::Created(_) => panic!(),
-            PassObjectState::DummyNone => panic!(),
-        })
-    }
-    pub(crate) fn on_created<A, F: FnOnce(&mut dyn RenderPass) -> A>(&self, fun: F) -> A {
-        self.on_pass(|state| match state {
-            PassObjectState::Initial(_) => panic!(),
-            PassObjectState::Created(created) => fun(&mut **created),
-            PassObjectState::DummyNone => panic!(),
-        })
-    }
+
 }
 
 pub struct ImageMove {
@@ -474,14 +443,15 @@ impl GraphBuilder {
     ) -> GraphPass {
         // we don't use impl Named here because it breaks type inference and we cannot name the closure type to resolve it so it makes the trait unusable
         let handle = GraphPass::new(self.0.input.passes.len());
-        let data = {
+        let (data, pass_object) = {
             let mut builder = GraphPassBuilder::new(self, handle);
-            let objectified = StoredCreatePass::new(pass, &mut builder);
-            builder.finish(queue, objectified)
+            let pass_object = StoredCreatePass::new(pass, &mut builder);
+            (builder.finish(queue), pass_object)
         };
         // if the string is 0, we set the name to None
         let name = Some(name.into()).filter(|n| !n.is_empty());
         self.0.input.passes.push(GraphObject { name, inner: data });
+        self.0.pass_objects.push(PassObjectState::Initial(pass_object));
         self.0
             .input
             .timeline
@@ -705,7 +675,7 @@ impl<'a> GraphPassBuilder<'a> {
             stages,
         });
     }
-    fn finish(self, queue: GraphQueue, pass: Box<dyn ObjectSafeCreatePass>) -> PassData {
+    fn finish(self, queue: GraphQueue) -> PassData {
         let mut access = vk::AccessFlags2KHR::default();
         let mut stages = vk::PipelineStageFlags2KHR::default();
         for i in &self.images {
@@ -729,7 +699,6 @@ impl<'a> GraphPassBuilder<'a> {
             stages,
             access,
             dependencies: self.dependencies,
-            pass: Cell::new(PassObjectState::Initial(pass)),
         }
     }
 }
