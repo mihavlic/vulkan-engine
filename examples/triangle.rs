@@ -97,10 +97,10 @@ fn main() {
         let swapchain = make_swapchain(&window, surface, &device);
 
         let vert_module = device
-            .create_shader_module_read(&mut File::open("test-bin/shader.vert.spv").unwrap())
+            .create_shader_module_read(&mut File::open("examples/shader.vert.spv").unwrap())
             .unwrap();
         let frag_module = device
-            .create_shader_module_read(&mut File::open("test-bin/shader.frag.spv").unwrap())
+            .create_shader_module_read(&mut File::open("examples/shader.frag.spv").unwrap())
             .unwrap();
 
         let empty_layout = device

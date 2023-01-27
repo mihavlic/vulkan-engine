@@ -5,9 +5,9 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[[bin]]
-path = "./test-bin/main.rs"
-name = "test-bin"
+[[example]]
+path = "./examples/triangle.rs"
+name = "triangle"
 
 [dependencies]
 pumice = {path = "../pumice", features = ["wrappers"]}
