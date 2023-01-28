@@ -4,6 +4,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+use parking_lot::{MappedRwLockReadGuard, RwLockReadGuard};
 use pumice::{vk, VulkanResult};
 use smallvec::SmallVec;
 
@@ -133,12 +134,25 @@ impl<T: Send> Drop for AtomicOption<T> {
 
 unsafe impl<T: Send> Send for AtomicOption<T> {}
 
-pub struct QueueSubmitData {
+// the public version of SubmissionEntry
+pub struct SubmissionData {
+    queue_family: u32,
+    semaphore: TimelineSemaphore,
+}
+
+struct SubmissionEntry {
     finalizer: AtomicOption<Option<Box<dyn FnOnce() + Send>>>,
+    queue_family: u32,
     semaphore: SemaphoreEntry,
 }
 
-impl QueueSubmitData {
+impl SubmissionEntry {
+    fn to_public(&self) -> SubmissionData {
+        SubmissionData {
+            queue_family: self.queue_family,
+            semaphore: self.semaphore.to_public(),
+        }
+    }
     fn is_finished(&self) -> bool {
         self.finalizer.is_none()
     }
@@ -156,7 +170,7 @@ pub enum WaitResult {
 }
 
 pub(crate) struct SubmissionManager {
-    submissions: GenArena<U32Key, QueueSubmitData>,
+    submissions: GenArena<U32Key, SubmissionEntry>,
     free_semaphores: Vec<SemaphoreEntry>,
 }
 
@@ -241,25 +255,30 @@ impl SubmissionManager {
     }
     fn allocate(
         &mut self,
+        queue_family: u32,
         finalizer: Option<Box<dyn FnOnce() + Send>>,
         device: &Device,
     ) -> (QueueSubmission, TimelineSemaphore) {
         let mut semaphore = self.get_fresh_semaphore(device);
         semaphore.bump_value();
         (
-            self.push_submission(semaphore, finalizer, true),
+            self.push_submission(semaphore, queue_family, finalizer, true),
             semaphore.to_public(),
         )
     }
     fn push_submission(
         &mut self,
-        mut semaphore: SemaphoreEntry,
+        semaphore: SemaphoreEntry,
+        queue_family: u32,
         finalizer: Option<Box<dyn FnOnce() + Send>>,
         head: bool,
     ) -> QueueSubmission {
+        let mut semaphore = semaphore;
         semaphore.value.set_head(head);
-        let key = self.submissions.insert(QueueSubmitData {
+
+        let key = self.submissions.insert(SubmissionEntry {
             finalizer: AtomicOption::new(finalizer),
+            queue_family,
             semaphore,
         });
         QueueSubmission(key)
@@ -290,6 +309,11 @@ impl SubmissionManager {
         debug_assert!(semaphore.value.is_head() == false);
 
         semaphore
+    }
+    fn get_submission_data(&self, submission: QueueSubmission) -> Option<SubmissionData> {
+        self.submissions
+            .get(submission.0)
+            .map(SubmissionEntry::to_public)
     }
     fn collect(&mut self) {
         let drain = self
@@ -342,12 +366,13 @@ pub struct AllocateSequential<'a> {
 impl<'a> AllocateSequential<'a> {
     fn alloc(
         &mut self,
+        queue_family: u32,
         finalizer: Option<Box<dyn FnOnce() + Send>>,
     ) -> (QueueSubmission, TimelineSemaphore) {
         self.semaphore.bump_value();
         let key = self
             .manager
-            .push_submission(self.semaphore, finalizer, false);
+            .push_submission(self.semaphore, queue_family, finalizer, false);
         self.last = Some(key);
         (key, self.semaphore.to_public())
     }
@@ -394,15 +419,35 @@ impl Device {
     }
     pub fn make_submission(
         &self,
+        queue_family: u32,
         finalizer: Option<Box<dyn FnOnce() + Send>>,
     ) -> (QueueSubmission, TimelineSemaphore) {
         self.synchronization_manager
             .write()
-            .allocate(finalizer, self)
+            .allocate(queue_family, finalizer, self)
+    }
+    pub fn get_submission_data(&self, submission: QueueSubmission) -> Option<SubmissionData> {
+        self.synchronization_manager
+            .read()
+            .get_submission_data(submission)
+    }
+    pub fn collect_active_submission_datas(
+        &self,
+        submissions: impl IntoIterator<Item = QueueSubmission>,
+        mut extend: impl Extend<SubmissionData>,
+    ) {
+        let guard = self.synchronization_manager.read();
+        let iter = submissions.into_iter().filter_map(|s| {
+            guard
+                .submissions
+                .get(s.0)
+                .filter(|e| !e.is_finished())
+                .map(SubmissionEntry::to_public)
+        });
+        extend.extend(iter);
     }
     pub fn idle_cleanup_poll(&self) {
         self.synchronization_manager.write().collect();
-        self.pending_resources.write().poll(self);
     }
     pub fn wait_idle(&self) {
         // let mut submissions = self.synchronization_manager.write();

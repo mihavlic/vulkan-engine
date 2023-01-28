@@ -1,10 +1,7 @@
 pub mod batch;
-pub mod inflight;
 pub mod submission;
 
-use self::{
-    batch::GenerationManager, inflight::InflightResourceManager, submission::SubmissionManager,
-};
+use self::{batch::GenerationManager, submission::SubmissionManager};
 use super::instance::InstanceCreateInfo;
 use crate::{
     instance::Instance,
@@ -96,8 +93,6 @@ pub struct Device {
     pub(crate) synchronization_manager: parking_lot::RwLock<SubmissionManager>,
     // coarse grained synchronization
     pub(crate) generation_manager: parking_lot::RwLock<GenerationManager>,
-    // tracks resources in flight that cannot be safely deleted
-    pub(crate) pending_resources: parking_lot::RwLock<InflightResourceManager>,
 
     // at the bottom so that these are dropped last
     #[allow(unused)]
@@ -280,7 +275,6 @@ impl Device {
 
             synchronization_manager: parking_lot::RwLock::new(SubmissionManager::new()),
             generation_manager: parking_lot::RwLock::new(GenerationManager::new(10)),
-            pending_resources: parking_lot::RwLock::new(InflightResourceManager::new()),
 
             device_table,
         };

@@ -740,12 +740,10 @@ impl<'a> SubmissionRecorder<'a> {
         } else {
             let index: u32 = self.submissions.len().try_into().unwrap();
             let submission_index = OptionalU32::new_some(index);
-            for (i, &p) in (0u32..).zip(&submission.passes) {
+            for &p in &submission.passes {
                 let meta = self.graph.get_pass_meta(p);
                 assert!(meta.scheduled_submission.get().is_none());
                 meta.scheduled_submission.set(submission_index);
-                meta.scheduled_submission_position
-                    .set(OptionalU32::new_some(i));
             }
 
             let finished = submission.finish(self.current_queue.unwrap().1);

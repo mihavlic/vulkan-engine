@@ -35,7 +35,6 @@ use crate::{
     arena::uint::{Config, OptionalU32, PackedUint},
     device::{
         batch::GenerationId,
-        inflight::InflightResource,
         submission::{self, QueueSubmission},
         Device, OwnedDevice,
     },

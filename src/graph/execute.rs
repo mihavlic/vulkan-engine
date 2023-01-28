@@ -19,7 +19,6 @@ use crate::{
     arena::uint::{Config, OptionalU32, PackedUint},
     device::{
         batch::GenerationId,
-        inflight::InflightResource,
         submission::{self, QueueSubmission},
         OwnedDevice,
     },
@@ -447,7 +446,11 @@ impl CompiledGraph {
         let semaphores = self
             .submissions
             .iter()
-            .map(|_| self.state().device.make_submission(None))
+            .map(|s| {
+                self.state()
+                    .device
+                    .make_submission(self.input.get_queue_family(s.queue), None)
+            })
             .collect::<Vec<_>>();
 
         // TODO when we separate compiling and executing a graph, these two loops will be far away
@@ -519,6 +522,14 @@ impl CompiledGraph {
                                 continue;
                             }
 
+                            // if !prev_access.is_empty() {
+                            //     let datas: SmallVec<[_; 8]> = SmallVec::new();
+                            //     self.state()
+                            //         .device
+                            //         .collect_active_submission_datas(submissions, extend)
+                            //     // we need to synchronize against all prev_acess passes
+                            //     // this is essentially the same as in emit_family_ownership_transition
+                            // }
                             todo!()
                         },
                         ImageData::Swapchain(archandle) => unsafe {
