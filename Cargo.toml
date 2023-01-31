@@ -32,3 +32,16 @@ nu-ansi-term = "0.46.0"
 [features]
 default = []
 build-tracing = ["tracing", "tracing-subscriber"]
+
+
+[profile.dev.package.pumice]
+opt-level = 1
+debug = 1
+
+[profile.dev.package.pumice-vma]
+opt-level = 1
+debug = 1
+
+[profile.dev.package.winit]
+opt-level = 1
+debug = 1

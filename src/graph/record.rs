@@ -82,7 +82,6 @@ impl PassData {
                 .push(PassDependency::new(dependency, hard, real));
         }
     }
-
 }
 
 pub struct ImageMove {
@@ -218,16 +217,10 @@ impl CompilationInput {
     pub(crate) fn get_buffer_display(&self, buffer: GraphBuffer) -> GraphObjectDisplay<'_> {
         self.buffers[buffer.index()].display(buffer.index())
     }
-    pub(crate) fn get_concrete_image_data(
-        &self,
-        image: GraphImage,
-    ) -> &ImageData {
+    pub(crate) fn get_concrete_image_data(&self, image: GraphImage) -> &ImageData {
         self.get_concrete_image_data_impl(image).1
     }
-    fn get_concrete_image_data_impl(
-        &self,
-        image: GraphImage,
-    ) -> (MovedImageEntry, &ImageData) {
+    fn get_concrete_image_data_impl(&self, image: GraphImage) -> (MovedImageEntry, &ImageData) {
         let mut image = image;
         loop {
             match self.get_image_data(image) {
@@ -257,7 +250,7 @@ impl CompilationInput {
     }
     pub(crate) fn get_image_subresource_layer_offset(&self, image: GraphImage) -> u32 {
         // we're calling this for the side effect of short circuiting all image move sequences (there's interior mutability)
-        let _  = self.get_concrete_image_data(image);
+        let _ = self.get_concrete_image_data(image);
         if let ImageData::Moved(entry) = self.get_image_data(image) {
             entry.get().dst_layer_offset as u32
         } else {
@@ -265,12 +258,18 @@ impl CompilationInput {
         }
     }
     /// Returns the base array layer in the image and the count of following layers, None if it's the whole resource
-    pub(crate) fn get_image_subresource_layer_offset_count(&self, image: GraphImage) -> (u32, Option<u32>) {
+    pub(crate) fn get_image_subresource_layer_offset_count(
+        &self,
+        image: GraphImage,
+    ) -> (u32, Option<u32>) {
         // we're calling this for the side effect of short circuiting all image move sequences (there's interior mutability)
-        let _  = self.get_concrete_image_data(image);
+        let _ = self.get_concrete_image_data(image);
         if let ImageData::Moved(entry) = self.get_image_data(image) {
             let entry = entry.get();
-            (entry.dst_layer_offset as u32, Some(entry.dst_layer_count as u32))
+            (
+                entry.dst_layer_offset as u32,
+                Some(entry.dst_layer_count as u32),
+            )
         } else {
             (0, None)
         }
@@ -406,7 +405,7 @@ impl GraphBuilder {
                 let layer_count: u16 = info.array_layers.try_into().unwrap();
                 *self.0.input.images[i.index()].get_inner_mut() =
                     ImageData::Moved(Cell::new(MovedImageEntry {
-                        dst: image, 
+                        dst: image,
                         dst_layer_offset: layer_offset,
                         dst_layer_count: layer_count,
                     }));
@@ -451,7 +450,9 @@ impl GraphBuilder {
         // if the string is 0, we set the name to None
         let name = Some(name.into()).filter(|n| !n.is_empty());
         self.0.input.passes.push(GraphObject { name, inner: data });
-        self.0.pass_objects.push(PassObjectState::Initial(pass_object));
+        self.0
+            .pass_objects
+            .push(PassObjectState::Initial(pass_object));
         self.0
             .input
             .timeline
