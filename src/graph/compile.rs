@@ -432,35 +432,35 @@ where
 }
 
 #[derive(Clone)]
-struct MemoryBarrier {
-    pub src_stages: vk::PipelineStageFlags2KHR,
-    pub dst_stages: vk::PipelineStageFlags2KHR,
-    pub src_access: vk::AccessFlags2KHR,
-    pub dst_access: vk::AccessFlags2KHR,
+pub(crate) struct MemoryBarrier {
+    pub(crate) src_stages: vk::PipelineStageFlags2KHR,
+    pub(crate) dst_stages: vk::PipelineStageFlags2KHR,
+    pub(crate) src_access: vk::AccessFlags2KHR,
+    pub(crate) dst_access: vk::AccessFlags2KHR,
 }
 
 #[derive(Clone)]
-struct ImageBarrier {
-    pub image: GraphImage,
-    pub src_stages: vk::PipelineStageFlags2KHR,
-    pub dst_stages: vk::PipelineStageFlags2KHR,
-    pub src_access: vk::AccessFlags2KHR,
-    pub dst_access: vk::AccessFlags2KHR,
-    pub old_layout: vk::ImageLayout,
-    pub new_layout: vk::ImageLayout,
-    pub src_queue_family_index: u32,
-    pub dst_queue_family_index: u32,
+pub(crate) struct ImageBarrier {
+    pub(crate) image: GraphImage,
+    pub(crate) src_stages: vk::PipelineStageFlags2KHR,
+    pub(crate) dst_stages: vk::PipelineStageFlags2KHR,
+    pub(crate) src_access: vk::AccessFlags2KHR,
+    pub(crate) dst_access: vk::AccessFlags2KHR,
+    pub(crate) old_layout: vk::ImageLayout,
+    pub(crate) new_layout: vk::ImageLayout,
+    pub(crate) src_queue_family_index: u32,
+    pub(crate) dst_queue_family_index: u32,
 }
 
 #[derive(Clone)]
-struct BufferBarrier {
-    pub image: GraphImage,
-    pub src_stages: vk::PipelineStageFlags2KHR,
-    pub dst_stages: vk::PipelineStageFlags2KHR,
-    pub src_access: vk::AccessFlags2KHR,
-    pub dst_access: vk::AccessFlags2KHR,
-    pub src_queue_family_index: u32,
-    pub dst_queue_family_index: u32,
+pub(crate) struct BufferBarrier {
+    pub(crate) buffer: GraphImage,
+    pub(crate) src_stages: vk::PipelineStageFlags2KHR,
+    pub(crate) dst_stages: vk::PipelineStageFlags2KHR,
+    pub(crate) src_access: vk::AccessFlags2KHR,
+    pub(crate) dst_access: vk::AccessFlags2KHR,
+    pub(crate) src_queue_family_index: u32,
+    pub(crate) dst_queue_family_index: u32,
 }
 
 #[derive(Clone)]

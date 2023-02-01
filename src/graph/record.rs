@@ -274,6 +274,20 @@ impl CompilationInput {
             (0, None)
         }
     }
+    pub fn get_image_subresource_range(
+        &self,
+        image: GraphImage,
+        aspect: vk::ImageAspectFlags,
+    ) -> vk::ImageSubresourceRange {
+        let (base_array_layer, layer_count) = self.get_image_subresource_layer_offset_count(image);
+        vk::ImageSubresourceRange {
+            aspect_mask: aspect,
+            base_mip_level: 0,
+            level_count: vk::REMAINING_MIP_LEVELS,
+            base_array_layer,
+            layer_count: layer_count.unwrap_or(vk::REMAINING_ARRAY_LAYERS),
+        }
+    }
 }
 
 #[repr(transparent)]

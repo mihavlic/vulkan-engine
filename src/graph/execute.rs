@@ -11,7 +11,7 @@ use std::{
 use ahash::HashMap;
 use bumpalo::Bump;
 use fixedbitset::FixedBitSet;
-use pumice::{util::ObjectHandle, vk10::CommandPoolCreateInfo, DeviceWrapper};
+use pumice::{util::ObjectHandle, DeviceWrapper};
 use rayon::ThreadPool;
 use smallvec::{smallvec, SmallVec};
 
@@ -35,13 +35,15 @@ use crate::{
     },
     passes::RenderPass,
     storage::{constant_ahash_hashmap, constant_ahash_hashset, ObjectStorage},
+    util::ffi_ptr::AsFFiPtr,
 };
 
 use super::{
     allocator::{AvailabilityToken, Suballocator},
     compile::{
-        GraphPassEvent, GraphResource, ImageKindCreateInfo, PassObjectState, ResourceFirstAccess,
-        ResourceState, SimpleBarrier, SpecialBarrier, Submission, SwapchainPresent,
+        BufferBarrier, GraphPassEvent, GraphResource, ImageBarrier, ImageKindCreateInfo,
+        MemoryBarrier, PassObjectState, ResourceFirstAccess, ResourceState, ResourceSubresource,
+        Submission, SwapchainPresent,
     },
     record::{BufferData, CompilationInput, GraphBuilder, ImageData, ImageMove, PassData},
     resource_marker::{ResourceMarker, TypeOption, TypeSome},
@@ -163,17 +165,7 @@ impl<'a> GraphExecutor<'a> {
         image: GraphImage,
         aspect: vk::ImageAspectFlags,
     ) -> vk::ImageSubresourceRange {
-        let (base_array_layer, layer_count) = self
-            .graph
-            .input
-            .get_image_subresource_layer_offset_count(image);
-        vk::ImageSubresourceRange {
-            aspect_mask: aspect,
-            base_mip_level: 0,
-            level_count: vk::REMAINING_MIP_LEVELS,
-            base_array_layer,
-            layer_count: layer_count.unwrap_or(vk::REMAINING_ARRAY_LAYERS),
-        }
+        self.graph.input.get_image_subresource_range(image, aspect)
     }
     pub fn get_image(&self, image: GraphImage) -> vk::Image {
         self.raw_images[image.index()].unwrap()
@@ -338,7 +330,7 @@ impl CompiledGraphVulkanState {
                 device
                     .device()
                     .create_command_pool(
-                        &CommandPoolCreateInfo::default(),
+                        &vk::CommandPoolCreateInfo::default(),
                         device.allocator_callbacks(),
                     )
                     .unwrap()
@@ -485,6 +477,8 @@ impl CompiledGraph {
                 ref accessors,
                 dst_layout,
                 dst_queue_family,
+                dst_stages,
+                dst_access,
             } = initial;
 
             accessors_scratch.clear();
@@ -495,7 +489,7 @@ impl CompiledGraph {
                     let data = self.input.get_image_data(image);
                     match data {
                         ImageData::Imported(archandle) => unsafe {
-                            let ResourceState::Normal { layout, queue_family, access } = &self.image_last_state[image.index()] else {
+                            let ResourceState::Normal(ResourceSubresource { layout, queue_family, access, src_barrier }) = &self.image_last_state[image.index()] else {
                                 panic!("Unsupported state for external resource");
                             };
 
@@ -604,7 +598,7 @@ impl CompiledGraph {
                     let data = self.input.get_buffer_data(buffer);
                     match data {
                         BufferData::Imported(archandle) => unsafe {
-                            let ResourceState::Normal { layout, queue_family, access } = &self.buffer_last_state[buffer.index()] else {
+                            let ResourceState::Normal(ResourceSubresource { layout, queue_family, access, src_barrier }) = &self.buffer_last_state[buffer.index()] else {
                                 panic!("Unsupported state for external resource");
                             };
 
@@ -703,9 +697,9 @@ impl CompiledGraph {
         self.current_generation.set(Some(id));
 
         // TODO multithreaded execution
-        let mut memory_barriers = Vec::new();
-        let mut image_barriers: Vec<vk::ImageMemoryBarrier2KHR> = Vec::new();
-        let mut buffer_barriers = Vec::new();
+        let mut raw_memory_barriers = Vec::new();
+        let mut raw_image_barriers = Vec::new();
+        let mut raw_buffer_barriers = Vec::new();
 
         unsafe {
             for (i, sub) in self.submissions.iter().enumerate() {
@@ -727,9 +721,9 @@ impl CompiledGraph {
                     queue: _,
                     passes,
                     semaphore_dependencies,
-                    barriers,
-                    special_barriers,
-                    contains_end_all_barrier: _,
+                    memory_barriers,
+                    image_barriers,
+                    buffer_barriers,
                 } = sub;
 
                 d.begin_command_buffer(
@@ -742,24 +736,25 @@ impl CompiledGraph {
                 )
                 .unwrap();
 
-                let mut barriers = barriers.iter();
-                let mut special_barriers = special_barriers.iter();
+                let mut memory_barriers = memory_barriers.iter();
+                let mut image_barriers = image_barriers.iter();
+                let mut buffer_barriers = buffer_barriers.iter();
 
                 for (i, pass) in passes.into_iter().enumerate() {
-                    // extract into function things
-                    do_barriers(
+                    self.do_barriers(
                         i,
                         d,
-                        &mut barriers,
                         &mut memory_barriers,
                         &mut image_barriers,
                         &mut buffer_barriers,
-                        &mut special_barriers,
+                        &mut raw_memory_barriers,
+                        &mut raw_image_barriers,
+                        &mut raw_buffer_barriers,
                         &raw_images,
                         &raw_buffers,
                         command_buffer,
-                        false,
                     );
+
                     let executor = GraphExecutor {
                         graph: self,
                         command_buffer,
@@ -771,18 +766,18 @@ impl CompiledGraph {
                         .on_created(|p| p.execute(&executor, &self.state().device))
                         .unwrap();
                 }
-                do_barriers(
-                    i,
+                self.do_barriers(
+                    usize::MAX,
                     d,
-                    &mut barriers,
                     &mut memory_barriers,
                     &mut image_barriers,
                     &mut buffer_barriers,
-                    &mut special_barriers,
+                    &mut raw_memory_barriers,
+                    &mut raw_image_barriers,
+                    &mut raw_buffer_barriers,
                     &raw_images,
                     &raw_buffers,
                     command_buffer,
-                    true,
                 );
 
                 d.end_command_buffer(command_buffer).unwrap();
@@ -910,113 +905,91 @@ impl CompiledGraph {
 
         self.prev_generation.set(Some(id));
     }
-}
+    unsafe fn do_barriers(
+        &self,
+        i: usize,
+        d: &DeviceWrapper,
+        memory_barriers: &mut std::slice::Iter<(SubmissionPass, MemoryBarrier)>,
+        image_barriers: &mut std::slice::Iter<(SubmissionPass, ImageBarrier)>,
+        buffer_barriers: &mut std::slice::Iter<(SubmissionPass, BufferBarrier)>,
 
-unsafe fn do_barriers(
-    i: usize,
-    d: &DeviceWrapper,
-    barriers: &mut std::slice::Iter<(SubmissionPass, SimpleBarrier)>,
-    memory_barriers: &mut Vec<vk::MemoryBarrier2KHR>,
-    image_barriers: &mut Vec<vk::ImageMemoryBarrier2KHR>,
-    buffer_barriers: &mut Vec<vk::BufferMemoryBarrier2KHR>,
-    special_barriers: &mut std::slice::Iter<(SubmissionPass, SpecialBarrier)>,
-    raw_images: &[Option<vk::Image>],
-    raw_buffers: &[Option<vk::Buffer>],
-    command_buffer: vk::CommandBuffer,
-    flush: bool,
-) {
-    memory_barriers.clear();
-    while let Some((pass, barrier)) = barriers.clone().next() {
-        if flush || pass.index() <= i {
-            barriers.next();
-            memory_barriers.push(vk::MemoryBarrier2KHR {
-                src_stage_mask: barrier.src_stages,
-                src_access_mask: barrier.src_access,
-                dst_stage_mask: barrier.dst_stages,
-                dst_access_mask: barrier.dst_access,
+        raw_memory_barriers: &mut Vec<vk::MemoryBarrier2KHR>,
+        raw_image_barriers: &mut Vec<vk::ImageMemoryBarrier2KHR>,
+        raw_buffer_barriers: &mut Vec<vk::BufferMemoryBarrier2KHR>,
+
+        raw_images: &[Option<vk::Image>],
+        raw_buffers: &[Option<vk::Buffer>],
+        command_buffer: vk::CommandBuffer,
+    ) {
+        let iter = memory_barriers
+            .take_while(|(p, _)| p.index() <= i)
+            .map(|(_, info)| vk::MemoryBarrier2KHR {
+                src_stage_mask: info.src_stages,
+                src_access_mask: info.src_access,
+                dst_stage_mask: info.dst_stages,
+                dst_access_mask: info.dst_access,
                 ..Default::default()
             });
-        } else {
-            break;
-        }
-    }
-    image_barriers.clear();
-    buffer_barriers.clear();
-    while let Some((pass, barrier)) = special_barriers.clone().next() {
-        if flush || pass.index() <= i {
-            special_barriers.next();
-            // TODO support moves - ie non-whole subresource ranges
-            let subresource_range = vk::ImageSubresourceRange {
-                // TODO don't be dumb
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: vk::REMAINING_MIP_LEVELS,
-                base_array_layer: 0,
-                layer_count: vk::REMAINING_ARRAY_LAYERS,
-            };
-            match barrier {
-                SpecialBarrier::LayoutTransition {
-                    image,
-                    src_layout,
-                    dst_layout,
-                } => image_barriers.push(vk::ImageMemoryBarrier2KHR {
-                    old_layout: *src_layout,
-                    new_layout: *dst_layout,
-                    image: raw_images[image.index()].unwrap(),
-                    subresource_range,
-                    ..Default::default()
-                }),
-                SpecialBarrier::ImageOwnershipTransition {
-                    image,
-                    src_family,
-                    dst_family,
-                } => image_barriers.push(vk::ImageMemoryBarrier2KHR {
-                    src_queue_family_index: *src_family,
-                    dst_queue_family_index: *dst_family,
-                    image: raw_images[image.index()].unwrap(),
-                    subresource_range,
-                    ..Default::default()
-                }),
-                SpecialBarrier::BufferOwnershipTransition {
-                    buffer,
-                    src_family,
-                    dst_family,
-                } => buffer_barriers.push(vk::BufferMemoryBarrier2KHR {
-                    src_queue_family_index: *src_family,
-                    dst_queue_family_index: *dst_family,
-                    buffer: raw_buffers[buffer.index()].unwrap(),
-                    offset: 0,
-                    size: vk::WHOLE_SIZE,
-                    ..Default::default()
-                }),
-            };
+        raw_memory_barriers.clear();
+        raw_memory_barriers.extend(iter);
 
-            // if let Some(last) = image_barriers.last_mut() {
-            //     if last.image == barrier.image {
-            //         // TODO merge barriers
-            //         continue;
-            //     }
-            // }
-        } else {
-            break;
-        }
-    }
-    if !(memory_barriers.is_empty() && image_barriers.is_empty() && buffer_barriers.is_empty()) {
-        d.cmd_pipeline_barrier_2_khr(
-            command_buffer,
-            &vk::DependencyInfoKHR {
-                // TODO track opportunities to use BY_REGION and friends
-                // https://stackoverflow.com/questions/65471677/the-meaning-and-implications-of-vk-dependency-by-region-bit
-                dependency_flags: vk::DependencyFlags::empty(),
-                memory_barrier_count: memory_barriers.len() as u32,
-                p_memory_barriers: memory_barriers.as_ptr(),
-                buffer_memory_barrier_count: buffer_barriers.len() as u32,
-                p_buffer_memory_barriers: buffer_barriers.as_ptr(),
-                image_memory_barrier_count: image_barriers.len() as u32,
-                p_image_memory_barriers: image_barriers.as_ptr(),
+        let iter = image_barriers
+            .take_while(|(p, _)| p.index() <= i)
+            .map(|(_, info)| vk::ImageMemoryBarrier2KHR {
+                image: raw_images[info.image.index()].unwrap(),
+                src_stage_mask: info.src_stages,
+                src_access_mask: info.src_access,
+                dst_stage_mask: info.dst_stages,
+                dst_access_mask: info.dst_access,
+                old_layout: info.old_layout,
+                new_layout: info.new_layout,
+                src_queue_family_index: info.src_queue_family_index,
+                dst_queue_family_index: info.dst_queue_family_index,
+                subresource_range: self
+                    .input
+                    .get_image_subresource_range(info.image, vk::ImageAspectFlags::COLOR),
                 ..Default::default()
-            },
-        );
+            });
+        raw_image_barriers.clear();
+        raw_image_barriers.extend(iter);
+
+        let iter = buffer_barriers
+            .take_while(|(p, _)| p.index() <= i)
+            .map(|(_, info)| vk::BufferMemoryBarrier2KHR {
+                buffer: raw_buffers[info.buffer.index()].unwrap(),
+                src_stage_mask: info.src_stages,
+                src_access_mask: info.src_access,
+                dst_stage_mask: info.dst_stages,
+                dst_access_mask: info.dst_access,
+                src_queue_family_index: info.src_queue_family_index,
+                dst_queue_family_index: info.dst_queue_family_index,
+                offset: 0,
+                size: vk::WHOLE_SIZE,
+                ..Default::default()
+            });
+        raw_buffer_barriers.clear();
+        raw_buffer_barriers.extend(iter);
+
+        if !(raw_memory_barriers.is_empty()
+            && raw_image_barriers.is_empty()
+            && raw_buffer_barriers.is_empty())
+        {
+            d.cmd_pipeline_barrier_2_khr(
+                command_buffer,
+                &vk::DependencyInfoKHR {
+                    // TODO track opportunities to use BY_REGION and friends
+                    // https://stackoverflow.com/questions/65471677/the-meaning-and-implications-of-vk-dependency-by-region-bit
+                    dependency_flags: vk::DependencyFlags::empty(),
+                    memory_barrier_count: raw_memory_barriers.len() as u32,
+                    p_memory_barriers: raw_memory_barriers.as_ffi_ptr(),
+                    buffer_memory_barrier_count: raw_buffer_barriers.len() as u32,
+                    p_buffer_memory_barriers: raw_buffer_barriers.as_ffi_ptr(),
+                    image_memory_barrier_count: raw_image_barriers.len() as u32,
+                    p_image_memory_barriers: raw_image_barriers.as_ffi_ptr(),
+                    ..Default::default()
+                },
+            );
+        }
     }
 }
 
