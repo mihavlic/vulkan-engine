@@ -4,6 +4,7 @@
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
+
         {
             "type": "lldb",
             "request": "launch",
@@ -46,39 +47,20 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug executable 'test-bin'",
+            "name": "Debug executable 'triangle'",
             "cargo": {
                 "args": [
                     "build",
-                    "--bin=test-bin",
+                    "--example=triangle",
                     "--package=graph"
                 ],
                 "filter": {
-                    "name": "test-bin",
-                    "kind": "bin"
+                    "name": "triangle",
+                    "kind": "example"
                 }
             },
             "args": [],
             "cwd": "${workspaceFolder}"
         },
-        {
-            "type": "lldb",
-            "request": "launch",
-            "name": "Debug unit tests in executable 'test-bin'",
-            "cargo": {
-                "args": [
-                    "test",
-                    "--no-run",
-                    "--bin=test-bin",
-                    "--package=graph"
-                ],
-                "filter": {
-                    "name": "test-bin",
-                    "kind": "bin"
-                }
-            },
-            "args": [],
-            "cwd": "${workspaceFolder}"
-        }
     ]
 }

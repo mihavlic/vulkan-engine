@@ -256,6 +256,12 @@ simple_handle! {
     pub(crate) GraphMemoryTypeHandle
 }
 
+impl SubmissionPass {
+    pub(crate) fn pass_after(self) -> SubmissionPass {
+        SubmissionPass(self.0.checked_add(1).unwrap())
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct MemoryTypeIndex(u32);
 

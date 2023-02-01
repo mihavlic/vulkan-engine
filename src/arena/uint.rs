@@ -77,6 +77,7 @@ impl<T: UInt> Optional<T> {
         }
     }
     #[inline]
+    #[track_caller]
     pub fn unwrap(&self) -> T {
         if self.0 == T::MAX {
             panic!("Tried unwrapping a None value")

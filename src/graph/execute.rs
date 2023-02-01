@@ -489,7 +489,7 @@ impl CompiledGraph {
                     let data = self.input.get_image_data(image);
                     match data {
                         ImageData::Imported(archandle) => unsafe {
-                            let ResourceState::Normal(ResourceSubresource { layout, queue_family, access, src_barrier }) = &self.image_last_state[image.index()] else {
+                            let ResourceState::Normal(ResourceSubresource { layout, queue_family, access, read_barrier, last_write  }) = &self.image_last_state[image.index()] else {
                                 panic!("Unsupported state for external resource");
                             };
 
@@ -598,7 +598,7 @@ impl CompiledGraph {
                     let data = self.input.get_buffer_data(buffer);
                     match data {
                         BufferData::Imported(archandle) => unsafe {
-                            let ResourceState::Normal(ResourceSubresource { layout, queue_family, access, src_barrier }) = &self.buffer_last_state[buffer.index()] else {
+                            let ResourceState::Normal(ResourceSubresource { layout, queue_family, access, read_barrier, last_write }) = &self.buffer_last_state[buffer.index()] else {
                                 panic!("Unsupported state for external resource");
                             };
 
@@ -921,21 +921,36 @@ impl CompiledGraph {
         raw_buffers: &[Option<vk::Buffer>],
         command_buffer: vk::CommandBuffer,
     ) {
-        let iter = memory_barriers
-            .take_while(|(p, _)| p.index() <= i)
-            .map(|(_, info)| vk::MemoryBarrier2KHR {
+        fn map_collect_into<'a, T: 'a, A, F: Fn(&T) -> A>(
+            i: usize,
+            from: &mut (impl Iterator<Item = &'a (SubmissionPass, T)> + Clone),
+            into: &mut Vec<A>,
+            map: F,
+        ) {
+            into.clear();
+            while let Some((pass, next)) = from.clone().next() {
+                if pass.index() <= i {
+                    from.next();
+                    let new = map(&next);
+                    into.push(new);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        map_collect_into(i, memory_barriers, raw_memory_barriers, |info| {
+            vk::MemoryBarrier2KHR {
                 src_stage_mask: info.src_stages,
                 src_access_mask: info.src_access,
                 dst_stage_mask: info.dst_stages,
                 dst_access_mask: info.dst_access,
                 ..Default::default()
-            });
-        raw_memory_barriers.clear();
-        raw_memory_barriers.extend(iter);
+            }
+        });
 
-        let iter = image_barriers
-            .take_while(|(p, _)| p.index() <= i)
-            .map(|(_, info)| vk::ImageMemoryBarrier2KHR {
+        map_collect_into(i, image_barriers, raw_image_barriers, |info| {
+            vk::ImageMemoryBarrier2KHR {
                 image: raw_images[info.image.index()].unwrap(),
                 src_stage_mask: info.src_stages,
                 src_access_mask: info.src_access,
@@ -949,13 +964,11 @@ impl CompiledGraph {
                     .input
                     .get_image_subresource_range(info.image, vk::ImageAspectFlags::COLOR),
                 ..Default::default()
-            });
-        raw_image_barriers.clear();
-        raw_image_barriers.extend(iter);
+            }
+        });
 
-        let iter = buffer_barriers
-            .take_while(|(p, _)| p.index() <= i)
-            .map(|(_, info)| vk::BufferMemoryBarrier2KHR {
+        map_collect_into(i, buffer_barriers, raw_buffer_barriers, |info| {
+            vk::BufferMemoryBarrier2KHR {
                 buffer: raw_buffers[info.buffer.index()].unwrap(),
                 src_stage_mask: info.src_stages,
                 src_access_mask: info.src_access,
@@ -966,9 +979,8 @@ impl CompiledGraph {
                 offset: 0,
                 size: vk::WHOLE_SIZE,
                 ..Default::default()
-            });
-        raw_buffer_barriers.clear();
-        raw_buffer_barriers.extend(iter);
+            }
+        });
 
         if !(raw_memory_barriers.is_empty()
             && raw_image_barriers.is_empty()

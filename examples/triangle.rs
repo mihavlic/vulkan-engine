@@ -1,6 +1,8 @@
 #![allow(unused)]
 
+use std::env::current_dir;
 use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::{io, slice};
 
 use graph::device::{self, DeviceCreateInfo, QueueFamilySelection};
@@ -96,11 +98,21 @@ fn main() {
 
         let swapchain = make_swapchain(&window, surface, &device);
 
+        fn checked_file_open(path: impl AsRef<Path>) -> File {
+            File::open(path.as_ref()).unwrap_or_else(|_| {
+                panic!(
+                    "Error opening file at {}\ncwd: {}",
+                    path.as_ref().to_string_lossy(),
+                    current_dir().unwrap().to_string_lossy()
+                )
+            })
+        }
+
         let vert_module = device
-            .create_shader_module_read(&mut File::open("examples/shader.vert.spv").unwrap())
+            .create_shader_module_read(&mut checked_file_open("examples/shader.vert.spv"))
             .unwrap();
         let frag_module = device
-            .create_shader_module_read(&mut File::open("examples/shader.frag.spv").unwrap())
+            .create_shader_module_read(&mut checked_file_open("examples/shader.frag.spv"))
             .unwrap();
 
         let empty_layout = device

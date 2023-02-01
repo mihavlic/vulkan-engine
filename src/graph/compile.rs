@@ -295,7 +295,7 @@ impl Config for CombinedBarrierConfig {
     const SECOND_BITS: usize = 30;
 }
 
-simple_handle! {PassMemoryBarrier, PassImageBarrier, PassBufferBarrier}
+simple_handle! {pub(crate) PassMemoryBarrier, pub(crate) PassImageBarrier, pub(crate) PassBufferBarrier}
 
 impl PassMemoryBarrier {
     fn to_combined(self) -> CombinedBarrierHandle {
@@ -403,10 +403,11 @@ pub(crate) struct ResourceSubresource<T: ResourceMarker>
 where
     T::IfImage<vk::ImageLayout>: Clone,
 {
-    src_barrier: Option<CombinedBarrierHandle>,
-    layout: T::IfImage<vk::ImageLayout>,
-    queue_family: u32,
-    access: SmallVec<[PassTouch; 2]>,
+    pub(crate) read_barrier: Option<CombinedBarrierHandle>,
+    pub(crate) last_write: Option<PassTouch>,
+    pub(crate) layout: T::IfImage<vk::ImageLayout>,
+    pub(crate) queue_family: u32,
+    pub(crate) access: SmallVec<[PassTouch; 2]>,
 }
 
 #[derive(Clone)]
@@ -454,7 +455,7 @@ pub(crate) struct ImageBarrier {
 
 #[derive(Clone)]
 pub(crate) struct BufferBarrier {
-    pub(crate) buffer: GraphImage,
+    pub(crate) buffer: GraphBuffer,
     pub(crate) src_stages: vk::PipelineStageFlags2KHR,
     pub(crate) dst_stages: vk::PipelineStageFlags2KHR,
     pub(crate) src_access: vk::AccessFlags2KHR,
@@ -489,8 +490,7 @@ impl Submission {
     }
     // adds a special barrier that happens after all the passes in the submission have finished
     // useful for resource queue ownership transfers
-    fn reset(&mut self, queue: GraphQueue) {
-        self.queue = queue;
+    fn reset(&mut self) {
         self.passes.clear();
         self.semaphore_dependencies.clear();
         self.memory_barriers.clear();
@@ -535,13 +535,6 @@ impl Submission {
     }
 }
 
-// #[derive(Clone)]
-// pub(crate) struct PassEffects {
-//     access: vk::AccessFlags2KHR,
-//     stages: vk::PipelineStageFlags2KHR,
-//     last_barrier: OptionalU32,
-// }
-
 #[derive(Clone)]
 pub(crate) struct OpenSubmision {
     current_pass: Option<TimelinePass>,
@@ -573,7 +566,7 @@ pub(crate) struct SubmissionRecorder<'a> {
     graph: &'a GraphCompiler,
     submissions: Vec<Submission>,
     queues: Vec<OpenSubmision>,
-    current_queue: Option<(u32, GraphQueue)>,
+    current_queue: Option<(usize, GraphQueue)>,
 }
 
 impl<'a> SubmissionRecorder<'a> {
@@ -586,8 +579,7 @@ impl<'a> SubmissionRecorder<'a> {
         }
     }
     pub(crate) fn set_current_queue(&mut self, queue: GraphQueue) {
-        if let Some(found) = self.queues.iter().position(|q| q.submission.queue == queue) {
-            self.queues[found].submission.reset(queue);
+        if let Some(found) = self.find_queue_internal_index(queue) {
             self.current_queue = Some((found.try_into().unwrap(), queue));
         } else {
             let index = self.queues.len();
@@ -597,6 +589,9 @@ impl<'a> SubmissionRecorder<'a> {
             });
             self.current_queue = Some((index.try_into().unwrap(), queue));
         }
+    }
+    fn find_queue_internal_index(&mut self, queue: GraphQueue) -> Option<usize> {
+        self.queues.iter().position(|q| q.submission.queue == queue)
     }
     #[inline]
     pub(crate) fn get_current_submission(&self) -> &OpenSubmision {
@@ -631,7 +626,8 @@ impl<'a> SubmissionRecorder<'a> {
             .map(|found| found.submission.queue)
             .find(|&queue| self.graph.input.get_queue_family(queue) == family)
     }
-    pub(crate) fn add_submission_sneaky(&mut self, submission: Submission) -> GraphSubmission {
+    /// Adds a closed submission to the structure without disturbing any state
+    pub(crate) fn atomic_add_submission(&mut self, submission: Submission) -> GraphSubmission {
         // TODO is this neccessary?
         assert!(self.current_queue.map(|q| q.1) != Some(submission.queue));
         let index = self.submissions.len();
@@ -653,15 +649,9 @@ impl<'a> SubmissionRecorder<'a> {
             on_prev_end(self);
         }
         if self.current_queue.is_some() && self.current_queue.unwrap().1 != data.queue {
-            self.__close_submission(self.current_queue.unwrap().1);
+            self.close_current_submission();
         }
         self.set_current_queue(data.queue);
-
-        // let effects = PassEffects {
-        //     stages: data.stages.translate_special_bits(),
-        //     access: data.access & vk::AccessFlags2KHR::WRITE_FLAGS,
-        //     last_barrier: OptionalU32::NONE,
-        // };
 
         let submission = self.get_current_submission();
         let pass_handle = SubmissionPass::new(submission.submission.passes.len());
@@ -675,17 +665,14 @@ impl<'a> SubmissionRecorder<'a> {
 
         pass_handle
     }
-    // pub(crate) fn add_memory_barrier(&mut self, barrier: SpecialBarrier) {
-    //     let pass = self.get_current_pass();
-    //     self.get_current_submission_mut()
-    //         .special_barriers
-    //         .push((pass, barrier));
-    // }
     pub(crate) fn add_semaphore_dependency(&mut self, dependency: GraphSubmission) {
         self.get_current_submission_mut().add_dependency(dependency);
     }
-    /// False if src_pass is from a separate submission and thus requires no further execution synchronization
-    pub(crate) fn notify_execution_dependency(&mut self, src_pass: GraphPass) -> bool {
+    // if the pass is from a submission other than the current open one, the submission is closed and the handle to it is returned
+    pub(crate) fn prepare_execution_dependency(
+        &mut self,
+        src_pass: GraphPass,
+    ) -> Option<GraphSubmission> {
         let (_, queue) = self.current_queue.unwrap();
 
         let data = self.graph.input.get_pass_data(src_pass);
@@ -695,15 +682,19 @@ impl<'a> SubmissionRecorder<'a> {
 
         // the pass is on another queue in an open submission, close it for the next step
         if data.queue != queue && scheduled.is_none() {
-            let _ = self
-                .__close_submission(data.queue)
+            let queue_index = self.find_queue_internal_index(data.queue).unwrap();
+            self.__close_submission(queue_index)
                 .expect("Dependency must be scheduled before the dependee");
         }
 
+        scheduled.get().map(GraphSubmission)
+    }
+    /// False if src_pass is from a separate submission and thus requires no further execution or memory synchronization
+    pub(crate) fn add_execution_dependency(&mut self, src_pass: GraphPass) -> bool {
         // the pass has already been submitted, ignore barrier stuff and create a semaphore dependency
-        if let Some(scheduled) = scheduled.get() {
+        if let Some(scheduled) = self.prepare_execution_dependency(src_pass) {
             let submission = self.get_current_submission_mut();
-            submission.add_dependency(GraphSubmission(scheduled));
+            submission.add_dependency(scheduled);
 
             false
         } else {
@@ -732,11 +723,11 @@ impl<'a> SubmissionRecorder<'a> {
         handle
     }
     pub(crate) fn close_current_submission(&mut self) {
-        self.__close_submission(self.current_queue.unwrap().1);
+        self.__close_submission(self.current_queue.unwrap().0);
         self.current_queue = None;
     }
-    pub(crate) fn __close_submission(&mut self, queue: GraphQueue) -> Option<GraphSubmission> {
-        let submission = &mut self.queues[queue.index()];
+    pub(crate) fn __close_submission(&mut self, queue_index: usize) -> Option<GraphSubmission> {
+        let submission = &mut self.queues[queue_index];
         if submission.submission.passes.is_empty() {
             // sanity check
             assert!(submission.submission.memory_barriers.is_empty());
@@ -757,13 +748,15 @@ impl<'a> SubmissionRecorder<'a> {
             let finished = submission.finish();
             self.submissions.push(finished);
 
+            submission.submission.reset();
+
             Some(GraphSubmission(index))
         }
     }
     pub(crate) fn finish(mut self) -> Vec<Submission> {
         // cleanup all open submissions, order doesn't matter since they're leaf nodes
-        for queue in 0..self.queues.len() {
-            self.__close_submission(GraphQueue::new(queue));
+        for queue_i in 0..self.queues.len() {
+            self.__close_submission(queue_i);
         }
         self.submissions
     }
@@ -1757,14 +1750,15 @@ impl GraphCompiler {
                         let mut recorder_ref = recorder.borrow_mut();
                         for dep in &data.dependencies {
                             if dep.is_real() {
-                                recorder_ref.notify_execution_dependency(dep.get_pass());
-                                recorder_ref.add_memory_barrier(MemoryBarrier {
-                                    // TODO reconsider if it would be useful to be able to specify more granular dependencies
-                                    src_stages: vk::PipelineStageFlags2KHR::ALL_COMMANDS,
-                                    dst_stages: data.stages,
-                                    src_access: vk::AccessFlags2KHR::all(),
-                                    dst_access: data.access,
-                                });
+                                if recorder_ref.add_execution_dependency(dep.get_pass()) {
+                                    recorder_ref.add_memory_barrier(MemoryBarrier {
+                                        // TODO reconsider if it would be useful to be able to specify more granular dependencies
+                                        src_stages: vk::PipelineStageFlags2KHR::ALL_COMMANDS,
+                                        dst_stages: data.stages,
+                                        src_access: vk::AccessFlags2KHR::all(),
+                                        dst_access: data.access,
+                                    });
+                                }
                             }
                         }
 
@@ -1805,9 +1799,9 @@ impl GraphCompiler {
 
             for sub in &mut submissions {
                 // may not be sorted due to later submissions possibly adding barriers willy nilly
-                sub.memory_barriers.sort_by_key(|(p, _)| p);
-                sub.image_barriers.sort_by_key(|(p, _)| p);
-                sub.buffer_barriers.sort_by_key(|(p, _)| p);
+                sub.memory_barriers.sort_by_key(|&(p, _)| p);
+                sub.image_barriers.sort_by_key(|&(p, _)| p);
+                sub.buffer_barriers.sort_by_key(|&(p, _)| p);
             }
 
             // perform transitive reduction on the submissions
@@ -1864,7 +1858,7 @@ impl GraphCompiler {
             let mut final_accessors: HashMap<CombinedResourceHandle, ResourceFirstAccess> =
                 constant_ahash_hashmap();
 
-            final_accessors.extend(accessors.into_iter().map(|(key, accessor)| {
+            let iter = accessors.into_iter().map(|(key, accessor)| {
                 let ResourceAccessEntry { closed, accessors, dst_layout, dst_stages, dst_access, dst_queue_family } = accessor;
 
                 submissions_scratch.clear();
@@ -1888,7 +1882,8 @@ impl GraphCompiler {
                 };
 
                 (key, access)
-            }));
+            });
+            final_accessors.extend(iter);
 
             (submissions, image_rw, buffer_rw, final_accessors)
         };
@@ -2242,15 +2237,20 @@ impl GraphCompiler {
                                 }
                             };
 
-                            let ResourceState::Normal(ResourceSubresource { src_barrier, layout, queue_family, ref access } ) = image_last_state[image.index()] else {
+                            let ResourceState::Normal(ResourceSubresource { read_barrier: src_barrier, layout, queue_family, ref access, last_write } ) = image_last_state[image.index()] else {
                                 panic!();
                             };
 
-                            let mut src_access = vk::AccessFlags2KHR::empty();
                             let mut src_stages = vk::PipelineStageFlags2KHR::empty();
-                            for touch in access {
-                                src_access |= touch.access;
-                                src_stages |= touch.stages;
+                            let mut src_access = vk::AccessFlags2KHR::empty();
+                            if access.is_empty() {
+                                let touch = last_write.unwrap();
+                                src_stages = touch.stages;
+                                src_access = touch.access;
+                            } else {
+                                for touch in access {
+                                    src_stages |= touch.stages;
+                                }
                             }
 
                             // swapchain images must be in PRESENT_SRC_KHR before presenting
@@ -2368,8 +2368,7 @@ impl GraphCompiler {
             }
         })
     }
-
-    pub(crate) fn emit_barriers<T: ResourceMarker>(
+    fn emit_barriers<T: ResourceMarker>(
         &self,
         pass: GraphPass,
         dst_queue_family: u32,
@@ -2408,10 +2407,11 @@ impl GraphCompiler {
         };
         let normal_state = |barrier: Option<CombinedBarrierHandle>| {
             ResourceState::Normal(ResourceSubresource {
+                read_barrier: barrier,
+                last_write: Some(dst_touch),
                 layout: dst_layout,
                 queue_family: dst_queue_family,
-                access: smallvec![dst_touch],
-                src_barrier: barrier,
+                access: SmallVec::new(),
             })
         };
         match state {
@@ -2455,20 +2455,16 @@ impl GraphCompiler {
                         recorder,
                     );
 
-                    if dst_writes {
-                        subresource.access.clear();
-                    } else {
+                    if !dst_writes {
                         all_parts_written_to = false;
                     }
-
-                    subresource.access.push(dst_touch);
                 }
 
                 if all_parts_written_to {
-                    let recorder = recorder.borrow_mut();
+                    let mut recorder = recorder.borrow_mut();
                     let submission = &mut recorder.get_current_submission_mut().submission;
                     for (_, subresource) in parts.iter_mut() {
-                        if let Some(src_barrier) = subresource.src_barrier {
+                        if let Some(src_barrier) = subresource.read_barrier {
                             submission.add_barrier_masks(
                                 src_barrier,
                                 vk::AccessFlags2KHR::empty(),
@@ -2499,12 +2495,6 @@ impl GraphCompiler {
                     concurrent,
                     recorder,
                 );
-
-                if dst_writes {
-                    // already synchronized
-                    subresource.access.clear();
-                }
-                subresource.access.push(dst_touch);
             }
             // TODO perhaps this shouldn't be a hard error and instead delegate access to the move destination
             ResourceState::Moved => panic!("Attempt to access moved resource"),
@@ -2559,50 +2549,18 @@ impl GraphCompiler {
         <T as ResourceMarker>::IfImage<vk::ImageLayout>: Copy,
     {
         let ResourceSubresource {
-            src_barrier,
+            read_barrier,
             layout: src_layout,
             queue_family: src_queue_family,
             access,
+            last_write,
         } = subresource;
 
         let mut recorder = recorder.borrow_mut();
 
-        if let Some(src_barrier) = *src_barrier {
-            recorder
-                .deref_mut()
-                .get_current_submission_mut()
-                .submission
-                .add_barrier_masks(src_barrier, dst_touch.access, dst_touch.stages);
-        }
-
-        // let mut synchronized = false;
-        // let mut synchronize = || {
-        //     if !synchronized {
-        //         let mut recorder = recorder.borrow_mut();
-
-        //     }
-        // };
-
-        // if *dst_writes {
-        //     synchronize();
-        // }
-
-        // layout transition
         let layout_transition = T::IS_IMAGE
             && dst_layout.unwrap() != vk::ImageLayout::UNDEFINED
             && dst_layout.unwrap() != src_layout.unwrap();
-
-        // if
-        // {
-        //     synchronize();
-        //     *dst_writes = true;
-        //     recorder.borrow_mut().layout_transition(
-        //         GraphImage(raw_resource_handle.0),
-        //         src_layout.unwrap()..dst_layout.unwrap(),
-        //     );
-        // }
-        // // We want to set the layout to UNDEFINED even if no layout transition happened because the contents cannot be trusted afterwards
-        // *src_layout = dst_layout;
 
         let queue_ownership_transition = !concurrent
             // if we do not need the contents of the resource (=layout UNDEFINED), we can simply ignore the transfer
@@ -2610,115 +2568,217 @@ impl GraphCompiler {
             && (T::IS_BUFFER || dst_layout.unwrap() != vk::ImageLayout::UNDEFINED)
             && *src_queue_family != dst_queue_family;
 
-        if layout_transition {
-            let get_submission_for_pass = |pass: GraphPass| -> (GraphSubmission, SubmissionPass) {
-                let src_meta = self.get_pass_meta(pass);
-                let submission = GraphSubmission(src_meta.scheduled_submission.get().unwrap());
-                let pass = SubmissionPass(src_meta.scheduled_submission_position.get().unwrap());
-
-                (submission, pass)
-            };
-            assert!(!access.is_empty(), "For the resource to get into a Normal state it must have been first accessed so it must not have the access field empty");
-
-            let mut access_submissions = access
-                .iter()
-                .map(|t| get_submission_for_pass(t.pass))
-                .collect::<SmallVec<[_; 16]>>();
-
-            // if all of the accesses are within the same submission, we can just add a dummy pass at the end
-            // which waits for all of the passes and then releases ownership
-            if access_submissions[1..]
-                .iter()
-                .all(|&(submission, _)| submission == access_submissions[0].0)
-            {
-                let sub = recorder.get_closed_submission_mut(access_submissions[0].0);
-                sub.add_final_special_barrier(barrier);
-            } else {
-                // there are multiple submissions which we need to synchronize against to transfer the ownership
-                // the only way to wait for them on a src_queue family is to create a dummy submission which binds them together
-                // TODO merge dummy submissions where possible
-
-                access_submissions.sort_by_key(|&(submission, _)| submission);
-                access_submissions.dedup_by_key(|&mut (submission, _)| submission);
-
-                let queue = recorder.find_queue_with_family(src_queue_family).unwrap();
-
-                let submission = Submission {
-                    queue,
-                    passes: Default::default(),
-                    semaphore_dependencies: access_submissions.iter().map(|&(s, _)| s).collect(),
-                    barriers: Default::default(),
-                    special_barriers: vec![(
-                        Submission::AFTER_END_ALL_BARRIER_SUBMISSION_PASS,
-                        barrier,
-                    )],
-                    contains_end_all_barrier: false,
-                };
-
-                let sub = recorder.add_submission_sneaky(submission);
-                recorder.add_semaphore_dependency(sub);
-            }
-        }
-
-        // do image or buffer barrier
+        // do an image or buffer barrier
         if layout_transition || queue_ownership_transition {
             *dst_writes = true;
-        } else
-        /* do a normal memory barrier, it is kind of dubious what should be preferred */
-        {
         }
 
-        // if *dst_writes {
-        //     for touch in &*access {
-        //         if recorder.notify_execution_dependency(touch.pass) {
-        //             // we need the previous access to finish before we can transition the layout
-        //             recorder.add_memory_barrier(
-        //                 touch.pass,
-        //                 touch.access,
-        //                 touch.stages,
-        //                 dst_touch.access,
-        //                 dst_touch.stages,
-        //             );
-        //         }
-        //         synchronized = true;
-        //     }
-        // }
+        if *dst_writes {
+            *read_barrier = None;
 
-        // queue family ownership transition
-        // if
-        // {
-        //     synchronize();
-        //     *dst_writes = true;
+            let (src_stages, src_access) = if queue_ownership_transition {
+                // the last relevant access is are the readers
+                if !access.is_empty() {
+                    // we need to make a point on the src queue where all of the reads are finished
+                    // we will first try to insert a barrier at the end of the submission
+                    // otherwise we will create a dummy submission which
+                    let mut access_submissions = access
+                        .iter()
+                        .map(|t| {
+                            recorder.prepare_execution_dependency(t.pass).expect(
+                                "Queue ownership transition implies non-current source submission",
+                            )
+                        })
+                        .collect::<SmallVec<[_; 16]>>();
 
-        //     self.emit_family_ownership_transition(
-        //         resource_handle,
-        //         *src_queue_family,
-        //         dst_queue_family,
-        //         access,
-        //         &mut recorder.borrow_mut(),
-        //     );
-        // }
-    }
-    pub(crate) fn emit_family_ownership_transition(
-        &self,
-        resource_handle: CombinedResourceHandle,
-        src_queue_family: u32,
-        dst_queue_family: u32,
-        access: &[PassTouch],
-        recorder: &mut SubmissionRecorder,
-    ) {
-        let barrier = match resource_handle.unpack() {
-            GraphResource::Image(image) => SpecialBarrier::ImageOwnershipTransition {
-                image,
-                src_family: src_queue_family,
-                dst_family: dst_queue_family,
-            },
-            GraphResource::Buffer(buffer) => SpecialBarrier::BufferOwnershipTransition {
-                buffer,
-                src_family: src_queue_family,
-                dst_family: dst_queue_family,
-            },
-        };
+                    let single_src_submission = access_submissions[1..]
+                        .iter()
+                        .all(|&s| s == access_submissions[0]);
+
+                    // if all of the accesses are within the same submission, we can just add a dummy pass at the end
+                    // which waits for all of the passes and then releases ownership
+                    let (src_submission_handle, src_submission, src_stages, src_access) =
+                        if single_src_submission {
+                            let src_stages = access
+                                .iter()
+                                .map(|t| t.stages)
+                                .reduce(std::ops::BitOr::bitor)
+                                .unwrap();
+
+                            let submission = access_submissions[0];
+                            (
+                                submission,
+                                recorder.get_closed_submission_mut(submission),
+                                src_stages,
+                                vk::AccessFlags2KHR::empty(),
+                            )
+                        }
+                        // there are multiple submissions which we need to synchronize against to transfer the ownership
+                        // the only way to wait for them on a src_queue family is to create a dummy submission which binds them together
+                        else {
+                            access_submissions.sort_unstable();
+                            access_submissions.dedup();
+
+                            let queue = recorder.find_queue_with_family(*src_queue_family).unwrap();
+
+                            // TODO merge dummy submissions where possible
+                            let submission = Submission {
+                                queue,
+                                passes: Vec::new(),
+                                semaphore_dependencies: access_submissions.into_vec(),
+                                memory_barriers: todo!(),
+                                image_barriers: todo!(),
+                                buffer_barriers: todo!(),
+                            };
+
+                            let submission = recorder.atomic_add_submission(submission);
+                            (
+                                submission,
+                                recorder.get_closed_submission_mut(submission),
+                                vk::PipelineStageFlags2KHR::empty(),
+                                vk::AccessFlags2KHR::empty(),
+                            )
+                        };
+
+                    // release the ownership
+                    match resource_handle.unpack() {
+                        GraphResource::Image(image) => {
+                            src_submission.add_final_image_barrier(ImageBarrier {
+                                image,
+                                src_stages,
+                                dst_stages: vk::PipelineStageFlags2KHR::empty(),
+                                src_access: src_access,
+                                dst_access: vk::AccessFlags2KHR::empty(),
+                                // the layout will possibly be transitioned in the acquire barrier
+                                old_layout: src_layout.unwrap(),
+                                new_layout: src_layout.unwrap(),
+                                src_queue_family_index: *src_queue_family,
+                                dst_queue_family_index: dst_queue_family,
+                            });
+                        }
+                        GraphResource::Buffer(buffer) => {
+                            src_submission.add_final_buffer_barrier(BufferBarrier {
+                                buffer,
+                                src_stages,
+                                dst_stages: vk::PipelineStageFlags2KHR::empty(),
+                                src_access: src_access,
+                                dst_access: vk::AccessFlags2KHR::empty(),
+                                src_queue_family_index: *src_queue_family,
+                                dst_queue_family_index: dst_queue_family,
+                            });
+                        }
+                    }
+
+                    // depend on the ownership-release-submission
+                    recorder.add_semaphore_dependency(src_submission_handle);
+
+                    (
+                        vk::PipelineStageFlags2KHR::empty(),
+                        vk::AccessFlags2KHR::empty(),
+                    )
+                } else {
+                    let mut stages = vk::PipelineStageFlags2KHR::empty();
+                    for touch in access.iter() {
+                        if recorder.add_execution_dependency(touch.pass) {
+                            stages |= touch.stages;
+                        }
+                    }
+
+                    (stages, vk::AccessFlags2KHR::empty())
+                }
+            }
+            // last writer (in that case we have a Write-Write)
+            else if let Some(touch) = last_write {
+                if recorder.add_execution_dependency(touch.pass) {
+                    (touch.stages, touch.access)
+                } else {
+                    (
+                        vk::PipelineStageFlags2KHR::empty(),
+                        vk::AccessFlags2KHR::empty(),
+                    )
+                }
+            } else {
+                panic!("Resource is in Normal state but has no previous writer or readers");
+            };
+
+            // check that a barrier is actually neccessary, this may occur if we're the first write for the resource
+            if layout_transition
+                || queue_ownership_transition
+                || !src_access.is_empty()
+                || !src_stages.is_empty()
+            {
+                // either acquire ownership or do a layout transition
+                if layout_transition || queue_ownership_transition {
+                    // FIXME for ownership transitions: is it more efficient to acquire everything at the start of the submission?
+                    // currenly doing it just-in-time seems more debuggable
+                    match resource_handle.unpack() {
+                        GraphResource::Image(image) => {
+                            recorder.add_image_barrier(ImageBarrier {
+                                image,
+                                // source masks are empty because we're depending on the access through a semaphore
+                                src_stages,
+                                dst_stages: dst_touch.stages,
+                                src_access,
+                                dst_access: dst_touch.access,
+                                old_layout: src_layout.unwrap(),
+                                new_layout: dst_layout.unwrap(),
+                                src_queue_family_index: *src_queue_family,
+                                dst_queue_family_index: dst_queue_family,
+                            });
+                        }
+                        GraphResource::Buffer(buffer) => {
+                            recorder.add_buffer_barrier(BufferBarrier {
+                                buffer,
+                                src_stages,
+                                dst_stages: dst_touch.stages,
+                                src_access,
+                                dst_access: dst_touch.access,
+                                src_queue_family_index: *src_queue_family,
+                                dst_queue_family_index: dst_queue_family,
+                            });
+                        }
+                    }
+                }
+                // otherwise the synchronization examples says that memory barriers are better
+                else {
+                    recorder.add_memory_barrier(MemoryBarrier {
+                        src_stages,
+                        dst_stages: dst_touch.stages,
+                        src_access,
+                        dst_access: dst_touch.access,
+                    });
+                }
+            }
+
+            *last_write = Some(dst_touch);
+            access.clear();
+        } else {
+            let last_write =
+                last_write.expect("The resource must be first written to before being read.");
+
+            if recorder.add_execution_dependency(last_write.pass) {
+                let read_barrier = read_barrier.get_or_insert_with(|| {
+                    let barrier = recorder.add_memory_barrier(MemoryBarrier {
+                        src_stages: last_write.stages,
+                        dst_stages: vk::PipelineStageFlags2KHR::empty(),
+                        src_access: last_write.access,
+                        dst_access: vk::AccessFlags2KHR::empty(),
+                    });
+                    barrier.to_combined()
+                });
+
+                recorder
+                    .get_current_submission_mut()
+                    .submission
+                    .add_barrier_masks(*read_barrier, dst_touch.access, dst_touch.stages);
+            }
+
+            access.push(dst_touch);
+        }
+
+        // update the resource state
+        *src_queue_family = dst_queue_family;
+        *src_layout = dst_layout;
     }
 }
 
