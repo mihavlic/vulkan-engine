@@ -2,6 +2,7 @@
 
 use std::env::current_dir;
 use std::fs::File;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::{io, slice};
 
@@ -13,6 +14,7 @@ use graph::passes::{self, ClearImage, SimpleShader};
 use graph::tracing::tracing_subscriber::install_tracing_subscriber;
 use pumice::{util::ApiLoadConfig, vk};
 use pumice_vma::{AllocationCreateFlags, AllocationCreateInfo};
+use smallvec::smallvec;
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::EventLoop;
 use winit::platform::run_return::EventLoopExtRunReturn;
@@ -108,12 +110,18 @@ fn main() {
             })
         }
 
-        let vert_module = device
-            .create_shader_module_read(&mut checked_file_open("examples/shader.vert.spv"))
-            .unwrap();
-        let frag_module = device
-            .create_shader_module_read(&mut checked_file_open("examples/shader.frag.spv"))
-            .unwrap();
+        // let vert_module = device
+        //     .create_shader_module_read(&mut checked_file_open("examples/shader.vert.spv"))
+        //     .unwrap();
+        // let frag_module = device
+        //     .create_shader_module_read(&mut checked_file_open("examples/shader.frag.spv"))
+        //     .unwrap();
+
+        let mut vert_bytes = Cursor::new(include_bytes!("shader.vert.spv").as_slice());
+        let mut frag_bytes = Cursor::new(include_bytes!("shader.frag.spv").as_slice());
+
+        let vert_module = device.create_shader_module_read(&mut vert_bytes).unwrap();
+        let frag_module = device.create_shader_module_read(&mut frag_bytes).unwrap();
 
         let empty_layout = device
             .create_pipeline_layout(object::PipelineLayoutCreateInfo::empty())
@@ -140,7 +148,11 @@ fn main() {
                 topology: vk::PrimitiveTopology::TRIANGLE_LIST,
                 primitive_restart_enable: false,
             })
-            .viewport(object::state::Viewport::default())
+            .viewport(object::state::Viewport {
+                // the actual contents are ignored, it is just important to have one for each
+                viewports: smallvec![Default::default()],
+                scissors: smallvec![Default::default()],
+            })
             .vertex_input(object::state::VertexInput {
                 vertex_bindings: Vec::new(),
                 vertex_attributes: Vec::new(),
