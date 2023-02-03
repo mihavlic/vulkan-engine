@@ -136,8 +136,8 @@ unsafe impl<T: Send> Send for AtomicOption<T> {}
 
 // the public version of SubmissionEntry
 pub struct SubmissionData {
-    queue_family: u32,
-    semaphore: TimelineSemaphore,
+    pub queue_family: u32,
+    pub semaphore: TimelineSemaphore,
 }
 
 struct SubmissionEntry {
@@ -310,6 +310,9 @@ impl SubmissionManager {
 
         semaphore
     }
+    fn is_submission_finished(&self, submission: QueueSubmission) -> bool {
+        self.submissions.get(submission.0).is_none()
+    }
     fn get_submission_data(&self, submission: QueueSubmission) -> Option<SubmissionData> {
         self.submissions
             .get(submission.0)
@@ -426,15 +429,46 @@ impl Device {
             .write()
             .allocate(queue_family, finalizer, self)
     }
+    pub fn is_submission_finished(&self, submission: QueueSubmission) -> bool {
+        self.synchronization_manager
+            .read()
+            .is_submission_finished(submission)
+    }
     pub fn get_submission_data(&self, submission: QueueSubmission) -> Option<SubmissionData> {
         self.synchronization_manager
             .read()
             .get_submission_data(submission)
     }
-    pub fn collect_active_submission_datas(
+    pub fn collect_active_submission_datas<E: Extend<SubmissionData>>(
         &self,
         submissions: impl IntoIterator<Item = QueueSubmission>,
-        mut extend: impl Extend<SubmissionData>,
+        mut extend: &mut E,
+    ) {
+        self.collect_active_submission_datas_map(submissions, extend, |x| x)
+    }
+    pub fn collect_active_submission_datas_map<O, E: Extend<O>, F: FnMut(SubmissionData) -> O>(
+        &self,
+        submissions: impl IntoIterator<Item = QueueSubmission>,
+        mut extend: &mut E,
+        fun: F,
+    ) {
+        let guard = self.synchronization_manager.read();
+        let iter = submissions
+            .into_iter()
+            .filter_map(|s| {
+                guard
+                    .submissions
+                    .get(s.0)
+                    .filter(|e| !e.is_finished())
+                    .map(SubmissionEntry::to_public)
+            })
+            .map(fun);
+        extend.extend(iter);
+    }
+    pub fn filter_active_submissions<E: Extend<QueueSubmission>>(
+        &self,
+        submissions: impl IntoIterator<Item = QueueSubmission>,
+        mut extend: &mut E,
     ) {
         let guard = self.synchronization_manager.read();
         let iter = submissions.into_iter().filter_map(|s| {
@@ -442,7 +476,7 @@ impl Device {
                 .submissions
                 .get(s.0)
                 .filter(|e| !e.is_finished())
-                .map(SubmissionEntry::to_public)
+                .map(|_| s)
         });
         extend.extend(iter);
     }

@@ -74,14 +74,14 @@ impl BufferViewCreateInfo {
 }
 
 pub(crate) struct BufferViewEntry {
-    pub(crate) handle: vk::BufferView,
-    pub(crate) info_hash: u32,
-    pub(crate) last_use: GenerationId,
+    handle: vk::BufferView,
+    info_hash: u32,
+    last_use: GenerationId,
 }
 
 pub struct BufferMutableState {
-    pub(crate) views: SmallVec<[BufferViewEntry; 2]>,
-    pub(crate) synchronization: SynchronizationState<BufferMarker>,
+    views: SmallVec<[BufferViewEntry; 2]>,
+    synchronization: SynchronizationState<BufferMarker>,
 }
 
 impl BufferMutableState {
@@ -90,6 +90,9 @@ impl BufferMutableState {
             views: SmallVec::new(),
             synchronization: SynchronizationState::blank(),
         }
+    }
+    pub(crate) fn get_synchronization_state(&mut self) -> &mut SynchronizationState<BufferMarker> {
+        &mut self.synchronization
     }
     pub unsafe fn get_view(
         &mut self,
@@ -144,6 +147,9 @@ pub(crate) struct BufferState {
 }
 
 impl BufferState {
+    pub(crate) unsafe fn get_mutable_state(&self) -> &MutableShared<BufferMutableState> {
+        &self.mutable
+    }
     pub(crate) unsafe fn update_state(
         &self,
         // the initial state of the resource

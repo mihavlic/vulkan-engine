@@ -220,6 +220,9 @@ impl CompilationInput {
     pub(crate) fn get_concrete_image_data(&self, image: GraphImage) -> &ImageData {
         self.get_concrete_image_data_impl(image).1
     }
+    pub(crate) fn get_concrete_image_handle(&self, image: GraphImage) -> GraphImage {
+        self.get_concrete_image_data_impl(image).0.dst
+    }
     fn get_concrete_image_data_impl(&self, image: GraphImage) -> (MovedImageEntry, &ImageData) {
         let mut image = image;
         loop {

@@ -212,7 +212,10 @@ impl ImageMutableState {
             synchronization: SynchronizationState::with_initial_layout(layout),
         }
     }
-    pub unsafe fn get_view(
+    pub(crate) fn get_synchronization_state(&mut self) -> &mut SynchronizationState<ImageMarker> {
+        &mut self.synchronization
+    }
+    pub(crate) unsafe fn get_view(
         &mut self,
         self_handle: vk::Image,
         info: &ImageViewCreateInfo,
@@ -242,7 +245,7 @@ impl ImageMutableState {
             VulkanResult::Ok(view)
         }
     }
-    pub unsafe fn destroy(&mut self, ctx: &Device) {
+    pub(crate) unsafe fn destroy(&mut self, ctx: &Device) {
         for view in self.views.drain(..) {
             ctx.device()
                 .destroy_image_view(view.handle, ctx.allocator_callbacks());
@@ -258,6 +261,9 @@ pub(crate) struct ImageState {
 }
 
 impl ImageState {
+    pub(crate) unsafe fn get_mutable_state(&self) -> &MutableShared<ImageMutableState> {
+        &self.mutable
+    }
     pub(crate) unsafe fn update_state(
         &self,
         // the initial state of the resource

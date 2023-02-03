@@ -440,6 +440,18 @@ pub(crate) struct MemoryBarrier {
     pub(crate) dst_access: vk::AccessFlags2KHR,
 }
 
+impl MemoryBarrier {
+    pub(crate) fn to_vk(&self) -> vk::MemoryBarrier2KHR {
+        vk::MemoryBarrier2KHR {
+            src_stage_mask: self.src_stages,
+            src_access_mask: self.src_access,
+            dst_stage_mask: self.dst_stages,
+            dst_access_mask: self.dst_access,
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ImageBarrier {
     pub(crate) image: GraphImage,
@@ -453,6 +465,28 @@ pub(crate) struct ImageBarrier {
     pub(crate) dst_queue_family_index: u32,
 }
 
+impl ImageBarrier {
+    pub(crate) fn to_vk(
+        &self,
+        image: vk::Image,
+        subresource_range: vk::ImageSubresourceRange,
+    ) -> vk::ImageMemoryBarrier2KHR {
+        vk::ImageMemoryBarrier2KHR {
+            image,
+            src_stage_mask: self.src_stages,
+            src_access_mask: self.src_access,
+            dst_stage_mask: self.dst_stages,
+            dst_access_mask: self.dst_access,
+            old_layout: self.old_layout,
+            new_layout: self.new_layout,
+            src_queue_family_index: self.src_queue_family_index,
+            dst_queue_family_index: self.dst_queue_family_index,
+            subresource_range,
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct BufferBarrier {
     pub(crate) buffer: GraphBuffer,
@@ -462,6 +496,23 @@ pub(crate) struct BufferBarrier {
     pub(crate) dst_access: vk::AccessFlags2KHR,
     pub(crate) src_queue_family_index: u32,
     pub(crate) dst_queue_family_index: u32,
+}
+
+impl BufferBarrier {
+    pub(crate) fn to_vk(&self, buffer: vk::Buffer) -> vk::BufferMemoryBarrier2KHR {
+        vk::BufferMemoryBarrier2KHR {
+            buffer,
+            src_stage_mask: self.src_stages,
+            src_access_mask: self.src_access,
+            dst_stage_mask: self.dst_stages,
+            dst_access_mask: self.dst_access,
+            src_queue_family_index: self.src_queue_family_index,
+            dst_queue_family_index: self.dst_queue_family_index,
+            offset: 0,
+            size: vk::WHOLE_SIZE,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1122,7 +1173,6 @@ impl GraphCompiler {
     pub fn compile<F: FnOnce(&mut GraphBuilder)>(
         &mut self,
         device: OwnedDevice,
-        threadpool: &ThreadPool,
         fun: F,
     ) -> CompiledGraph {
         self.input.clear();
@@ -1139,7 +1189,7 @@ impl GraphCompiler {
 
         let (sender, receiver) = std::sync::mpsc::channel();
         let owned_device = device.clone();
-        threadpool.spawn(move || {
+        device.threadpool().spawn(move || {
             use rayon::prelude::*;
             let (a, b) = rayon::join(
                 move || {
@@ -2405,14 +2455,24 @@ impl GraphCompiler {
                 matches!(self.input.get_buffer_data(handle), BufferData::Imported(_))
             }
         };
-        let normal_state = |barrier: Option<CombinedBarrierHandle>| {
-            ResourceState::Normal(ResourceSubresource {
-                read_barrier: barrier,
-                last_write: Some(dst_touch),
-                layout: dst_layout,
-                queue_family: dst_queue_family,
-                access: SmallVec::new(),
-            })
+        let normal_state = |barrier: Option<CombinedBarrierHandle>, dst_writes: bool| {
+            if dst_writes {
+                ResourceState::Normal(ResourceSubresource {
+                    read_barrier: barrier,
+                    last_write: Some(dst_touch),
+                    layout: dst_layout,
+                    queue_family: dst_queue_family,
+                    access: SmallVec::new(),
+                })
+            } else {
+                ResourceState::Normal(ResourceSubresource {
+                    read_barrier: barrier,
+                    last_write: None,
+                    layout: dst_layout,
+                    queue_family: dst_queue_family,
+                    access: smallvec![dst_touch],
+                })
+            }
         };
         match state {
             // no dependency
@@ -2429,9 +2489,9 @@ impl GraphCompiler {
                         src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                         dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                     });
-                    *state = normal_state(Some(barrier.to_combined()));
+                    *state = normal_state(Some(barrier.to_combined()), true);
                 } else {
-                    *state = normal_state(None);
+                    *state = normal_state(None, dst_writes);
                 }
             }
             // if the current access only needs to read, add it to the readers (and handle layout transitions)
@@ -2480,7 +2540,7 @@ impl GraphCompiler {
                         src_access: vk::AccessFlags2KHR::empty(),
                         dst_access: vk::AccessFlags2KHR::empty(),
                     });
-                    *state = normal_state(Some(barrier.to_combined()));
+                    *state = normal_state(Some(barrier.to_combined()), true);
                 }
             }
             ResourceState::Normal(subresource) => {

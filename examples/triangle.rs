@@ -184,7 +184,7 @@ fn main() {
         let pipeline = device.create_delayed_pipeline(pipeline_info);
 
         let mut compiler = GraphCompiler::new();
-        let mut graph = compiler.compile(device.clone(), device.threadpool(), |b| {
+        let mut graph = compiler.compile(device.clone(), |b| {
             let queue = b.import_queue(queue);
             let swapchain = b.acquire_swapchain(swapchain.clone());
             b.add_pass(

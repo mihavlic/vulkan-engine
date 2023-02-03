@@ -325,6 +325,15 @@ impl Device {
         self.queue_families
             .get(self.queue_selection_mapping.get(selection_index)?.0)
     }
+    pub fn find_queue_for_family(&self, queue_family: u32) -> Option<vk::Queue> {
+        let range = self
+            .queue_selection_mapping
+            .iter()
+            .find(|&&(family, _)| family == queue_family as usize)?
+            .1
+            .clone();
+        self.queues.get(range)?.get(0).cloned()
+    }
     pub unsafe fn create_shader_module_read<R: io::Read + io::Seek>(
         &self,
         data: &mut R,
