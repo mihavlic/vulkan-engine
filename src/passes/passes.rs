@@ -1,11 +1,17 @@
+use std::ops::Mul;
+
 use pumice::{util::ObjectHandle, vk};
 use smallvec::{smallvec, SmallVec};
 
 use crate::{
     device::Device,
     graph::{
-        compile::GraphContext, execute::GraphExecutor, record::GraphPassBuilder,
-        task::GraphicsPipelinePromise, GraphImage,
+        compile::GraphContext,
+        descriptors::{bind_descriptor_sets, DescBuffer, DescSetBuilder, DescriptorData},
+        execute::GraphExecutor,
+        record::GraphPassBuilder,
+        task::GraphicsPipelinePromise,
+        GraphImage,
     },
     object::{self, ConcreteGraphicsPipeline, Extent, GraphicsPipeline, RenderPassMode},
 };
@@ -62,6 +68,8 @@ impl RenderPass for ClearImage {
 }
 
 pub struct SimpleShader {
+    pub set_layout: object::DescriptorSetLayout,
+    pub pipeline_layout: object::PipelineLayout,
     pub pipeline: GraphicsPipeline,
     pub attachments: Vec<GraphImage>,
 }
@@ -102,6 +110,7 @@ impl CreatePass for SimpleShader {
         Box::new(SimpleShaderPass {
             info: self,
             pipeline,
+            start: std::time::Instant::now(),
         })
     }
 }
@@ -109,6 +118,7 @@ impl CreatePass for SimpleShader {
 struct SimpleShaderPass {
     info: SimpleShader,
     pipeline: ConcreteGraphicsPipeline,
+    start: std::time::Instant,
 }
 
 impl RenderPass for SimpleShaderPass {
@@ -193,6 +203,29 @@ impl RenderPass for SimpleShaderPass {
                 d.cmd_set_scissor(cmd, 0, std::slice::from_ref(&rect));
             }
         }
+
+        let time = self.start.elapsed().as_secs_f32() * std::f32::consts::PI;
+        let color: [f32; 4] = [time.sin(), time.mul(2.0).sin(), time.mul(3.0).sin(), time];
+        let res = executor.allocate_uniform_element(color);
+
+        let mut set = DescSetBuilder::new(&self.info.set_layout);
+        set.update_buffer_binding(
+            0,
+            0,
+            &DescBuffer {
+                buffer: res.buffer,
+                offset: 0,
+                range: vk::WHOLE_SIZE,
+                dynamic_offset: Some(res.dynamic_offset),
+                ..Default::default()
+            },
+        );
+        let fin = set.finish(executor);
+        executor.bind_descriptor_sets(
+            vk::PipelineBindPoint::GRAPHICS,
+            &self.info.pipeline_layout,
+            &[fin],
+        );
 
         d.cmd_draw(cmd, 3, 1, 0, 0);
 

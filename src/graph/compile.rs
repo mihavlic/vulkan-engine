@@ -23,7 +23,7 @@ use crate::{
     },
     graph::{
         allocator::MemoryKind,
-        execute::{CompiledGraphVulkanState, DeferredResourceFree, GraphExecutor},
+        execute::{CompiledGraphVulkanState, GraphExecutor, MainCompiledGraphVulkanState},
         resource_marker::{BufferMarker, ImageMarker, TypeOption},
         reverse_edges::reverse_edges_into,
         task::{GraphicsPipelineSrc, SendUnsafeCell},
@@ -911,6 +911,7 @@ pub(crate) struct ResourceFirstAccess {
 }
 
 pub(crate) enum ImageKindCreateInfo<'a> {
+    ImageRef(std::cell::Ref<'a, object::ImageCreateInfo>),
     Image(&'a object::ImageCreateInfo),
     Swapchain(&'a object::SwapchainCreateInfo),
 }
@@ -2345,15 +2346,13 @@ impl GraphCompiler {
             current_generation: Cell::new(None),
             prev_generation: Cell::new(None),
 
-            state: ManuallyDrop::new(Arc::new(SendUnsafeCell::new(
-                CompiledGraphVulkanState::new(
-                    device,
-                    &*suballocators,
-                    std::mem::take(&mut self.pass_objects),
-                    std::mem::take(&mut self.physical_images),
-                    std::mem::take(&mut self.physical_buffers),
-                ),
-            ))),
+            state: MainCompiledGraphVulkanState::new(
+                device,
+                &*suballocators,
+                std::mem::take(&mut self.pass_objects),
+                std::mem::take(&mut self.physical_images),
+                std::mem::take(&mut self.physical_buffers),
+            ),
         }
     }
 

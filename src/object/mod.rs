@@ -1,7 +1,7 @@
 macro_rules! create_object {
     ($name:ident) => {
-        #[derive(Clone, PartialEq, Eq)]
-        pub struct $name(pub(crate) $crate::object::ArcHandle<Self>);
+        #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(pub(crate) $crate::object::ObjHandle<Self>);
 
         unsafe impl Send for $name {}
         unsafe impl Sync for $name {}
@@ -13,6 +13,20 @@ macro_rules! derive_raw_handle {
         impl $name {
             pub fn raw(&self) -> $Handle {
                 unsafe { self.0.get_handle() }
+            }
+        }
+
+        impl std::ops::Deref for $name {
+            type Target = $crate::object::ObjRef<$name>;
+            #[inline(always)]
+            fn deref(&self) -> &Self::Target {
+                // sound because ObjRef is repr(transparent)
+                unsafe {
+                    std::mem::transmute::<
+                        &crate::object::ObjHeader<$name>,
+                        &crate::object::ObjRef<$name>,
+                    >(self.0 .0.as_ref())
+                }
             }
         }
     };
@@ -41,14 +55,16 @@ pub use surface::*;
 pub use swapchain::*;
 
 use pumice::VulkanResult;
-use std::{borrow::BorrowMut, hash::Hash, mem::ManuallyDrop, ptr::NonNull};
-
-use crate::storage::{
-    interned::ObjectCreateInfoFingerPrint, ArcHeader, MutableShared, ObjectStorage,
-    SynchronizationLock,
+use std::{
+    borrow::BorrowMut, hash::Hash, mem::ManuallyDrop, ops::Deref, ptr::NonNull,
+    sync::atomic::AtomicUsize,
 };
 
-pub(crate) trait ObjectData {
+use crate::storage::{
+    interned::ObjectCreateInfoFingerPrint, MutableShared, ObjectStorage, SynchronizationLock,
+};
+
+pub trait ObjectData {
     type CreateInfo;
     type Handle: Copy;
     /// The method must be safe to be called from multiple threads at the same time
@@ -57,7 +73,7 @@ pub(crate) trait ObjectData {
     fn get_handle(&self) -> Self::Handle;
 }
 
-pub(crate) trait Object: Sized {
+pub trait Object: Sized {
     type Storage: ObjectStorage<Self> + Sync;
     type Parent;
 
@@ -73,49 +89,60 @@ pub(crate) trait Object: Sized {
         ctx: &Self::Parent,
     ) -> VulkanResult<()>;
 
-    unsafe fn get_storage(parent: &Self::Parent) -> &Self::Storage;
+    fn get_storage(parent: &Self::Parent) -> &Self::Storage;
 }
 
-pub(crate) struct ArcHandle<T: Object>(pub(crate) NonNull<ArcHeader<T>>);
+#[repr(C)]
+pub struct ObjHeader<T: Object> {
+    pub(crate) refcount: AtomicUsize,
+    pub(crate) object_data: T::Data,
+    pub(crate) storage_data: <T::Storage as ObjectStorage<T>>::StorageData,
+    pub(crate) parent: NonNull<T::Parent>,
+}
+
+pub struct ObjHandle<T: Object>(pub(crate) NonNull<ObjHeader<T>>);
 
 /// Pointed-to object is atomically reference counted, fields are either immutable or synchronized with MutableShared
-unsafe impl<T: Object + Send> Send for ArcHandle<T> {}
-unsafe impl<T: Object + Sync> Sync for ArcHandle<T> {}
+unsafe impl<T: Object + Send> Send for ObjHandle<T> {}
+unsafe impl<T: Object + Sync> Sync for ObjHandle<T> {}
 
-impl<T: Object> ArcHandle<T> {
-    pub(crate) unsafe fn get_object_data(&self) -> &T::Data {
-        &self.0.as_ref().object_data
+impl<T: Object> ObjHandle<T> {
+    pub unsafe fn get_object_header_ptr(&self) -> *mut ObjHeader<T> {
+        self.0.as_ptr()
     }
-    pub(crate) unsafe fn get_storage_data(&self) -> &<T::Storage as ObjectStorage<T>>::StorageData {
-        &self.0.as_ref().storage_data
+}
+
+impl<T: Object> ObjRef<T> {
+    pub fn get_object_data(&self) -> &T::Data {
+        &self.0.object_data
     }
-    pub(crate) unsafe fn get_parent_storage(&self) -> &T::Storage {
+    pub fn get_storage_data(&self) -> &<T::Storage as ObjectStorage<T>>::StorageData {
+        &self.0.storage_data
+    }
+    pub fn get_parent_storage(&self) -> &T::Storage {
         let parent = self.get_parent();
         T::get_storage(parent)
     }
-    pub(crate) unsafe fn get_handle(&self) -> <T::Data as ObjectData>::Handle {
+    pub fn get_handle(&self) -> <T::Data as ObjectData>::Handle {
         self.get_object_data().get_handle()
     }
-    pub(crate) unsafe fn get_create_info(&self) -> &<T::Data as ObjectData>::CreateInfo {
+    pub fn get_create_info(&self) -> &<T::Data as ObjectData>::CreateInfo {
         self.get_object_data().get_create_info()
     }
-    pub(crate) unsafe fn get_arc_header(&self) -> &ArcHeader<T> {
-        self.0.as_ref()
+    pub fn get_object_header(&self) -> &ObjHeader<T> {
+        &self.0
     }
-    pub(crate) unsafe fn get_arc_header_ptr(&self) -> *mut ArcHeader<T> {
-        self.0.as_ptr()
+    pub fn get_parent(&self) -> &T::Parent {
+        // safety: dubious
+        // user should ensure that parent is the last this to be dropped
+        // (or just leak it)
+        unsafe { self.get_object_header().parent.as_ref() }
     }
-    pub(crate) unsafe fn get_parent(&self) -> &T::Parent {
-        self.get_arc_header().parent.as_ref()
-    }
-    pub(crate) unsafe fn make_weak_copy(&self) -> ManuallyDrop<Self> {
-        ManuallyDrop::new(std::ptr::read(self))
-    }
-    pub(crate) unsafe fn lock_storage(&self) -> SynchronizationLock<'_> {
+    pub fn lock_storage(&self) -> SynchronizationLock<'_> {
         let storage = self.get_parent_storage();
         storage.acquire_exclusive(self)
     }
-    pub(crate) unsafe fn access_mutable<
+    pub fn access_mutable<
         A,
         B,
         F: FnOnce(&T::Data) -> &MutableShared<A>,
@@ -128,45 +155,53 @@ impl<T: Object> ArcHandle<T> {
         let lock = self.lock_storage();
 
         let mutable = fun1(&self.get_object_data());
-        let mut refmut = mutable.get_mut(&lock);
+        let mut refmut = unsafe { mutable.get_mut(&lock) };
 
         fun2(refmut.borrow_mut())
     }
+    /// Duplicate the handle without incrementing the refcount, use this only when holding the
+    /// the original handle.
+    pub unsafe fn make_weak_copy(&self) -> ManuallyDrop<ObjHandle<T>> {
+        ManuallyDrop::new(ObjHandle(NonNull::from(&self.0)))
+    }
 }
 
-impl<T: Object> PartialEq for ArcHandle<T> {
+impl<T: Object> PartialEq for ObjHandle<T> {
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0
     }
 }
-impl<T: Object> PartialOrd for ArcHandle<T> {
+impl<T: Object> PartialOrd for ObjHandle<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         self.0.partial_cmp(&other.0)
     }
 }
-impl<T: Object> Eq for ArcHandle<T> {}
-impl<T: Object> Ord for ArcHandle<T> {
+impl<T: Object> Eq for ObjHandle<T> {}
+impl<T: Object> Ord for ObjHandle<T> {
     fn cmp(&self, _other: &Self) -> std::cmp::Ordering {
         todo!()
     }
 }
-impl<T: Object> Hash for ArcHandle<T> {
+impl<T: Object> Hash for ObjHandle<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.0.hash(state);
     }
 }
 
 pub(crate) struct CloneMany<T: Object> {
-    handle: ArcHandle<T>,
+    handle: ObjHandle<T>,
     count: usize,
 }
 
 impl<T: Object> Iterator for CloneMany<T> {
-    type Item = ArcHandle<T>;
+    type Item = ObjHandle<T>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.count > 0 {
             self.count -= 1;
-            return Some(ArcHandle(self.handle.0));
+            // safety: we've bulk incremented the refcount at the creation of CloneMany
+            // so this new handle is accounted for
+            let copy = unsafe { self.handle.make_weak_copy() };
+            return Some(ManuallyDrop::into_inner(copy));
         }
         return None;
     }
@@ -182,7 +217,7 @@ impl<T: Object> Drop for CloneMany<T> {
         unsafe {
             let prev = self
                 .handle
-                .get_arc_header()
+                .get_object_header()
                 .refcount
                 .fetch_sub(self.count, std::sync::atomic::Ordering::SeqCst);
 
@@ -191,13 +226,13 @@ impl<T: Object> Drop for CloneMany<T> {
             // if we just subtracted the same value as was in self.count, self.count is now 0, destroy the object
             if prev == self.count {
                 let storage = self.handle.get_parent_storage();
-                T::Storage::destroy(storage, &self.handle).unwrap();
+                T::Storage::destroy(storage, self.handle.make_weak_copy()).unwrap();
             }
         }
     }
 }
 
-impl<T: Object> ArcHandle<T> {
+impl<T: Object> ObjHandle<T> {
     pub(crate) fn clone_many<'a>(&'a self, count: usize) -> CloneMany<T> {
         unsafe {
             let header = self.0;
@@ -208,14 +243,14 @@ impl<T: Object> ArcHandle<T> {
             assert!(prev > 0);
 
             CloneMany {
-                handle: ArcHandle(self.0),
+                handle: ObjHandle(self.0),
                 count,
             }
         }
     }
 }
 
-impl<T: Object> Clone for ArcHandle<T> {
+impl<T: Object> Clone for ObjHandle<T> {
     fn clone(&self) -> Self {
         unsafe {
             let header = self.0;
@@ -225,30 +260,30 @@ impl<T: Object> Clone for ArcHandle<T> {
 
             assert!(prev > 0);
 
-            ArcHandle(header)
+            ObjHandle(header)
         }
     }
 }
 
-impl<T: Object> Drop for ArcHandle<T> {
+impl<T: Object> Drop for ObjHandle<T> {
     fn drop(&mut self) {
-        unsafe {
-            let prev = self
-                .get_arc_header()
-                .refcount
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let prev = self
+            .get_object_header()
+            .refcount
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
 
-            assert!(prev > 0);
+        assert!(prev > 0);
 
-            if prev == 1 {
-                let storage = self.get_parent_storage();
-                T::Storage::destroy(storage, self).unwrap();
+        if prev == 1 {
+            let storage = self.get_parent_storage();
+            unsafe {
+                T::Storage::destroy(storage, self.make_weak_copy()).unwrap();
             }
         }
     }
 }
 
-pub(crate) struct BasicObjectData<H, I> {
+pub struct BasicObjectData<H, I> {
     handle: H,
     info: I,
 }
@@ -277,5 +312,16 @@ impl<H: Copy, I> ObjectData for BasicObjectData<H, I> {
     }
     fn get_handle(&self) -> Self::Handle {
         self.handle
+    }
+}
+
+#[repr(transparent)]
+pub struct ObjRef<T: Object>(ObjHeader<T>);
+
+impl<T: Object> std::ops::Deref for ObjHandle<T> {
+    type Target = ObjRef<T>;
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        unsafe { std::mem::transmute::<&ObjHeader<T>, &ObjRef<T>>(self.0.as_ref()) }
     }
 }

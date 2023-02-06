@@ -13,7 +13,7 @@ use crate::{
     storage::{constant_ahash_hasher, nostore::SimpleStorage, MutableShared, SynchronizationLock},
 };
 
-use super::{ArcHandle, Object, ObjectData};
+use super::{ObjHandle, Object, ObjectData};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Extent {
@@ -253,7 +253,7 @@ impl ImageMutableState {
     }
 }
 
-pub(crate) struct ImageState {
+pub struct ImageState {
     handle: vk::Image,
     info: ImageCreateInfo,
     allocation: pumice_vma::Allocation,
@@ -261,10 +261,10 @@ pub(crate) struct ImageState {
 }
 
 impl ImageState {
-    pub(crate) unsafe fn get_mutable_state(&self) -> &MutableShared<ImageMutableState> {
+    pub unsafe fn get_mutable_state(&self) -> &MutableShared<ImageMutableState> {
         &self.mutable
     }
-    pub(crate) unsafe fn update_state(
+    pub unsafe fn update_state(
         &self,
         // the initial state of the resource
         dst_family: u32,
@@ -333,7 +333,7 @@ impl Object for Image {
         VulkanResult::Ok(())
     }
 
-    unsafe fn get_storage(parent: &Self::Parent) -> &Self::Storage {
+    fn get_storage(parent: &Self::Parent) -> &Self::Storage {
         &parent.image_storage
     }
 }

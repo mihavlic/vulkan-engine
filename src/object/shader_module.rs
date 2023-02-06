@@ -1,7 +1,7 @@
 use std::cell::RefMut;
 use std::ptr;
 
-use super::{ArcHandle, BasicObjectData, ImageMutableState, Object, ObjectData};
+use super::{BasicObjectData, ImageMutableState, ObjHandle, Object, ObjectData};
 
 use crate::device::Device;
 use crate::storage::nostore::SimpleStorage;
@@ -47,7 +47,7 @@ impl Object for ShaderModule {
         VulkanResult::Ok(())
     }
 
-    unsafe fn get_storage(parent: &Self::Parent) -> &Self::Storage {
+    fn get_storage(parent: &Self::Parent) -> &Self::Storage {
         &parent.shader_modules
     }
 }

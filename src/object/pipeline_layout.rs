@@ -5,25 +5,23 @@ use crate::storage::nostore::SimpleStorage;
 use crate::storage::SynchronizationLock;
 use crate::util::ffi_ptr::AsFFiPtr;
 
-use super::{ArcHandle, Object};
 use super::{BasicObjectData, ObjectData};
+use super::{ObjHandle, Object};
 use pumice::util::ObjectHandle;
 use pumice::vk;
 use pumice::VulkanResult;
 use smallvec::SmallVec;
 
 pub struct PipelineLayoutCreateInfo {
-    pub flags: vk::PipelineLayoutCreateFlags,
-    pub set_layouts: SmallVec<[super::DescriptorSetLayout; 4]>,
-    pub push_constants: SmallVec<[vk::PushConstantRange; 4]>,
+    pub set_layouts: Vec<super::DescriptorSetLayout>,
+    pub push_constants: Vec<vk::PushConstantRange>,
 }
 
 impl PipelineLayoutCreateInfo {
     pub fn empty() -> Self {
         Self {
-            flags: vk::PipelineLayoutCreateFlags::empty(),
-            set_layouts: SmallVec::new(),
-            push_constants: SmallVec::new(),
+            set_layouts: Vec::new(),
+            push_constants: Vec::new(),
         }
     }
     pub unsafe fn create(&self, ctx: &Device) -> VulkanResult<vk::PipelineLayout> {
@@ -34,7 +32,6 @@ impl PipelineLayoutCreateInfo {
             .collect::<SmallVec<[_; 8]>>();
 
         let info = vk::PipelineLayoutCreateInfo {
-            flags: self.flags,
             set_layout_count: layouts.len() as u32,
             p_set_layouts: layouts.as_ffi_ptr(),
             push_constant_range_count: self.push_constants.len() as u32,
@@ -73,7 +70,7 @@ impl Object for PipelineLayout {
         VulkanResult::Ok(())
     }
 
-    unsafe fn get_storage(parent: &Self::Parent) -> &Self::Storage {
+    fn get_storage(parent: &Self::Parent) -> &Self::Storage {
         &parent.pipeline_layouts
     }
 }

@@ -7,7 +7,7 @@ use crate::{
     instance::Instance,
     object::{
         self, Buffer, DescriptorSetLayout, GraphicsPipeline, Image, PipelineLayout, RenderPass,
-        RenderPassMode, ShaderModule, Swapchain,
+        RenderPassMode, Sampler, ShaderModule, Swapchain,
     },
     storage::{nostore::SimpleStorage, ObjectStorage},
     tracing::shim_macros::{info, trace},
@@ -79,6 +79,7 @@ pub struct Device {
     // object handle storage
     pub(crate) graphics_pipelines: SimpleStorage<GraphicsPipeline>,
     pub(crate) shader_modules: SimpleStorage<ShaderModule>,
+    pub(crate) samplers: SimpleStorage<Sampler>,
     pub(crate) render_passes: SimpleStorage<RenderPass>,
     pub(crate) pipeline_layouts: SimpleStorage<PipelineLayout>,
     pub(crate) descriptor_set_layouts: SimpleStorage<DescriptorSetLayout>,
@@ -263,6 +264,7 @@ impl Device {
             queues,
 
             shader_modules: SimpleStorage::new(),
+            samplers: SimpleStorage::new(),
             render_passes: SimpleStorage::new(),
             pipeline_layouts: SimpleStorage::new(),
             descriptor_set_layouts: SimpleStorage::new(),

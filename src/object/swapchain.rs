@@ -1,7 +1,7 @@
 use std::cell::RefMut;
 use std::ptr;
 
-use super::{ArcHandle, ImageMutableState, ImageViewCreateInfo, Object, ObjectData};
+use super::{ImageMutableState, ImageViewCreateInfo, ObjHandle, Object, ObjectData};
 
 use crate::device::batch::GenerationId;
 use crate::device::Device;
@@ -264,7 +264,7 @@ impl SwapchainCreateInfo {
     }
 }
 
-pub(crate) struct SwapchainState {
+pub struct SwapchainState {
     info: SwapchainCreateInfo,
     mutable: MutableShared<SwapchainMutableState>,
 }
@@ -321,7 +321,7 @@ impl Object for Swapchain {
         VulkanResult::Ok(())
     }
 
-    unsafe fn get_storage(parent: &Self::Parent) -> &Self::Storage {
+    fn get_storage(parent: &Self::Parent) -> &Self::Storage {
         &parent.swapchain_storage
     }
 }

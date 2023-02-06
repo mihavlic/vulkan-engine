@@ -6,71 +6,31 @@ use crate::storage::SynchronizationLock;
 use crate::util::ffi_ptr::AsFFiPtr;
 
 use super::BasicObjectData;
-use super::{ArcHandle, Object};
+use super::{ObjHandle, Object};
 use pumice::util::ObjectHandle;
 use pumice::vk;
 use pumice::VulkanResult;
 use smallvec::SmallVec;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct InnerSampler;
-
-impl InnerSampler {
-    fn handle(&self) -> vk::Sampler {
-        todo!()
-    }
+pub struct DescriptorBinding {
+    pub binding: u32,
+    pub count: u32,
+    pub kind: vk::DescriptorType,
+    pub stages: vk::ShaderStageFlags,
+    pub immutable_samplers: SmallVec<[super::Sampler; 2]>,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct Sampler(InnerSampler);
-
-// #[derive(Clone, PartialEq, Eq, Hash)]
-// pub enum DescriptorKind {
-//     Sampler,
-//     CombinedImageSampler(Sampler),
-//     SampledImage,
-//     StorageImage,
-//     UniformTexelBuffer,
-//     StorageTexelBuffer,
-//     UniformBuffer,
-//     StorageBuffer,
-//     UniformBufferDynamic,
-//     StorageBufferDynamic,
-//     InputAttachment, // TODO support other values
-// }
-
-// impl DescriptorKind {
-//     fn to_vk(&self) -> (vk::DescriptorType, Option<vk::Sampler>) {
-//         use DescriptorKind::*;
-//         let mut sampler = None;
-//         let kind = match self {
-//             Sampler => vk::DescriptorType::SAMPLER,
-//             CombinedImageSampler(combined_sampler) => {
-//                 sampler = Some(combined_sampler.0.handle());
-//                 vk::DescriptorType::COMBINED_IMAGE_SAMPLER
-//             }
-//             SampledImage => vk::DescriptorType::SAMPLED_IMAGE,
-//             StorageImage => vk::DescriptorType::STORAGE_IMAGE,
-//             UniformTexelBuffer => vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
-//             StorageTexelBuffer => vk::DescriptorType::STORAGE_TEXEL_BUFFER,
-//             UniformBuffer => vk::DescriptorType::UNIFORM_BUFFER,
-//             StorageBuffer => vk::DescriptorType::STORAGE_BUFFER,
-//             UniformBufferDynamic => vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
-//             StorageBufferDynamic => vk::DescriptorType::STORAGE_BUFFER_DYNAMIC,
-//             InputAttachment => vk::DescriptorType::INPUT_ATTACHMENT,
-//         };
-
-//         (kind, sampler)
-//     }
-// }
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct DescriptorBinding {
-    binding: u32,
-    count: u32,
-    kind: vk::DescriptorType,
-    stages: vk::ShaderStageFlags,
-    immutable_samplers: Option<SmallVec<[Sampler; 2]>>,
+impl Default for DescriptorBinding {
+    fn default() -> Self {
+        Self {
+            binding: 0,
+            count: 1,
+            kind: Default::default(),
+            stages: Default::default(),
+            immutable_samplers: Default::default(),
+        }
+    }
 }
 
 impl DescriptorBinding {
@@ -81,23 +41,23 @@ impl DescriptorBinding {
     ) {
         // first collect all bindings, we cannot get stable poiners until everything is collected because a vector can reallocate
         for binding in this {
-            if let Some(immutable_samplers) = &binding.immutable_samplers {
+            if !binding.immutable_samplers.is_empty() {
                 assert_eq!(binding.kind, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, "Immutable samplers are only supported with COMBINED_IMAGE_SAMPLER descriptor bindings");
                 assert_eq!(
                     binding.count as usize,
-                    immutable_samplers.len(),
+                    binding.immutable_samplers.len(),
                     "CombinedImageSampler descriptor must have a corresponding number of samplers"
                 );
-                samplers.extend(immutable_samplers.iter().map(|s| s.0.handle()))
+                samplers.extend(binding.immutable_samplers.iter().map(|s| s.get_handle()))
             }
         }
 
         // now fill in the output structures
         let mut samplers_cursor = 0;
         out.extend(this.iter().map(|binding| {
-            let ptr = if let Some(immutable_samplers) = &binding.immutable_samplers {
-                let ptr = samplers.as_ffi_ptr().add(immutable_samplers.len());
-                samplers_cursor += immutable_samplers.len();
+            let ptr = if !binding.immutable_samplers.is_empty() {
+                let ptr = samplers.as_ffi_ptr().add(binding.immutable_samplers.len());
+                samplers_cursor += binding.immutable_samplers.len();
                 ptr
             } else {
                 std::ptr::null()
@@ -114,10 +74,10 @@ impl DescriptorBinding {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Default)]
 pub struct DescriptorSetLayoutCreateInfo {
-    flags: vk::DescriptorSetLayoutCreateFlags,
-    bindings: Vec<DescriptorBinding>,
+    pub flags: vk::DescriptorSetLayoutCreateFlags,
+    pub bindings: Vec<DescriptorBinding>,
 }
 
 impl DescriptorSetLayoutCreateInfo {
@@ -165,7 +125,7 @@ impl Object for DescriptorSetLayout {
         VulkanResult::Ok(())
     }
 
-    unsafe fn get_storage(parent: &Self::Parent) -> &Self::Storage {
+    fn get_storage(parent: &Self::Parent) -> &Self::Storage {
         &parent.descriptor_set_layouts
     }
 }

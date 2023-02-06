@@ -1,5 +1,6 @@
 mod allocator;
 pub mod compile;
+pub mod descriptors;
 pub mod execute;
 mod lazy_sorted;
 pub mod record;

@@ -1,11 +1,12 @@
 pub mod interned;
 pub mod nostore;
 
-use crate::object::{ArcHandle, Object};
+use crate::object::{ObjHandle, ObjRef, Object};
 use pumice::VulkanResult;
 use std::{
     cell::{Ref, RefCell, RefMut},
     hash::BuildHasher,
+    mem::ManuallyDrop,
     ops::{Deref, DerefMut},
     ptr::NonNull,
     sync::atomic::AtomicUsize,
@@ -15,10 +16,10 @@ pub enum SynchronizationLock<'a> {
     ReentrantMutexGuard(parking_lot::ReentrantMutexGuard<'a, ()>),
 }
 
-pub(crate) struct ObjectRead<'a, T>(NonNull<T>, SynchronizationLock<'a>);
+pub struct ObjectRead<'a, T>(NonNull<T>, SynchronizationLock<'a>);
 
 impl<'a, T> ObjectRead<'a, T> {
-    pub(crate) fn get_lock(&self) -> &SynchronizationLock<'a> {
+    pub fn get_lock(&self) -> &SynchronizationLock<'a> {
         &self.1
     }
 }
@@ -30,10 +31,10 @@ impl<'a, T> Deref for ObjectRead<'a, T> {
     }
 }
 
-pub(crate) struct ObjectReadWrite<'a, T>(NonNull<T>, SynchronizationLock<'a>);
+pub struct ObjectReadWrite<'a, T>(NonNull<T>, SynchronizationLock<'a>);
 
 impl<'a, T> ObjectReadWrite<'a, T> {
-    pub(crate) fn get_lock(&self) -> &SynchronizationLock<'a> {
+    pub fn get_lock(&self) -> &SynchronizationLock<'a> {
         &self.1
     }
 }
@@ -51,50 +52,27 @@ impl<'a, T> DerefMut for ObjectReadWrite<'a, T> {
     }
 }
 
-pub(crate) trait ObjectStorage<T: Object>: Sized {
+pub trait ObjectStorage<T: Object>: Sized {
     type StorageData;
     unsafe fn get_or_create<'a>(
         &self,
         data: T::InputData<'a>,
         ctx: NonNull<T::Parent>,
-    ) -> VulkanResult<ArcHandle<T>>;
+    ) -> VulkanResult<ObjHandle<T>>;
 
-    unsafe fn destroy(&self, handle: &ArcHandle<T>) -> VulkanResult<()>;
+    unsafe fn destroy(&self, handle: ManuallyDrop<ObjHandle<T>>) -> VulkanResult<()>;
 
     // acquires exlusive access for the object pointed to by handle
-    fn acquire_exclusive<'a>(&'a self, handle: &ArcHandle<T>) -> SynchronizationLock<'a>;
+    fn acquire_exclusive<'a>(&'a self, handle: &ObjRef<T>) -> SynchronizationLock<'a>;
     // acquires exlusive access for all objects of the
     fn acquire_all_exclusive<'a>(&'a self) -> SynchronizationLock<'a>;
 
-    fn read_object<'a>(&'a self, handle: &ArcHandle<T>) -> ObjectRead<'a, T::Data> {
+    fn read_object<'a>(&'a self, handle: &ObjRef<T>) -> ObjectRead<'a, T::Data> {
         let lock = self.acquire_exclusive(handle);
         unsafe { ObjectRead(NonNull::from(handle.get_object_data()), lock) }
     }
 
     unsafe fn cleanup(&self);
-}
-
-// pub(crate) struct ObjectHeader<T: Object> {
-//     pub(crate) handle: T::Handle,
-//     pub(crate) info: T::CreateInfo,
-//     pub(crate) storage_data: <T::Storage as ObjectStorage<T>>::StorageData,
-//     pub(crate) object_data: <T as Object>::ObjectData,
-//     parent: NonNull<T::Parent>,
-// }
-
-// impl<T: Object> ObjectHeader<T> {
-//     // yep this is so safe
-//     pub(crate) unsafe fn parent<'a, 'b>(&'a self) -> &'b T::Parent {
-//         self.parent.as_ref()
-//     }
-// }
-
-#[repr(C)]
-pub(crate) struct ArcHeader<T: Object> {
-    pub(crate) refcount: AtomicUsize,
-    pub(crate) object_data: T::Data,
-    pub(crate) storage_data: <T::Storage as ObjectStorage<T>>::StorageData,
-    pub(crate) parent: NonNull<T::Parent>,
 }
 
 // help

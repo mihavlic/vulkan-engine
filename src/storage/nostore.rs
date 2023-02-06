@@ -3,12 +3,12 @@ use std::{mem::ManuallyDrop, ptr::NonNull};
 use ahash::HashSet;
 use pumice::VulkanResult;
 
-use super::{constant_ahash_randomstate, ArcHeader, MutableShared, ObjectStorage, ReentrantMutex};
-use crate::object::{ArcHandle, Object};
+use super::{constant_ahash_randomstate, MutableShared, ObjectStorage, ReentrantMutex};
+use crate::object::{ObjHandle, ObjHeader, ObjRef, Object};
 
-pub(crate) struct SimpleStorage<T: Object> {
+pub struct SimpleStorage<T: Object> {
     lock: ReentrantMutex,
-    handles: MutableShared<HashSet<ManuallyDrop<ArcHandle<T>>>>,
+    handles: MutableShared<HashSet<ManuallyDrop<ObjHandle<T>>>>,
 }
 
 impl<T: Object> SimpleStorage<T> {
@@ -27,27 +27,27 @@ impl<T: Object<Storage = Self>> ObjectStorage<T> for SimpleStorage<T> {
         &self,
         data: T::InputData<'a>,
         ctx: NonNull<T::Parent>,
-    ) -> VulkanResult<ArcHandle<T>> {
+    ) -> VulkanResult<ObjHandle<T>> {
         self.lock.with_locked(|lock| {
             T::create(data, ctx.as_ref()).map(|data| {
-                let boxed = Box::new(ArcHeader {
+                let boxed = Box::new(ObjHeader {
                     refcount: 1.into(),
                     object_data: data,
                     storage_data: (),
                     parent: ctx,
                 });
                 let leak = Box::leak(boxed);
-                let handle = ArcHandle(NonNull::from(leak));
+                let handle = ObjHandle(NonNull::from(leak));
                 self.handles.get_mut(lock).insert(handle.make_weak_copy());
                 handle
             })
         })
     }
 
-    unsafe fn destroy(&self, handle: &ArcHandle<T>) -> VulkanResult<()> {
+    unsafe fn destroy(&self, handle: ManuallyDrop<ObjHandle<T>>) -> VulkanResult<()> {
         let handle = handle.make_weak_copy();
-        let alloc = Box::from_raw(handle.get_arc_header_ptr());
-        let ArcHeader {
+        let alloc = Box::from_raw(handle.get_object_header_ptr());
+        let ObjHeader {
             refcount: _,
             object_data,
             storage_data: _,
@@ -60,7 +60,7 @@ impl<T: Object<Storage = Self>> ObjectStorage<T> for SimpleStorage<T> {
         })
     }
 
-    fn acquire_exclusive<'a>(&'a self, _handle: &ArcHandle<T>) -> super::SynchronizationLock<'a> {
+    fn acquire_exclusive<'a>(&'a self, _handle: &ObjRef<T>) -> super::SynchronizationLock<'a> {
         self.lock.lock()
     }
 

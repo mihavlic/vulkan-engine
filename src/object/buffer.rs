@@ -16,7 +16,7 @@ use crate::{
 use pumice::{vk, VulkanResult};
 use smallvec::SmallVec;
 
-use super::{ArcHandle, Object, ObjectData, SynchronizationState, SynchronizeResult};
+use super::{ObjHandle, Object, ObjectData, SynchronizationState, SynchronizeResult};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BufferCreateInfo {
@@ -139,7 +139,7 @@ impl BufferMutableState {
     }
 }
 
-pub(crate) struct BufferState {
+pub struct BufferState {
     handle: vk::Buffer,
     info: BufferCreateInfo,
     allocation: pumice_vma::Allocation,
@@ -147,10 +147,10 @@ pub(crate) struct BufferState {
 }
 
 impl BufferState {
-    pub(crate) unsafe fn get_mutable_state(&self) -> &MutableShared<BufferMutableState> {
+    pub unsafe fn get_mutable_state(&self) -> &MutableShared<BufferMutableState> {
         &self.mutable
     }
-    pub(crate) unsafe fn update_state(
+    pub unsafe fn update_state(
         &self,
         // the initial state of the resource
         dst_family: u32,
@@ -216,7 +216,7 @@ impl Object for Buffer {
         VulkanResult::Ok(())
     }
 
-    unsafe fn get_storage(parent: &Self::Parent) -> &Self::Storage {
+    fn get_storage(parent: &Self::Parent) -> &Self::Storage {
         &parent.buffer_storage
     }
 }

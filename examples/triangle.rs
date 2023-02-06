@@ -14,7 +14,7 @@ use graph::passes::{self, ClearImage, SimpleShader};
 use graph::tracing::tracing_subscriber::install_tracing_subscriber;
 use pumice::{util::ApiLoadConfig, vk};
 use pumice_vma::{AllocationCreateFlags, AllocationCreateInfo};
-use smallvec::smallvec;
+use smallvec::{smallvec, SmallVec};
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::EventLoop;
 use winit::platform::run_return::EventLoopExtRunReturn;
@@ -43,13 +43,14 @@ fn main() {
         conf.add_extension(vk::KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
         conf.add_extension(vk::KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
         conf.add_extension(vk::KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+        conf.add_extension(vk::EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME);
 
         conf.fill_in_extensions();
 
         let info = InstanceCreateInfo {
             config: &mut conf,
             validation_layers: &[
-                pumice::cstr!("VK_LAYER_KHRONOS_validation"),
+                // pumice::cstr!("VK_LAYER_KHRONOS_validation"),
                 // pumice::cstr!("VK_LAYER_LUNARG_api_dump"),
             ],
             enable_debug_callback: true,
@@ -61,8 +62,13 @@ fn main() {
 
         let surface = instance.create_surface(&window).unwrap();
 
+        let mut scalar_layout = vk::PhysicalDeviceScalarBlockLayoutFeaturesEXT {
+            scalar_block_layout: vk::TRUE,
+            ..Default::default()
+        };
         let mut sync = vk::PhysicalDeviceSynchronization2FeaturesKHR {
             synchronization_2: vk::TRUE,
+            p_next: (&mut scalar_layout) as *mut _ as *mut _,
             ..Default::default()
         };
         let mut timeline = vk::PhysicalDeviceTimelineSemaphoreFeaturesKHR {
@@ -75,6 +81,7 @@ fn main() {
             p_next: (&mut timeline) as *mut _ as *mut _,
             ..Default::default()
         };
+
         let info = DeviceCreateInfo {
             instance,
             config: &mut conf,
@@ -123,8 +130,24 @@ fn main() {
         let vert_module = device.create_shader_module_read(&mut vert_bytes).unwrap();
         let frag_module = device.create_shader_module_read(&mut frag_bytes).unwrap();
 
-        let empty_layout = device
-            .create_pipeline_layout(object::PipelineLayoutCreateInfo::empty())
+        let set_layout = device
+            .create_descriptor_set_layout(object::DescriptorSetLayoutCreateInfo {
+                bindings: [object::DescriptorBinding {
+                    binding: 0,
+                    kind: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
+                    stages: vk::ShaderStageFlags::VERTEX,
+                    ..Default::default()
+                }]
+                .to_vec(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let pipeline_layout = device
+            .create_pipeline_layout(object::PipelineLayoutCreateInfo {
+                set_layouts: vec![set_layout.clone()],
+                push_constants: Vec::new(),
+            })
             .unwrap();
 
         let pipeline_info = object::GraphicsPipelineCreateInfo::builder()
@@ -178,7 +201,7 @@ fn main() {
                 ..Default::default()
             })
             .dynamic_state([vk::DynamicState::SCISSOR, vk::DynamicState::VIEWPORT])
-            .layout(empty_layout)
+            .layout(pipeline_layout.clone())
             .finish();
 
         let pipeline = device.create_delayed_pipeline(pipeline_info);
@@ -200,6 +223,8 @@ fn main() {
             b.add_pass(
                 queue,
                 SimpleShader {
+                    set_layout,
+                    pipeline_layout,
                     pipeline,
                     attachments: vec![swapchain],
                 },

@@ -4,10 +4,10 @@ use ahash::HashSet;
 use pumice::VulkanResult;
 
 use super::{
-    constant_ahash_hashmap, constant_ahash_hashset, constant_ahash_randomstate, ArcHeader,
-    MutableShared, ObjectStorage, ReentrantMutex,
+    constant_ahash_hashmap, constant_ahash_hashset, constant_ahash_randomstate, MutableShared,
+    ObjectStorage, ReentrantMutex,
 };
-use crate::object::{ArcHandle, Object, ObjectData};
+use crate::object::{ObjHandle, ObjHeader, ObjRef, Object, ObjectData};
 
 pub(crate) trait ObjectCreateInfoFingerPrint {
     fn get_fingerprint(&self) -> u128;
@@ -15,8 +15,8 @@ pub(crate) trait ObjectCreateInfoFingerPrint {
 
 pub(crate) struct InterningStorage<T: Object> {
     lock: ReentrantMutex,
-    handles: MutableShared<ahash::HashSet<ManuallyDrop<ArcHandle<T>>>>,
-    interned: MutableShared<ahash::HashMap<u128, ManuallyDrop<ArcHandle<T>>>>,
+    handles: MutableShared<ahash::HashSet<ManuallyDrop<ObjHandle<T>>>>,
+    interned: MutableShared<ahash::HashMap<u128, ManuallyDrop<ObjHandle<T>>>>,
 }
 
 impl<T: Object> InterningStorage<T> {
@@ -39,7 +39,7 @@ where
         &self,
         data: T::InputData<'a>,
         ctx: NonNull<T::Parent>,
-    ) -> VulkanResult<ArcHandle<T>> {
+    ) -> VulkanResult<ObjHandle<T>> {
         let fingie = data.get_fingerprint();
         self.lock.with_locked(|lock| {
             let mut inerned_guard = self.interned.get_mut(lock);
@@ -54,14 +54,14 @@ where
             };
 
             T::create(data, ctx.as_ref()).map(|data| {
-                let boxed = Box::new(ArcHeader {
+                let boxed = Box::new(ObjHeader {
                     refcount: 1.into(),
                     object_data: data,
                     storage_data: (),
                     parent: ctx,
                 });
                 let leak = Box::leak(boxed);
-                let handle = ArcHandle(NonNull::from(leak));
+                let handle = ObjHandle(NonNull::from(leak));
 
                 let weak = handle.make_weak_copy();
                 match entry {
@@ -79,10 +79,10 @@ where
         })
     }
 
-    unsafe fn destroy(&self, handle: &ArcHandle<T>) -> VulkanResult<()> {
+    unsafe fn destroy(&self, handle: ManuallyDrop<ObjHandle<T>>) -> VulkanResult<()> {
         let handle = handle.make_weak_copy();
-        let alloc = Box::from_raw(handle.get_arc_header_ptr());
-        let ArcHeader {
+        let alloc = Box::from_raw(handle.get_object_header_ptr());
+        let ObjHeader {
             refcount: _,
             object_data,
             storage_data: _,
@@ -95,7 +95,7 @@ where
         })
     }
 
-    fn acquire_exclusive<'a>(&'a self, _handle: &ArcHandle<T>) -> super::SynchronizationLock<'a> {
+    fn acquire_exclusive<'a>(&'a self, _handle: &ObjRef<T>) -> super::SynchronizationLock<'a> {
         self.lock.lock()
     }
 

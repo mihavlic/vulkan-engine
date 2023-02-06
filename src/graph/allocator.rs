@@ -322,10 +322,18 @@ impl Suballocator {
     }
 }
 
-fn round_up_pow2(number: u64, multiple: u64) -> u64 {
+pub fn round_up_pow2(number: u64, multiple: u64) -> u64 {
     number.wrapping_add(multiple).wrapping_sub(1) & !multiple.wrapping_sub(1)
 }
 
-fn round_down_pow2(number: u64, multiple: u64) -> u64 {
+pub fn round_down_pow2(number: u64, multiple: u64) -> u64 {
+    number & !multiple.wrapping_sub(1)
+}
+
+pub fn round_up_pow2_usize(number: usize, multiple: usize) -> usize {
+    number.wrapping_add(multiple).wrapping_sub(1) & !multiple.wrapping_sub(1)
+}
+
+pub fn round_down_pow2_usize(number: usize, multiple: usize) -> usize {
     number & !multiple.wrapping_sub(1)
 }

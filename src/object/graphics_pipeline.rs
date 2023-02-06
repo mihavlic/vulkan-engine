@@ -17,7 +17,7 @@ use parking_lot::{RawMutex, RawRwLock};
 use pumice::{util::ObjectHandle, vk, VulkanResult};
 use smallvec::{Array, SmallVec};
 
-use super::{ArcHandle, BasicObjectData, Object, ObjectData};
+use super::{BasicObjectData, ObjHandle, Object, ObjectData};
 
 #[derive(Clone)]
 pub struct SpecializationInfo {
@@ -716,7 +716,7 @@ impl GraphicsPipelineMutableState {
     }
 }
 
-pub(crate) struct GraphicsPipelineState {
+pub struct GraphicsPipelineState {
     info: GraphicsPipelineCreateInfo,
     pub(crate) mutable: MutableShared<GraphicsPipelineMutableState>,
 }
@@ -765,7 +765,7 @@ impl Object for GraphicsPipeline {
         VulkanResult::Ok(())
     }
 
-    unsafe fn get_storage(parent: &Self::Parent) -> &Self::Storage {
+    fn get_storage(parent: &Self::Parent) -> &Self::Storage {
         &parent.graphics_pipelines
     }
 }

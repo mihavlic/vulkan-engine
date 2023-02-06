@@ -7,8 +7,8 @@ use crate::storage::nostore::SimpleStorage;
 use crate::storage::{constant_ahash_hasher, SynchronizationLock};
 use crate::util::ffi_ptr::AsFFiPtr;
 
-use super::{ArcHandle, Object};
 use super::{BasicObjectData, ObjectData};
+use super::{ObjHandle, Object};
 use pumice::util::ObjectHandle;
 use pumice::vk;
 use pumice::VulkanResult;
@@ -115,7 +115,7 @@ impl Object for RenderPass {
         VulkanResult::Ok(())
     }
 
-    unsafe fn get_storage(parent: &Self::Parent) -> &Self::Storage {
+    fn get_storage(parent: &Self::Parent) -> &Self::Storage {
         &parent.render_passes
     }
 }
