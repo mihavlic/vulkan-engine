@@ -1,4 +1,5 @@
 pub mod batch;
+pub mod reflection;
 pub mod submission;
 
 use self::{batch::GenerationManager, submission::SubmissionManager};
@@ -22,6 +23,7 @@ use pumice::{
 };
 use pumice_vma::Allocator;
 use smallvec::{smallvec, SmallVec};
+use spirq::Variable;
 use std::{
     collections::{hash_map::RandomState, HashSet},
     ffi::{c_void, CStr},
@@ -345,12 +347,12 @@ impl Device {
             .get_or_create(data.as_ref(), NonNull::from(self))
             .map(object::ShaderModule)
     }
-    pub unsafe fn create_shader_module(
+    pub unsafe fn create_shader_module_spirv(
         &self,
-        data: impl AsRef<[u32]>,
+        spirv: impl AsRef<[u32]>,
     ) -> VulkanResult<object::ShaderModule> {
         self.shader_modules
-            .get_or_create(data.as_ref(), NonNull::from(self))
+            .get_or_create(spirv.as_ref(), NonNull::from(self))
             .map(object::ShaderModule)
     }
     pub unsafe fn create_descriptor_set_layout(
@@ -414,6 +416,8 @@ impl Device {
         self.device()
             .create_fence(&info, self.allocator_callbacks())
     }
+    /// Create descriptor layouts and a pipeline layout from spirv data
+
     pub unsafe fn destroy_raw_semaphore(&self, semaphore: vk::Semaphore) {
         self.device()
             .destroy_semaphore(semaphore, self.allocator_callbacks())
@@ -769,7 +773,7 @@ unsafe fn select_device(
 }
 
 // stolen from ash
-fn read_spirv<R: io::Read + io::Seek>(x: &mut R) -> io::Result<Vec<u32>> {
+pub fn read_spirv<R: io::Read + io::Seek>(x: &mut R) -> io::Result<Vec<u32>> {
     let size = x.seek(io::SeekFrom::End(0))?;
     if size % 4 != 0 {
         return Err(io::Error::new(

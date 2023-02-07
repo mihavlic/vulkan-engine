@@ -914,8 +914,6 @@ impl CompiledGraph {
 
         let bump = Bump::new();
 
-        drop(state);
-
         unsafe {
             let state = self.state();
             let mut command_pools = state.command_pools.borrow_mut();

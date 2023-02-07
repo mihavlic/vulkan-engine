@@ -12,6 +12,7 @@ name = "triangle"
 [dependencies]
 pumice = {path = "../pumice", features = ["wrappers"]}
 pumice-vma = {path = "../pumice-vma/pumice-vma"}
+spirq = "0.6.3"
 
 ahash = {version = "0.8.2", default-features = false, features = ["std"]}
 smallvec = {version = "1.10.0", features = ["union", "const_generics"]}
@@ -32,7 +33,6 @@ nu-ansi-term = "0.46.0"
 [features]
 default = []
 build-tracing = ["tracing", "tracing-subscriber"]
-
 
 [profile.dev.package.pumice]
 opt-level = 1

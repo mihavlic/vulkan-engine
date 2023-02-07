@@ -44,7 +44,8 @@ macro_rules! desc_set_sizes {
     };
 }
 
-const UNIFORM_BUFFER_SIZE: u64 = 1024 * 16;
+// the minimum required value of maxUniformBufferRange
+const UNIFORM_BUFFER_SIZE: u64 = 16384;
 
 const DESCRIPTOR_SET_SIZES: &[vk::DescriptorPoolSize] = desc_set_sizes!(
     256 * SAMPLER,
@@ -252,21 +253,18 @@ impl DescriptorAllocator {
         }
 
         let buffer = self.buffers.last_mut().unwrap();
-        let ptr = Self::bump_buffer(buffer, layout, device).unwrap_or_else(|| {
-            self.add_buffer(device);
-            let buffer = self.buffers.last_mut().unwrap();
-            Self::bump_buffer(buffer, layout, device)
-                .expect("Failed to bump allocate from a fresh buffer")
-        });
+        let (ptr, dynamic_offset) =
+            Self::bump_buffer(buffer, layout, device).unwrap_or_else(|| {
+                self.add_buffer(device);
+                let buffer = self.buffers.last_mut().unwrap();
+                Self::bump_buffer(buffer, layout, device)
+                    .expect("Failed to bump allocate from a fresh buffer")
+            });
 
         let buffer = self.buffers.last().unwrap();
 
         UniformMemory {
-            dynamic_offset: ptr
-                .as_ptr()
-                .offset_from(buffer.start.as_ptr())
-                .try_into()
-                .unwrap(),
+            dynamic_offset,
             buffer: buffer.buffer,
             memory: ptr,
         }
@@ -275,10 +273,18 @@ impl DescriptorAllocator {
         buffer: &mut UniformBuffer,
         layout: std::alloc::Layout,
         device: &Device,
-    ) -> Option<NonNull<u8>> {
+    ) -> Option<(NonNull<u8>, u32)> {
         let start = buffer.cursor.as_ptr() as usize;
         let aligned = round_up_pow2_usize(start, layout.align());
-        let offset = aligned - start;
+        let mut offset = aligned - start;
+
+        let offset_align = device
+            .physical_device_properties
+            .limits
+            .min_uniform_buffer_offset_alignment;
+        if offset_align > 0 {
+            offset = round_up_pow2_usize(offset, offset_align as usize);
+        }
 
         let start_ptr = buffer.cursor.as_ptr().add(offset);
         let end_ptr = start_ptr.add(layout.size());
@@ -289,7 +295,7 @@ impl DescriptorAllocator {
 
         buffer.cursor = NonNull::new(end_ptr).unwrap();
 
-        Some(NonNull::new(start_ptr).unwrap())
+        Some((NonNull::new(start_ptr).unwrap(), offset.try_into().unwrap()))
     }
 }
 

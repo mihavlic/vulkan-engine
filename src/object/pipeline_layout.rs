@@ -74,3 +74,9 @@ impl Object for PipelineLayout {
         &parent.pipeline_layouts
     }
 }
+
+impl PipelineLayout {
+    pub fn get_descriptor_set_layouts(&self) -> &Vec<super::DescriptorSetLayout> {
+        &self.get_create_info().set_layouts
+    }
+}

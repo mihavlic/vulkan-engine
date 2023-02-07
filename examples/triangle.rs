@@ -6,7 +6,8 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::{io, slice};
 
-use graph::device::{self, DeviceCreateInfo, QueueFamilySelection};
+use graph::device::reflection::ReflectedLayout;
+use graph::device::{self, read_spirv, DeviceCreateInfo, QueueFamilySelection};
 use graph::graph::compile::GraphCompiler;
 use graph::instance::{Instance, InstanceCreateInfo, OwnedInstance};
 use graph::object::{self, ImageCreateInfo, PipelineStage, SwapchainCreateInfo};
@@ -127,28 +128,20 @@ fn main() {
         let mut vert_bytes = Cursor::new(include_bytes!("shader.vert.spv").as_slice());
         let mut frag_bytes = Cursor::new(include_bytes!("shader.frag.spv").as_slice());
 
-        let vert_module = device.create_shader_module_read(&mut vert_bytes).unwrap();
-        let frag_module = device.create_shader_module_read(&mut frag_bytes).unwrap();
+        let vert_spirv = read_spirv(&mut vert_bytes).unwrap();
+        let frag_spirv = read_spirv(&mut frag_bytes).unwrap();
 
-        let set_layout = device
-            .create_descriptor_set_layout(object::DescriptorSetLayoutCreateInfo {
-                bindings: [object::DescriptorBinding {
-                    binding: 0,
-                    kind: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
-                    stages: vk::ShaderStageFlags::VERTEX,
-                    ..Default::default()
-                }]
-                .to_vec(),
-                ..Default::default()
-            })
-            .unwrap();
+        let vert_module = device.create_shader_module_spirv(&vert_spirv).unwrap();
+        let frag_module = device.create_shader_module_spirv(&frag_spirv).unwrap();
 
-        let pipeline_layout = device
-            .create_pipeline_layout(object::PipelineLayoutCreateInfo {
-                set_layouts: vec![set_layout.clone()],
-                push_constants: Vec::new(),
-            })
-            .unwrap();
+        let pipeline_layout = ReflectedLayout::new(&[
+            (&vert_spirv, &["main"], true),
+            (&frag_spirv, &["main"], true),
+        ])
+        .create(&device, vk::DescriptorSetLayoutCreateFlags::empty())
+        .unwrap();
+
+        let set_layout = pipeline_layout.get_descriptor_set_layouts()[0].clone();
 
         let pipeline_info = object::GraphicsPipelineCreateInfo::builder()
             .stages([
