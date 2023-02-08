@@ -1,5 +1,6 @@
 macro_rules! create_object {
     ($name:ident) => {
+        #[repr(transparent)]
         #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(pub(crate) $crate::object::ObjHandle<Self>);
 
@@ -33,6 +34,7 @@ macro_rules! derive_raw_handle {
 }
 
 mod buffer;
+mod compute_pipeline;
 mod descriptor_set_layout;
 mod graphics_pipeline;
 mod image;
@@ -44,6 +46,7 @@ mod surface;
 mod swapchain;
 
 pub use buffer::*;
+pub use compute_pipeline::*;
 pub use descriptor_set_layout::*;
 pub use graphics_pipeline::*;
 pub use image::*;

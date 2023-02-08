@@ -1,7 +1,7 @@
 pub mod interned;
 pub mod nostore;
 
-use crate::object::{ObjHandle, ObjRef, Object};
+use crate::object::{ObjHandle, ObjHeader, ObjRef, Object};
 use pumice::VulkanResult;
 use std::{
     cell::{Ref, RefCell, RefMut},
@@ -57,7 +57,7 @@ pub trait ObjectStorage<T: Object>: Sized {
     unsafe fn get_or_create<'a>(
         &self,
         data: T::InputData<'a>,
-        ctx: NonNull<T::Parent>,
+        ctx: &T::Parent,
     ) -> VulkanResult<ObjHandle<T>>;
 
     unsafe fn destroy(&self, handle: ManuallyDrop<ObjHandle<T>>) -> VulkanResult<()>;
@@ -133,4 +133,34 @@ pub(crate) fn constant_ahash_hashmap<K, V>() -> ahash::HashMap<K, V> {
 
 pub(crate) fn constant_ahash_hashset<K>() -> ahash::HashSet<K> {
     ahash::HashSet::with_hasher(constant_ahash_randomstate())
+}
+
+unsafe fn create_handle<T: Object>(
+    data: <T as Object>::InputData<'_>,
+    storage_data: <T::Storage as ObjectStorage<T>>::StorageData,
+    ctx: &<T as Object>::Parent,
+) -> VulkanResult<ObjHandle<T>> {
+    let data = T::create(data, ctx)?;
+    Ok(create_handle_leaked_box(data, storage_data, ctx))
+}
+
+fn create_handle_leaked_box<T: Object>(
+    data: <T as Object>::Data,
+    storage_data: <<T as Object>::Storage as ObjectStorage<T>>::StorageData,
+    ctx: &<T as Object>::Parent,
+) -> ObjHandle<T> {
+    let boxed = Box::new(ObjHeader {
+        refcount: 1.into(),
+        object_data: data,
+        storage_data,
+        parent: NonNull::from(ctx),
+    });
+
+    ObjHandle(NonNull::from(Box::leak(boxed)))
+}
+
+unsafe fn unleak_handle_leaked_box<T: Object>(
+    handle: ManuallyDrop<ObjHandle<T>>,
+) -> Box<ObjHeader<T>> {
+    Box::from_raw(handle.get_object_header_ptr())
 }

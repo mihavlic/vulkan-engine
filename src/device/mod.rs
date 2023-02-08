@@ -7,13 +7,15 @@ use super::instance::InstanceCreateInfo;
 use crate::{
     instance::Instance,
     object::{
-        self, Buffer, DescriptorSetLayout, GraphicsPipeline, Image, PipelineLayout, RenderPass,
-        RenderPassMode, Sampler, ShaderModule, Swapchain,
+        self, create_compute_pipeline_impl, Buffer, ComputePipeline, DescriptorSetLayout,
+        GraphicsPipeline, Image, PipelineLayout, RenderPass, RenderPassMode, Sampler, ShaderModule,
+        Swapchain,
     },
     storage::{nostore::SimpleStorage, ObjectStorage},
     tracing::shim_macros::{info, trace},
     util::format_utils::{self},
 };
+use bumpalo::Bump;
 use pumice::{
     loader::{tables::DeviceTable, DeviceLoader},
     util::{ApiLoadConfig, ObjectHandle},
@@ -22,6 +24,7 @@ use pumice::{
     DeviceWrapper, VulkanResult,
 };
 use pumice_vma::Allocator;
+use rayon::prelude::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use smallvec::{smallvec, SmallVec};
 use spirq::Variable;
 use std::{
@@ -80,6 +83,7 @@ pub struct Device {
 
     // object handle storage
     pub(crate) graphics_pipelines: SimpleStorage<GraphicsPipeline>,
+    pub(crate) compute_pipelines: SimpleStorage<ComputePipeline>,
     pub(crate) shader_modules: SimpleStorage<ShaderModule>,
     pub(crate) samplers: SimpleStorage<Sampler>,
     pub(crate) render_passes: SimpleStorage<RenderPass>,
@@ -265,12 +269,13 @@ impl Device {
             queue_selection_mapping,
             queues,
 
+            graphics_pipelines: SimpleStorage::new(),
+            compute_pipelines: SimpleStorage::new(),
             shader_modules: SimpleStorage::new(),
             samplers: SimpleStorage::new(),
             render_passes: SimpleStorage::new(),
             pipeline_layouts: SimpleStorage::new(),
             descriptor_set_layouts: SimpleStorage::new(),
-            graphics_pipelines: SimpleStorage::new(),
             image_storage: SimpleStorage::new(),
             buffer_storage: SimpleStorage::new(),
             swapchain_storage: SimpleStorage::new(),
@@ -344,7 +349,7 @@ impl Device {
     ) -> VulkanResult<object::ShaderModule> {
         let data = read_spirv(data).map_err(|_| vk::Result::ERROR_UNKNOWN)?;
         self.shader_modules
-            .get_or_create(data.as_ref(), NonNull::from(self))
+            .get_or_create(data.as_ref(), self)
             .map(object::ShaderModule)
     }
     pub unsafe fn create_shader_module_spirv(
@@ -352,7 +357,7 @@ impl Device {
         spirv: impl AsRef<[u32]>,
     ) -> VulkanResult<object::ShaderModule> {
         self.shader_modules
-            .get_or_create(spirv.as_ref(), NonNull::from(self))
+            .get_or_create(spirv.as_ref(), self)
             .map(object::ShaderModule)
     }
     pub unsafe fn create_descriptor_set_layout(
@@ -360,7 +365,7 @@ impl Device {
         info: object::DescriptorSetLayoutCreateInfo,
     ) -> VulkanResult<object::DescriptorSetLayout> {
         self.descriptor_set_layouts
-            .get_or_create(info, NonNull::from(self))
+            .get_or_create(info, self)
             .map(object::DescriptorSetLayout)
     }
     pub unsafe fn create_pipeline_layout(
@@ -368,19 +373,55 @@ impl Device {
         info: object::PipelineLayoutCreateInfo,
     ) -> VulkanResult<object::PipelineLayout> {
         self.pipeline_layouts
-            .get_or_create(info, NonNull::from(self))
+            .get_or_create(info, self)
             .map(object::PipelineLayout)
     }
-    pub unsafe fn create_delayed_pipeline(
+    pub unsafe fn create_delayed_graphics_pipeline(
         &self,
         info: object::GraphicsPipelineCreateInfo,
     ) -> object::GraphicsPipeline {
         assert!(matches!(info.render_pass, RenderPassMode::Delayed));
         self.graphics_pipelines
-            .get_or_create(info, NonNull::from(self))
+            .get_or_create(info, self)
             .map(object::GraphicsPipeline)
-            // infallible
+            // infallible since the pipeline creation is delayed and no api calls are made
             .unwrap()
+    }
+    pub unsafe fn create_compute_pipeline(
+        &self,
+        info: object::ComputePipelineCreateInfo,
+    ) -> VulkanResult<object::ComputePipeline> {
+        self.compute_pipelines
+            .get_or_create(info, self)
+            .map(object::ComputePipeline)
+    }
+    pub unsafe fn create_compute_pipelines_parallel(
+        &self,
+        infos: Vec<object::ComputePipelineCreateInfo>,
+    ) -> VulkanResult<Vec<object::ComputePipeline>> {
+        let datas = self.threadpool().install(|| {
+            infos
+                .into_par_iter()
+                .map(|info| {
+                    // FIXME Bump is not Sync
+                    let bump = Bump::new();
+                    create_compute_pipeline_impl(info, &bump, self)
+                })
+                .collect::<VulkanResult<Vec<_>>>()
+        })?;
+
+        let mut pipelines = self.compute_pipelines.add_multiple(datas, self);
+        // FIXME use Vec::into_raw_parts
+        let (ptr, len, cap) = (
+            pipelines.as_mut_ptr(),
+            pipelines.len(),
+            pipelines.capacity(),
+        );
+        std::mem::forget(pipelines);
+
+        // we're converting a Vec<ObjHandle<ComputePipeline>> into a Vec<ComputeHandle>
+        // since ComputeHandle is repr(transparent)
+        Ok(Vec::from_raw_parts(ptr.cast(), len, cap))
     }
     pub unsafe fn create_image(
         &self,
@@ -388,7 +429,7 @@ impl Device {
         allocate: pumice_vma::AllocationCreateInfo,
     ) -> VulkanResult<object::Image> {
         self.image_storage
-            .get_or_create((info, allocate), NonNull::from(self))
+            .get_or_create((info, allocate), self)
             .map(object::Image)
     }
     pub unsafe fn create_swapchain(
@@ -396,7 +437,7 @@ impl Device {
         info: object::SwapchainCreateInfo,
     ) -> VulkanResult<object::Swapchain> {
         self.swapchain_storage
-            .get_or_create(info, NonNull::from(self))
+            .get_or_create(info, self)
             .map(object::Swapchain)
     }
     pub unsafe fn create_raw_semaphore(&self) -> VulkanResult<vk::Semaphore> {
@@ -451,7 +492,9 @@ impl Drop for Device {
             }
 
             self.graphics_pipelines.cleanup();
+            self.compute_pipelines.cleanup();
             self.shader_modules.cleanup();
+            self.samplers.cleanup();
             self.render_passes.cleanup();
             self.pipeline_layouts.cleanup();
             self.descriptor_set_layouts.cleanup();

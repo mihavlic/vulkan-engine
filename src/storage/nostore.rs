@@ -3,7 +3,10 @@ use std::{mem::ManuallyDrop, ptr::NonNull};
 use ahash::HashSet;
 use pumice::VulkanResult;
 
-use super::{constant_ahash_randomstate, MutableShared, ObjectStorage, ReentrantMutex};
+use super::{
+    constant_ahash_randomstate, create_handle, create_handle_leaked_box, unleak_handle_leaked_box,
+    MutableShared, ObjectStorage, ReentrantMutex,
+};
 use crate::object::{ObjHandle, ObjHeader, ObjRef, Object};
 
 pub struct SimpleStorage<T: Object> {
@@ -26,27 +29,20 @@ impl<T: Object<Storage = Self>> ObjectStorage<T> for SimpleStorage<T> {
     unsafe fn get_or_create<'a>(
         &self,
         data: T::InputData<'a>,
-        ctx: NonNull<T::Parent>,
+        ctx: &T::Parent,
     ) -> VulkanResult<ObjHandle<T>> {
+        let handle = create_handle(data, (), ctx)?;
+
         self.lock.with_locked(|lock| {
-            T::create(data, ctx.as_ref()).map(|data| {
-                let boxed = Box::new(ObjHeader {
-                    refcount: 1.into(),
-                    object_data: data,
-                    storage_data: (),
-                    parent: ctx,
-                });
-                let leak = Box::leak(boxed);
-                let handle = ObjHandle(NonNull::from(leak));
-                self.handles.get_mut(lock).insert(handle.make_weak_copy());
-                handle
-            })
-        })
+            let is_true = self.handles.get_mut(lock).insert(handle.make_weak_copy());
+            assert!(is_true == false);
+        });
+
+        Ok(handle)
     }
 
     unsafe fn destroy(&self, handle: ManuallyDrop<ObjHandle<T>>) -> VulkanResult<()> {
-        let handle = handle.make_weak_copy();
-        let alloc = Box::from_raw(handle.get_object_header_ptr());
+        let alloc = unleak_handle_leaked_box(handle.make_weak_copy());
         let ObjHeader {
             refcount: _,
             object_data,
@@ -55,7 +51,8 @@ impl<T: Object<Storage = Self>> ObjectStorage<T> for SimpleStorage<T> {
         } = *alloc;
 
         self.lock.with_locked(|lock| {
-            self.handles.get_mut(lock).remove(&handle);
+            let is_true = self.handles.get_mut(lock).remove(&handle);
+            assert!(is_true == true);
             T::destroy(&object_data, lock, parent.as_ref())
         })
     }
@@ -74,5 +71,28 @@ impl<T: Object<Storage = Self>> ObjectStorage<T> for SimpleStorage<T> {
                 T::destroy(handle.get_object_data(), lock, handle.get_parent()).unwrap();
             }
         });
+    }
+}
+
+impl<T: Object<Storage = SimpleStorage<T>>> SimpleStorage<T> {
+    pub(crate) unsafe fn add_multiple(
+        &self,
+        datas: Vec<T::Data>,
+        ctx: &T::Parent,
+    ) -> Vec<ObjHandle<T>> {
+        let handles = datas
+            .into_iter()
+            .map(|data| create_handle_leaked_box(data, (), ctx))
+            .collect::<Vec<_>>();
+
+        self.lock.with_locked(|lock| {
+            let mut guard = self.handles.get_mut(lock);
+            for handle in &handles {
+                let is_true = guard.insert(handle.make_weak_copy());
+                assert!(is_true == is_true);
+            }
+        });
+
+        handles
     }
 }

@@ -197,7 +197,7 @@ fn main() {
             .layout(pipeline_layout.clone())
             .finish();
 
-        let pipeline = device.create_delayed_pipeline(pipeline_info);
+        let pipeline = device.create_delayed_graphics_pipeline(pipeline_info);
 
         let mut compiler = GraphCompiler::new();
         let mut graph = compiler.compile(device.clone(), |b| {

@@ -34,6 +34,42 @@ pub struct PipelineStage {
     pub specialization_info: Option<SpecializationInfo>,
 }
 
+impl PipelineStage {
+    pub(crate) fn to_vk(&self, bump: &Bump) -> vk::PipelineShaderStageCreateInfo {
+        let p_name = match self.name.as_ref() {
+            "main" => {
+                const MAIN_CSTR: &CStr = pumice::cstr!("main");
+                MAIN_CSTR.as_ptr()
+            }
+            other => bump
+                .alloc_slice_fill_iter(CStrIterator::new(other.as_bytes()))
+                .as_ptr() as *const c_char,
+        };
+
+        let p_specialization_info = self
+            .specialization_info
+            .as_ref()
+            .map(|i| {
+                bump.alloc(vk::SpecializationInfo {
+                    map_entry_count: i.map_entries.len() as u32,
+                    p_map_entries: i.map_entries.as_ffi_ptr(),
+                    data_size: i.data.len(),
+                    p_data: i.data.as_ffi_ptr().cast(),
+                }) as *const _
+            })
+            .unwrap_or(std::ptr::null());
+
+        vk::PipelineShaderStageCreateInfo {
+            flags: self.flags,
+            stage: self.stage,
+            module: self.module.raw(),
+            p_name,
+            p_specialization_info,
+            ..Default::default()
+        }
+    }
+}
+
 pub struct PipelineRenderingCreateInfoKHR {
     pub s_type: vk::StructureType,
     pub p_next: *const std::os::raw::c_void,
@@ -103,6 +139,16 @@ pub enum BasePipeline {
     Pipeline(ConcreteGraphicsPipeline),
     #[default]
     None,
+}
+
+impl BasePipeline {
+    pub(crate) fn get_index_or_pipeline(&self) -> (vk::Pipeline, i32) {
+        match self {
+            BasePipeline::Index(index) => (vk::Pipeline::null(), *index),
+            BasePipeline::Pipeline(handle) => (handle.get_handle(), -1),
+            BasePipeline::None => (vk::Pipeline::null(), -1),
+        }
+    }
 }
 
 pub mod state {
@@ -340,10 +386,6 @@ impl<'a> ExactSizeIterator for CStrIterator<'a> {
             None => 0,
         }
     }
-
-    // fn is_empty(&self) -> bool {
-    //     self.0.is_none()
-    // }
 }
 
 impl<'a> CStrIterator<'a> {
@@ -377,37 +419,7 @@ impl GraphicsPipelineCreateInfo {
         let (render_pass, subpass) =
             raw_info_handle_renderpass(&self.render_pass, &mut pnext_head, bump);
 
-        let stages = bump.alloc_slice_fill_iter(self.stages.iter().map(|s| {
-            const MAIN_CSTR: &CStr = pumice::cstr!("main");
-            let name = match s.name.as_ref() {
-                "main" => MAIN_CSTR.as_ptr(),
-                other => bump
-                    .alloc_slice_fill_iter(CStrIterator::new(s.name.as_bytes()))
-                    .as_ptr() as *const c_char,
-            };
-            let info = |i: &SpecializationInfo| {
-                let info = vk::SpecializationInfo {
-                    map_entry_count: i.map_entries.len() as u32,
-                    p_map_entries: i.map_entries.as_ffi_ptr(),
-                    data_size: i.data.len(),
-                    p_data: i.data.as_ffi_ptr().cast(),
-                };
-                bump.alloc(info) as *const _
-            };
-            let p_specialization_info = s
-                .specialization_info
-                .as_ref()
-                .map(info)
-                .unwrap_or(std::ptr::null());
-            vk::PipelineShaderStageCreateInfo {
-                flags: s.flags,
-                stage: s.stage,
-                module: s.module.raw(),
-                p_name: name,
-                p_specialization_info,
-                ..Default::default()
-            }
-        }));
+        let stages = bump.alloc_slice_fill_iter(self.stages.iter().map(|stage| stage.to_vk(bump)));
 
         let vertex_input = {
             self.vertex_input
@@ -564,11 +576,8 @@ impl GraphicsPipelineCreateInfo {
                 .unwrap_or(ptr::null())
         };
 
-        let (base_pipeline_handle, base_pipeline_index) = match &self.base_pipeline {
-            BasePipeline::Index(index) => (vk::Pipeline::null(), *index),
-            BasePipeline::Pipeline(handle) => (handle.get_handle(), -1),
-            BasePipeline::None => (vk::Pipeline::null(), -1),
-        };
+        let (base_pipeline_handle, base_pipeline_index) =
+            self.base_pipeline.get_index_or_pipeline();
 
         vk::GraphicsPipelineCreateInfo {
             p_next: pnext_head,
