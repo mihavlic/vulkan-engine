@@ -35,7 +35,7 @@ impl<T: Object<Storage = Self>> ObjectStorage<T> for SimpleStorage<T> {
 
         self.lock.with_locked(|lock| {
             let is_true = self.handles.get_mut(lock).insert(handle.make_weak_copy());
-            assert!(is_true == false);
+            assert!(is_true == true);
         });
 
         Ok(handle)

@@ -10,8 +10,8 @@ path = "./examples/triangle.rs"
 name = "triangle"
 
 [dependencies]
-pumice = {path = "../pumice", features = ["wrappers"]}
-pumice-vma = {path = "../pumice-vma/pumice-vma"}
+pumice = {git = "https://github.com/mihavlic/vulkan-bindings.git", features = ["wrappers"]}
+pumice-vma = {git = "https://github.com/mihavlic/pumice-vma.git"}
 spirq = "0.6.3"
 
 ahash = {version = "0.8.2", default-features = false, features = ["std"]}
