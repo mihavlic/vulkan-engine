@@ -299,12 +299,14 @@ impl DescriptorAllocator {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
 pub struct UniformMemory {
     pub dynamic_offset: u32,
     pub buffer: vk::Buffer,
     pub memory: NonNull<u8>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct UniformResult {
     pub dynamic_offset: u32,
     pub buffer: vk::Buffer,
@@ -317,13 +319,25 @@ pub struct DescImage {
     pub layout: vk::ImageLayout,
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct DescBuffer {
     pub buffer: vk::Buffer,
     pub view: vk::BufferView,
     pub offset: u64,
     pub range: u64,
     pub dynamic_offset: Option<u32>,
+}
+
+impl Default for DescBuffer {
+    fn default() -> Self {
+        Self {
+            buffer: vk::Buffer::null(),
+            view: vk::BufferView::null(),
+            offset: 0,
+            range: vk::WHOLE_SIZE,
+            dynamic_offset: None,
+        }
+    }
 }
 
 impl DescBuffer {
@@ -433,18 +447,49 @@ impl<'a> DescSetBuilder<'a> {
     fn mark_dirty(&mut self) {
         self.set = vk::DescriptorSet::null();
     }
-    pub fn update_image_binding(&mut self, binding: u32, array_offset: u32, data: &DescImage) {
+    pub fn update_image_binding(
+        &mut self,
+        binding: u32,
+        array_offset: u32,
+        data: &DescImage,
+    ) -> &mut Self {
         self.update_image_bindings_arr(binding, array_offset, std::slice::from_ref(data));
+        self
     }
-    pub fn update_buffer_binding(&mut self, binding: u32, array_offset: u32, data: &DescBuffer) {
+    pub fn update_buffer_binding(
+        &mut self,
+        binding: u32,
+        array_offset: u32,
+        data: &DescBuffer,
+    ) -> &mut Self {
         self.update_buffer_bindings_arr(binding, array_offset, std::slice::from_ref(data));
+        self
+    }
+    pub fn update_buffer_binding_dynamic(
+        &mut self,
+        binding: u32,
+        array_offset: u32,
+        result: UniformResult,
+    ) -> &mut Self {
+        self.update_buffer_binding(
+            binding,
+            array_offset,
+            &DescBuffer {
+                buffer: result.buffer,
+                offset: 0,
+                range: vk::WHOLE_SIZE,
+                dynamic_offset: Some(result.dynamic_offset),
+                ..Default::default()
+            },
+        );
+        self
     }
     pub fn update_image_bindings_arr(
         &mut self,
         binding: u32,
         array_offset: u32,
         datas: &[DescImage],
-    ) {
+    ) -> &mut Self {
         let binding = &self.bindings[binding as usize];
         assert!(binding.category == DescriptorCategory::Image);
         let data_slice = binding.data_slice.start as usize..binding.data_slice.end as usize;
@@ -460,13 +505,14 @@ impl<'a> DescSetBuilder<'a> {
                 self.mark_dirty();
             }
         }
+        self
     }
     pub fn update_buffer_bindings_arr(
         &mut self,
         binding: u32,
         array_offset: u32,
         datas: &[DescBuffer],
-    ) {
+    ) -> &mut Self {
         let binding = &self.bindings[binding as usize];
         assert!(binding.category == DescriptorCategory::Buffer);
         assert!(array_offset as usize + datas.len() <= binding.data_slice.len());
@@ -480,8 +526,9 @@ impl<'a> DescSetBuilder<'a> {
                 self.mark_dirty();
             }
         }
+        self
     }
-    pub fn update_whole(&mut self, bindings: &[DescriptorData]) {
+    pub fn update_whole(&mut self, bindings: &[DescriptorData]) -> &mut Self {
         let layout = &self.layout.get_create_info();
         assert_eq!(bindings.len(), layout.bindings.len());
 
@@ -491,22 +538,23 @@ impl<'a> DescSetBuilder<'a> {
             match data {
                 DescriptorData::Image(image) => {
                     assert_eq!(count, 1);
-                    self.update_image_bindings_arr(i, 0, std::slice::from_ref(image))
+                    self.update_image_bindings_arr(i, 0, std::slice::from_ref(image));
                 }
                 DescriptorData::ImageArr(images) => {
                     assert_eq!(count, images.len());
-                    self.update_image_bindings_arr(i, 0, *images)
+                    self.update_image_bindings_arr(i, 0, *images);
                 }
                 DescriptorData::Buffer(buffer) => {
                     assert_eq!(count, 1);
-                    self.update_buffer_bindings_arr(i, 0, std::slice::from_ref(buffer))
+                    self.update_buffer_bindings_arr(i, 0, std::slice::from_ref(buffer));
                 }
                 DescriptorData::BufferArr(buffers) => {
                     assert_eq!(count, buffers.len());
-                    self.update_buffer_bindings_arr(i, 0, *buffers)
+                    self.update_buffer_bindings_arr(i, 0, *buffers);
                 }
             }
         }
+        self
     }
     pub unsafe fn finish(&mut self, executor: &GraphExecutor) -> FinishedSet {
         let state = executor.graph.state();
@@ -647,12 +695,23 @@ pub struct FinishedSet<'a> {
     dynamic_offsets: SmallVec<[u32; 4]>,
 }
 
+impl<'a> FinishedSet<'a> {
+    pub unsafe fn bind(
+        &self,
+        bind_point: vk::PipelineBindPoint,
+        layout: &ObjRef<object::PipelineLayout>,
+        executor: &GraphExecutor,
+    ) {
+        executor.bind_descriptor_sets(bind_point, layout, &[self]);
+    }
+}
+
 pub unsafe fn bind_descriptor_sets(
     device: &DeviceWrapper,
     cmd: vk::CommandBuffer,
     bind_point: vk::PipelineBindPoint,
     layout: &ObjRef<object::PipelineLayout>,
-    sets: &[FinishedSet],
+    sets: &[&FinishedSet],
 ) {
     let dynamic_offsets = sets
         .iter()

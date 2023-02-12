@@ -122,9 +122,6 @@ struct SimpleShaderPass {
 }
 
 impl RenderPass for SimpleShaderPass {
-    fn prepare(&mut self) {
-        {}
-    }
     unsafe fn execute(
         &mut self,
         executor: &GraphExecutor,
@@ -219,12 +216,12 @@ impl RenderPass for SimpleShaderPass {
                 dynamic_offset: Some(res.dynamic_offset),
                 ..Default::default()
             },
-        );
-        let fin = set.finish(executor);
-        executor.bind_descriptor_sets(
+        )
+        .finish(executor)
+        .bind(
             vk::PipelineBindPoint::GRAPHICS,
             &self.info.pipeline_layout,
-            &[fin],
+            executor,
         );
 
         d.cmd_draw(cmd, 3, 1, 0, 0);

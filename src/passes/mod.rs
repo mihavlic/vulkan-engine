@@ -9,7 +9,7 @@ use crate::{
 };
 
 pub trait RenderPass: 'static + Send {
-    fn prepare(&mut self);
+    fn prepare(&mut self) {}
     unsafe fn execute(&mut self, executor: &GraphExecutor, device: &Device) -> VulkanResult<()>;
 }
 
@@ -24,9 +24,6 @@ pub trait CreatePass: 'static + Send {
 }
 
 impl RenderPass for () {
-    fn prepare(&mut self) {
-        {}
-    }
     unsafe fn execute(&mut self, executor: &GraphExecutor, device: &Device) -> VulkanResult<()> {
         VulkanResult::Ok(())
     }
@@ -43,5 +40,12 @@ impl<P: RenderPass + Send, F: FnMut(&mut GraphPassBuilder) -> P + Send + 'static
         ctx: &mut GraphContext,
     ) -> Box<dyn RenderPass + Send> {
         Box::new(prepared)
+    }
+}
+
+impl<F: FnMut(&GraphExecutor, &Device) + Send + 'static> RenderPass for F {
+    unsafe fn execute(&mut self, executor: &GraphExecutor, device: &Device) -> VulkanResult<()> {
+        self(executor, device);
+        Ok(())
     }
 }

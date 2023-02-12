@@ -70,8 +70,10 @@ impl OpenGeneration {
         // safe because as long as OpenGeneration exists, its lock is locked, and it cannot be cloned
         unsafe { self.0.submissions.get_mut().extend(submissions) };
     }
-    pub fn finish(self) {
-        drop(self)
+    pub fn finish(self) -> GenerationId {
+        let id = self.id();
+        drop(self);
+        id
     }
 }
 

@@ -36,6 +36,7 @@ use std::{
     ptr::NonNull,
     slice,
     sync::Arc,
+    time::Duration,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -432,6 +433,15 @@ impl Device {
             .get_or_create((info, allocate), self)
             .map(object::Image)
     }
+    pub unsafe fn create_buffer(
+        &self,
+        info: object::BufferCreateInfo,
+        allocate: pumice_vma::AllocationCreateInfo,
+    ) -> VulkanResult<object::Buffer> {
+        self.buffer_storage
+            .get_or_create((info, allocate), self)
+            .map(object::Buffer)
+    }
     pub unsafe fn create_swapchain(
         &self,
         info: object::SwapchainCreateInfo,
@@ -482,8 +492,10 @@ impl Drop for Device {
 
             // we do both device_wait_idle and then also wait on all the registered semaphores
             // since validation layers complain otherwise
-            self.wait_idle();
-            self.synchronization_manager.write().destroy(self);
+            let mut write = self.synchronization_manager.write();
+            write.wait_all(self);
+            // self.wait_idle();
+            write.destroy(self);
             self.generation_manager.write().destroy(self);
 
             if self.pipeline_cache != vk::PipelineCache::null() {
@@ -493,14 +505,18 @@ impl Drop for Device {
 
             self.graphics_pipelines.cleanup();
             self.compute_pipelines.cleanup();
-            self.shader_modules.cleanup();
-            self.samplers.cleanup();
-            self.render_passes.cleanup();
+
             self.pipeline_layouts.cleanup();
             self.descriptor_set_layouts.cleanup();
+
+            self.shader_modules.cleanup();
+            self.samplers.cleanup();
+
             self.image_storage.cleanup();
             self.buffer_storage.cleanup();
             self.swapchain_storage.cleanup();
+
+            self.render_passes.cleanup();
 
             self.device().destroy_device(callbacks);
         }

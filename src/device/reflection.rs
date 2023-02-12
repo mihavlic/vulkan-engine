@@ -6,6 +6,7 @@ use crate::object;
 
 use super::Device;
 
+#[derive(Debug)]
 pub struct DescriptorSetBinding {
     pub name: String,
     pub binding: u32,
@@ -14,11 +15,13 @@ pub struct DescriptorSetBinding {
     pub stages: vk::ShaderStageFlags,
 }
 
+#[derive(Debug)]
 pub struct DescriptorSet {
     pub set: u32,
     pub bindings: Vec<DescriptorSetBinding>,
 }
 
+#[derive(Debug)]
 pub struct PushConstantRange {
     pub name: String,
     pub stage_flags: vk::ShaderStageFlags,
@@ -26,6 +29,7 @@ pub struct PushConstantRange {
     pub size: u32,
 }
 
+#[derive(Debug)]
 pub struct ReflectedLayout {
     pub sets: Vec<DescriptorSet>,
     pub push_constants: Vec<PushConstantRange>,
@@ -97,7 +101,7 @@ impl ReflectedLayout {
                                 ty,
                                 nbind: count,
                             } => {
-                                let mut name = name.unwrap();
+                                let mut name = name.unwrap_or_default();
                                 let set_index = desc_bind.set();
                                 let binding_index = desc_bind.bind();
                                 let kind = type_to_descriptor_type(desc_ty, dynamic);
@@ -128,7 +132,7 @@ impl ReflectedLayout {
                                 }
                             }
                             Variable::PushConstant { name, ty } => {
-                                let name = name.unwrap();
+                                let name = name.unwrap_or_default();
                                 let size: u32 = ty.nbyte().unwrap().try_into().unwrap();
                                 if let Some(found) =
                                     push_constants.iter_mut().find(|entry| entry.name == name)

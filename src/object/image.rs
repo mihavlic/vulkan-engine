@@ -23,14 +23,14 @@ pub enum Extent {
 }
 
 impl Extent {
-    pub(crate) fn as_image_type(&self) -> vk::ImageType {
+    pub fn as_image_type(&self) -> vk::ImageType {
         match self {
             Extent::D1(_) => vk::ImageType::T1D,
             Extent::D2(_, _) => vk::ImageType::T2D,
             Extent::D3(_, _, _) => vk::ImageType::T3D,
         }
     }
-    pub(crate) fn as_extent_3d(&self) -> vk::Extent3D {
+    pub fn as_extent_3d(&self) -> vk::Extent3D {
         match *self {
             Extent::D1(w) => vk::Extent3D {
                 width: w,
@@ -48,6 +48,24 @@ impl Extent {
                 depth: d,
             },
         }
+    }
+    pub fn get_1d(&self) -> Option<u32> {
+        if let Self::D1(x) = *self {
+            return Some(x);
+        }
+        None
+    }
+    pub fn get_2d(&self) -> Option<(u32, u32)> {
+        if let Self::D2(x, y) = *self {
+            return Some((x, y));
+        }
+        None
+    }
+    pub fn get_3d(&self) -> Option<(u32, u32, u32)> {
+        if let Self::D3(x, y, z) = *self {
+            return Some((x, y, z));
+        }
+        None
     }
 }
 

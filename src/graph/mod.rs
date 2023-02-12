@@ -92,6 +92,17 @@ pub struct GraphObject<T> {
 }
 
 impl<T> GraphObject<T> {
+    pub(crate) fn from_cow(name: Cow<'static, str>, inner: T) -> Self {
+        // if the string length is 0, we set the name to None
+        if name.is_empty() {
+            GraphObject { name: None, inner }
+        } else {
+            GraphObject {
+                name: Some(name),
+                inner,
+            }
+        }
+    }
     pub(crate) fn get_inner(&self) -> &T {
         &self.inner
     }

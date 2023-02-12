@@ -1,4 +1,6 @@
+use core::panic;
 use std::{
+    backtrace::Backtrace,
     borrow::{BorrowMut, Cow},
     cell::{Cell, Ref, RefCell, RefMut},
     collections::{hash_map::Entry, BinaryHeap},
@@ -251,9 +253,6 @@ impl<'a> GraphExecutor<'a> {
     ) -> vk::ImageSubresourceRange {
         self.graph.input.get_image_subresource_range(image, aspect)
     }
-    pub fn get_image(&self, image: GraphImage) -> vk::Image {
-        self.raw_images[image.index()].unwrap()
-    }
     pub unsafe fn get_image_view(
         &self,
         image: GraphImage,
@@ -332,8 +331,21 @@ impl<'a> GraphExecutor<'a> {
             },
         )
     }
+    pub fn get_image(&self, image: GraphImage) -> vk::Image {
+        self.raw_images[image.index()].unwrap_or_else(|| {
+            panic!(
+                "Missing handle for '{}', is the image dead?",
+                self.graph.input.get_image_display(image)
+            )
+        })
+    }
     pub fn get_buffer(&self, buffer: GraphBuffer) -> vk::Buffer {
-        self.raw_buffers[buffer.index()].unwrap()
+        self.raw_buffers[buffer.index()].unwrap_or_else(|| {
+            panic!(
+                "Missing handle for '{}', is the buffer dead?",
+                self.graph.input.get_buffer_display(buffer)
+            )
+        })
     }
     pub unsafe fn allocate_uniform_iter<T, I: IntoIterator<Item = T>>(
         &self,
@@ -373,7 +385,7 @@ impl<'a> GraphExecutor<'a> {
         &self,
         bind_point: vk::PipelineBindPoint,
         layout: &ObjRef<object::PipelineLayout>,
-        sets: &[FinishedSet],
+        sets: &[&FinishedSet],
     ) {
         let state = self.graph.state();
         bind_descriptor_sets(
@@ -450,6 +462,10 @@ impl CompiledGraphVulkanState {
         let d = device.device();
         let ac = device.allocator_callbacks();
 
+        descriptor_allocator.get_mut().destroy(device);
+        swapchain_semaphores.get_mut().destroy(device);
+        command_pools.get_mut().destroy(device);
+
         for i in physical_images {
             i.state.borrow_mut().destroy(device);
             d.destroy_image(i.vkhandle, ac);
@@ -463,10 +479,6 @@ impl CompiledGraphVulkanState {
         for a in allocations {
             device.allocator().free_memory(*a);
         }
-
-        descriptor_allocator.get_mut().destroy(device);
-        swapchain_semaphores.get_mut().destroy(device);
-        command_pools.get_mut().destroy(device);
     }
 }
 
@@ -891,14 +903,13 @@ impl CompiledGraph {
             })
             .collect::<Vec<_>>();
 
-        let current_generation = self
-            .state()
-            .device
-            .open_generation(Some(self.state.make_finalizer()));
-
-        current_generation.add_submissions(submission_finish_semaphores.iter().map(|(s, _)| *s));
-        let id = current_generation.id();
-        current_generation.finish();
+        let id = {
+            let gen = self
+                .device()
+                .open_generation(Some(self.state.make_finalizer()));
+            gen.add_submissions(submission_finish_semaphores.iter().map(|(s, _)| *s));
+            gen.finish()
+        };
 
         self.current_generation.set(Some(id));
 
@@ -1451,10 +1462,21 @@ impl CompiledGraph {
         );
 
         map_collect_into(i, image_barriers, raw_image_barriers, |info| {
+            let usage = match self.get_image_create_info(info.image) {
+                ImageKindCreateInfo::ImageRef(i) => i.usage,
+                ImageKindCreateInfo::Image(i) => i.usage,
+                ImageKindCreateInfo::Swapchain(i) => i.usage,
+            };
+
+            let aspect = if usage.contains(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT) {
+                vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+            } else {
+                vk::ImageAspectFlags::COLOR
+            };
+
             info.to_vk(
                 raw_images[info.image.index()].unwrap(),
-                self.input
-                    .get_image_subresource_range(info.image, vk::ImageAspectFlags::COLOR),
+                self.input.get_image_subresource_range(info.image, aspect),
             )
         });
 
@@ -1513,7 +1535,7 @@ impl CompiledGraph {
             info.to_vk(
                 raw_images[info.image.index()].unwrap(),
                 self.input
-                    .get_image_subresource_range(info.image, vk::ImageAspectFlags::COLOR),
+                    .get_image_subresource_range(info.image, vk::ImageAspectFlags::all()),
             )
         });
 

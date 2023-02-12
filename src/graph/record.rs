@@ -337,26 +337,30 @@ impl GraphBuilder {
             .push(Named::to_graph_object(buffer).map(BufferData::Imported));
         handle
     }
-    pub fn create_image(
+    pub fn create_image<N: Into<Cow<'static, str>>>(
         &mut self,
-        info: impl Named<object::ImageCreateInfo>,
+        info: object::ImageCreateInfo,
         allocation: pumice_vma::AllocationCreateInfo,
+        name: N,
     ) -> GraphImage {
         let handle = GraphImage::new(self.0.input.images.len());
-        self.0.input.images.push(
-            Named::to_graph_object(info).map(|a| ImageData::TransientPrototype(a, allocation)),
-        );
+        self.0.input.images.push(GraphObject::from_cow(
+            name.into(),
+            ImageData::TransientPrototype(info, allocation),
+        ));
         handle
     }
-    pub fn create_buffer(
+    pub fn create_buffer<N: Into<Cow<'static, str>>>(
         &mut self,
-        info: impl Named<object::BufferCreateInfo>,
+        info: object::BufferCreateInfo,
         allocation: pumice_vma::AllocationCreateInfo,
+        name: N,
     ) -> GraphBuffer {
         let handle = GraphBuffer::new(self.0.input.buffers.len());
-        self.0.input.buffers.push(
-            Named::to_graph_object(info).map(|a| BufferData::TransientPrototype(a, allocation)),
-        );
+        self.0.input.buffers.push(GraphObject::from_cow(
+            name.into(),
+            BufferData::TransientPrototype(info, allocation),
+        ));
         handle
     }
     #[track_caller]
@@ -464,9 +468,10 @@ impl GraphBuilder {
             let pass_object = StoredCreatePass::new(pass, &mut builder);
             (builder.finish(queue), pass_object)
         };
-        // if the string is 0, we set the name to None
-        let name = Some(name.into()).filter(|n| !n.is_empty());
-        self.0.input.passes.push(GraphObject { name, inner: data });
+        self.0
+            .input
+            .passes
+            .push(GraphObject::from_cow(name.into(), data));
         self.0
             .pass_objects
             .push(PassObjectState::Initial(pass_object));
@@ -659,7 +664,12 @@ impl<'a> GraphPassBuilder<'a> {
             ImageData::Transient(_) | ImageData::Moved(_) => unreachable!(),
         };
 
-        assert!(resource_usage.contains(usage));
+        assert!(
+            resource_usage.contains(usage),
+            "Resource '{}' is missing usage {:?}",
+            self.graph_builder.0.input.get_image_display(image),
+            usage
+        );
 
         // TODO deduplicate or explicitly forbid multiple entries with the same handle
         self.images.push(PassImageData {
@@ -684,7 +694,12 @@ impl<'a> GraphPassBuilder<'a> {
             BufferData::Transient(_) => unreachable!(),
         };
 
-        assert!(resource_usage.contains(usage));
+        assert!(
+            resource_usage.contains(usage),
+            "Resource '{}' is missing usage {:?}",
+            self.graph_builder.0.input.get_buffer_display(buffer),
+            usage
+        );
 
         // TODO deduplicate or explicitly forbid multiple entries with the same handle
         self.buffers.push(PassBufferData {

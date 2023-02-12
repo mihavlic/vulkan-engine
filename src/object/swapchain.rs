@@ -229,12 +229,12 @@ impl SwapchainMutableState {
         &self.images[image_index as usize]
     }
     pub unsafe fn destroy(&mut self, ctx: &Device) {
-        for mut data in self.images.drain(..) {
-            data.destroy(ctx);
-        }
         if self.swapchain != vk::SwapchainKHR::null() {
             ctx.device()
                 .destroy_swapchain_khr(self.swapchain, ctx.allocator_callbacks());
+        }
+        for mut data in self.images.drain(..) {
+            data.destroy(ctx);
         }
     }
 }

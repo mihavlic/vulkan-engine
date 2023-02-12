@@ -1366,7 +1366,14 @@ impl GraphCompiler {
                 match src {
                     // no dependency
                     ResourceState::Uninit => {
-                        *src = ResourceState::new_normal(p, dst_writing);
+                        assert!(
+                            dst_writing,
+                            "First resource access is a read, this is invalid"
+                        );
+                        *src = ResourceState::Normal {
+                            reading: SmallVec::new(),
+                            writing: Some(p),
+                        };
                     }
                     // inherit all dependencies
                     ResourceState::MoveDst { reading, writing } => {
@@ -1384,39 +1391,22 @@ impl GraphCompiler {
                     ResourceState::Normal { reading, writing } => {
                         // note that when a Write occurs and then some Reads, the next Write will
                         // make a hard dependency to the previous Write and soft dependencies to all the Reads
-
-                        if let Some(producer) = writing {
-                            assert!(reading.is_empty());
-                            data.add_dependency(
-                                *producer,
-                                // src is WRITE, some dependency must occur
-                                is_hard(true, dst_writing).unwrap(),
-                                false,
-                            );
-
-                            // W W
-                            if dst_writing {
-                                *writing = Some(p);
-                            }
-                            // W R
-                            else {
-                                reading.push(p);
-                            }
-                        }
-                        // R W
                         if dst_writing {
-                            for r in &*reading {
-                                data.add_dependency(
-                                    *r,
-                                    is_hard(false, /* dst_writing == */ true).unwrap(),
-                                    false,
-                                );
+                            if let Some(producer) = writing {
+                                data.add_dependency(*producer, true, false);
                             }
+
+                            for read in &*reading {
+                                data.add_dependency(*read, false, false);
+                            }
+
                             reading.clear();
                             *writing = Some(p);
-                        }
-                        // R R - we only append this pass to the current readers, no dependency is created
-                        else {
+                        } else {
+                            let producer = writing
+                                .expect("Resource must first be written to before it is read");
+                            data.add_dependency(producer, true, false);
+
                             if !reading.contains(&p) {
                                 reading.push(p);
                             }
@@ -1434,7 +1424,6 @@ impl GraphCompiler {
                 match e.get() {
                     PassEventData::Pass(p) => {
                         let data = &mut self.input.passes[p.index()];
-
                         for i_index in 0..data.images.len() {
                             let image = &data.images[i_index];
                             let dst_writing = image.is_written();

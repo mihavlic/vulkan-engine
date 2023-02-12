@@ -779,10 +779,32 @@ impl Object for GraphicsPipeline {
     }
 }
 
+impl std::ops::Deref for GraphicsPipeline {
+    type Target = crate::object::ObjRef<GraphicsPipeline>;
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        unsafe {
+            std::mem::transmute::<
+                &crate::object::ObjHeader<GraphicsPipeline>,
+                &crate::object::ObjRef<GraphicsPipeline>,
+            >(self.0 .0.as_ref())
+        }
+    }
+}
+
+impl GraphicsPipeline {
+    pub fn get_descriptor_set_layouts(&self) -> &Vec<super::DescriptorSetLayout> {
+        self.get_create_info().layout.get_descriptor_set_layouts()
+    }
+}
+
 #[derive(Clone)]
 pub struct ConcreteGraphicsPipeline(pub(crate) GraphicsPipeline, pub(crate) vk::Pipeline);
 
 impl ConcreteGraphicsPipeline {
+    pub fn get_descriptor_set_layouts(&self) -> &Vec<super::DescriptorSetLayout> {
+        self.0.get_descriptor_set_layouts()
+    }
     pub fn get_handle(&self) -> vk::Pipeline {
         self.1
     }

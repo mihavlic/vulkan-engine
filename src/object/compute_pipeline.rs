@@ -112,6 +112,15 @@ impl Object for ComputePipeline {
     }
 }
 
+impl ComputePipeline {
+    pub fn get_descriptor_set_layouts(&self) -> &Vec<super::DescriptorSetLayout> {
+        self.get_create_info().layout.get_descriptor_set_layouts()
+    }
+    pub fn get_pipeline_layout(&self) -> &super::PipelineLayout {
+        &self.get_create_info().layout
+    }
+}
+
 pub(crate) unsafe fn create_compute_pipeline_impl(
     data: ComputePipelineCreateInfo,
     bump: &Bump,
