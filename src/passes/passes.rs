@@ -135,7 +135,7 @@ impl RenderPass for SimpleShaderPass {
             .attachments
             .iter()
             .map(|&image| vk::RenderingAttachmentInfoKHR {
-                image_view: executor.get_default_image_view(image, vk::ImageAspectFlags::COLOR),
+                image_view: executor.get_default_image_view(image),
                 image_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 resolve_mode: vk::ResolveModeFlagsKHR::NONE,
                 load_op: vk::AttachmentLoadOp::LOAD,
@@ -203,7 +203,7 @@ impl RenderPass for SimpleShaderPass {
 
         let time = self.start.elapsed().as_secs_f32() * std::f32::consts::PI;
         let color: [f32; 4] = [time.sin(), time.mul(2.0).sin(), time.mul(3.0).sin(), time];
-        let res = executor.allocate_uniform_element(color);
+        let res = executor.allocate_uniform_element(&color);
 
         let mut set = DescSetBuilder::new(&self.info.set_layout);
         set.update_buffer_binding(

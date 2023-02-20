@@ -1,6 +1,7 @@
 use std::{
     ffi::c_void,
     mem::ManuallyDrop,
+    ops::Not,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -10,7 +11,10 @@ use smallvec::SmallVec;
 
 use crate::{
     arena::arena::{GenArena, U32Key},
-    device::Device,
+    device::{
+        debug::{maybe_attach_debug_label, DisplayConcat},
+        Device,
+    },
     graph::task::SendUnsafeCell,
 };
 
@@ -172,6 +176,7 @@ pub enum WaitResult {
 pub(crate) struct SubmissionManager {
     submissions: GenArena<U32Key, SubmissionEntry>,
     free_semaphores: Vec<SemaphoreEntry>,
+    semaphore_count: u32,
 }
 
 impl SubmissionManager {
@@ -179,6 +184,7 @@ impl SubmissionManager {
         Self {
             submissions: GenArena::new(),
             free_semaphores: Vec::new(),
+            semaphore_count: 0,
         }
     }
     fn wait_for_submissions<T: IntoIterator<Item = QueueSubmission>>(
@@ -191,7 +197,7 @@ impl SubmissionManager {
         let mut remaining_timeout_ns = timeout_ns;
         // avoid the syscall(?) when the timeout is infinite
         let skip_time = timeout_ns == 0 || timeout_ns == u64::MAX;
-        let start = skip_time.then(|| std::time::Instant::now());
+        let start = skip_time.not().then(|| std::time::Instant::now());
 
         let mut timeout = false;
 
@@ -300,6 +306,12 @@ impl SubmissionManager {
                     .create_semaphore(&info, device.allocator_callbacks())
                     .unwrap()
             };
+            maybe_attach_debug_label(
+                raw,
+                &DisplayConcat::new(&[&"Submission timeline semaphore ", &self.semaphore_count]),
+                device,
+            );
+            self.semaphore_count += 1;
             SemaphoreEntry {
                 raw,
                 value: SemaphoreValue::new(0, false),

@@ -1,4 +1,5 @@
 mod allocator;
+pub mod blackboard;
 pub mod compile;
 pub mod descriptors;
 pub mod execute;

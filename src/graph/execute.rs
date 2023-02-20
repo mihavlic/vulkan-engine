@@ -5,8 +5,9 @@ use std::{
     cell::{Cell, Ref, RefCell, RefMut},
     collections::{hash_map::Entry, BinaryHeap},
     fmt::Display,
+    hash::Hash,
     mem::ManuallyDrop,
-    ops::{Deref, DerefMut, Range},
+    ops::{Deref, DerefMut, Not, Range},
     sync::Arc,
 };
 
@@ -22,6 +23,7 @@ use crate::{
     arena::uint::{Config, OptionalU32, PackedUint},
     device::{
         batch::GenerationId,
+        debug::{maybe_attach_debug_label, with_temporary_cstr, DisplayConcat, LazyDisplay},
         submission::{self, QueueSubmission, SubmissionData, TimelineSemaphore},
         OwnedDevice,
     },
@@ -45,10 +47,11 @@ use crate::{
 
 use super::{
     allocator::{AvailabilityToken, Suballocator},
+    blackboard::BlackBoard,
     compile::{
         BufferBarrier, GraphPassEvent, GraphResource, ImageBarrier, ImageKindCreateInfo,
         MemoryBarrier, PassMeta, PassObjectState, ResourceFirstAccess, ResourceState,
-        ResourceSubresource, Submission, SwapchainPresent,
+        ResourceSubresource, Submission,
     },
     descriptors::{
         bind_descriptor_sets, DescriptorAllocator, FinishedSet, UniformMemory, UniformResult,
@@ -100,9 +103,14 @@ impl LegacySemaphoreStack {
     pub(crate) unsafe fn reset(&mut self) {
         self.next_index = 0;
     }
-    pub(crate) unsafe fn next(&mut self, ctx: &Device) -> vk::Semaphore {
+    pub(crate) unsafe fn next(&mut self, device: &Device) -> vk::Semaphore {
         if self.next_index == self.semaphores.len() {
-            let semaphore = ctx.create_raw_semaphore().unwrap();
+            let semaphore = device.create_raw_semaphore().unwrap();
+            maybe_attach_debug_label(
+                semaphore,
+                &DisplayConcat::new(&[&"Legacy semaphore ", &self.next_index]),
+                device,
+            );
             self.semaphores.push(semaphore);
         }
 
@@ -110,9 +118,9 @@ impl LegacySemaphoreStack {
         self.next_index += 1;
         semaphore
     }
-    pub(crate) unsafe fn destroy(&mut self, ctx: &Device) {
+    pub(crate) unsafe fn destroy(&mut self, device: &Device) {
         for semaphore in self.semaphores.drain(..) {
-            ctx.destroy_raw_semaphore(semaphore);
+            device.destroy_raw_semaphore(semaphore);
         }
     }
 }
@@ -121,6 +129,54 @@ impl Drop for LegacySemaphoreStack {
     fn drop(&mut self) {
         if !self.semaphores.is_empty() {
             panic!("LegacySemaphoreStack has not been destroyed before being dropped!");
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct FenceStack {
+    next_index: usize,
+    fences: Vec<vk::Fence>,
+}
+
+impl FenceStack {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+    pub(crate) unsafe fn reset(&mut self, device: &Device) {
+        if self.next_index != 0 {
+            device
+                .device()
+                .reset_fences(&self.fences[..self.next_index]);
+            self.next_index = 0;
+        }
+    }
+    pub(crate) unsafe fn next(&mut self, device: &Device) -> vk::Fence {
+        if self.next_index == self.fences.len() {
+            let fence = device.create_raw_fence(false).unwrap();
+            maybe_attach_debug_label(
+                fence,
+                &DisplayConcat::new(&[&"FenceStack fence ", &self.next_index]),
+                device,
+            );
+            self.fences.push(fence);
+        }
+
+        let fence = self.fences[self.next_index];
+        self.next_index += 1;
+        fence
+    }
+    pub(crate) unsafe fn destroy(&mut self, device: &Device) {
+        for fence in self.fences.drain(..) {
+            device.destroy_raw_fence(fence);
+        }
+    }
+}
+
+impl Drop for FenceStack {
+    fn drop(&mut self) {
+        if !self.fences.is_empty() {
+            panic!("FenceStack has not been destroyed before being dropped!");
         }
     }
 }
@@ -217,6 +273,7 @@ impl CommandBufferStack {
 
 pub struct GraphExecutor<'a> {
     pub(crate) graph: &'a CompiledGraph,
+    pub(crate) blackboard: &'a RefCell<BlackBoard>,
     pub(crate) command_buffer: vk::CommandBuffer,
     pub(crate) swapchain_image_indices: &'a ahash::HashMap<GraphImage, u32>,
     pub(crate) raw_images: &'a [Option<vk::Image>],
@@ -224,13 +281,14 @@ pub struct GraphExecutor<'a> {
 }
 
 impl<'a> GraphExecutor<'a> {
+    pub fn execution_blackboard(&self) -> Ref<BlackBoard> {
+        self.blackboard.borrow()
+    }
+    pub fn execution_blackboard_mut(&self) -> RefMut<BlackBoard> {
+        self.blackboard.borrow_mut()
+    }
     pub fn get_image_format(&self, image: GraphImage) -> vk::Format {
-        let info = self.graph.get_image_create_info(image);
-        match info {
-            ImageKindCreateInfo::Image(info) => info.format,
-            ImageKindCreateInfo::ImageRef(info) => info.format,
-            ImageKindCreateInfo::Swapchain(info) => info.format,
-        }
+        self.graph.get_image_format(image)
     }
     pub fn get_image_extent(&self, image: GraphImage) -> object::Extent {
         let info = self.graph.get_image_create_info(image);
@@ -278,10 +336,26 @@ impl<'a> GraphExecutor<'a> {
             }
             ImageData::Transient(physical) => {
                 let data = self.graph.get_physical_image(*physical);
+
+                let label = LazyDisplay(|f| {
+                    write!(
+                        f,
+                        "{} view {:x}",
+                        self.graph.input.get_image_display(image),
+                        info.get_hash()
+                    )
+                });
+
                 let view = data
                     .state
                     .borrow_mut()
-                    .get_view(data.vkhandle, &info, batch_id, &self.graph.state().device)
+                    .get_view(
+                        data.vkhandle,
+                        &info,
+                        batch_id,
+                        Some(&label),
+                        &self.graph.state().device,
+                    )
                     .unwrap();
                 view
             }
@@ -295,11 +369,7 @@ impl<'a> GraphExecutor<'a> {
             }
         }
     }
-    pub unsafe fn get_default_image_view(
-        &self,
-        image: GraphImage,
-        aspect: vk::ImageAspectFlags,
-    ) -> vk::ImageView {
+    pub unsafe fn get_default_image_view(&self, image: GraphImage) -> vk::ImageView {
         let info = self.graph.get_image_create_info(image);
         let (kind, format) = match info {
             ImageKindCreateInfo::Image(info) => (
@@ -320,7 +390,8 @@ impl<'a> GraphExecutor<'a> {
             ),
             ImageKindCreateInfo::Swapchain(info) => (vk::ImageViewType::T2D, info.format),
         };
-        let subresource_range = self.get_image_subresource_range(image, aspect);
+        let subresource_range =
+            self.get_image_subresource_range(image, format.get_format_aspects().0);
         self.get_image_view(
             image,
             &object::ImageViewCreateInfo {
@@ -362,7 +433,7 @@ impl<'a> GraphExecutor<'a> {
             .allocate_uniform_iter(&state.device, iter);
         res
     }
-    pub unsafe fn allocate_uniform_element<T>(&self, value: T) -> UniformResult {
+    pub unsafe fn allocate_uniform_element<T: 'static>(&self, value: &T) -> UniformResult {
         let state = self.graph.state();
         let res = state
             .descriptor_allocator
@@ -398,19 +469,28 @@ impl<'a> GraphExecutor<'a> {
     }
 }
 
+enum ExternalResourceHandle {
+    ImportedImage(object::Image),
+    Swapchain(object::Swapchain),
+    ImportedBuffer(object::Buffer),
+}
+
 /// The part of state needed by CompiledGraph that holds vulkan objects and must have its destruction deferred until work finishes
 pub(crate) struct CompiledGraphVulkanState {
-    pub(crate) passes: RefCell<Vec<PassObjectState>>,
-    pub(crate) physical_images: Vec<PhysicalImageData>,
-    pub(crate) physical_buffers: Vec<PhysicalBufferData>,
-    pub(crate) allocations: Vec<pumice_vma::Allocation>,
+    passes: RefCell<Vec<PassObjectState>>,
+    physical_images: Vec<PhysicalImageData>,
+    physical_buffers: Vec<PhysicalBufferData>,
+    external_resources: Vec<ExternalResourceHandle>,
+    allocations: Vec<pumice_vma::Allocation>,
     // semaphores used for presenting:
     //  to synchronize the moment when we aren't using the swapchain image anymore
     //  to start the submission only after the presentation engine is done with it
     // https://vulkan-tutorial.com/Drawing_a_triangle/Drawing/Rendering_and_presentation#page_Creating-the-synchronization-objects
-    pub(crate) swapchain_semaphores: RefCell<LegacySemaphoreStack>,
+    swapchain_semaphores: RefCell<LegacySemaphoreStack>,
+    fences: RefCell<FenceStack>,
+    command_pools: RefCell<CommandBufferStack>,
+
     pub(crate) descriptor_allocator: RefCell<DescriptorAllocator>,
-    pub(crate) command_pools: RefCell<CommandBufferStack>,
     pub(crate) device: OwnedDevice,
 }
 
@@ -421,6 +501,7 @@ impl CompiledGraphVulkanState {
         passes: Vec<PassObjectState>,
         physical_images: Vec<PhysicalImageData>,
         physical_buffers: Vec<PhysicalBufferData>,
+        input: &CompilationInput,
     ) -> Self {
         let allocations = suballocators
             .into_iter()
@@ -428,22 +509,48 @@ impl CompiledGraphVulkanState {
             .map(|b| b.0.allocation)
             .collect::<Vec<_>>();
 
+        let mut external_resources = Vec::new();
+
+        for i in &input.images {
+            match &**i {
+                ImageData::Imported(a) => {
+                    external_resources.push(ExternalResourceHandle::ImportedImage(a.clone()))
+                }
+                ImageData::Swapchain(a) => {
+                    external_resources.push(ExternalResourceHandle::Swapchain(a.clone()))
+                }
+                _ => {}
+            }
+        }
+
+        for i in &input.buffers {
+            match &**i {
+                BufferData::Imported(a) => {
+                    external_resources.push(ExternalResourceHandle::ImportedBuffer(a.clone()))
+                }
+                _ => {}
+            }
+        }
+
         Self {
             swapchain_semaphores: RefCell::new(LegacySemaphoreStack::new()),
             command_pools: RefCell::new(CommandBufferStack::new()),
             allocations,
             passes: RefCell::new(passes),
-            physical_buffers,
             physical_images,
+            physical_buffers,
+            external_resources,
             device,
             descriptor_allocator: RefCell::new(DescriptorAllocator::new()),
+            fences: RefCell::new(FenceStack::new()),
         }
     }
     unsafe fn reset(&mut self) {
         let device = &self.device;
-        self.swapchain_semaphores.get_mut().reset();
         self.descriptor_allocator.get_mut().reset(device);
         self.command_pools.get_mut().reset(device);
+        self.swapchain_semaphores.get_mut().reset();
+        self.fences.get_mut().reset(device);
     }
     unsafe fn destroy(&mut self) {
         let Self {
@@ -452,19 +559,22 @@ impl CompiledGraphVulkanState {
             passes,
             physical_images,
             physical_buffers,
+            external_resources,
             allocations,
             descriptor_allocator,
             swapchain_semaphores,
             command_pools,
             device,
+            fences,
         } = self;
 
         let d = device.device();
         let ac = device.allocator_callbacks();
 
+        command_pools.get_mut().destroy(device);
         descriptor_allocator.get_mut().destroy(device);
         swapchain_semaphores.get_mut().destroy(device);
-        command_pools.get_mut().destroy(device);
+        fences.get_mut().destroy(device);
 
         for i in physical_images {
             i.state.borrow_mut().destroy(device);
@@ -478,6 +588,14 @@ impl CompiledGraphVulkanState {
 
         for a in allocations {
             device.allocator().free_memory(*a);
+        }
+
+        for p in passes.get_mut().drain(..) {
+            drop(p);
+        }
+
+        for e in external_resources.drain(..) {
+            drop(e);
         }
     }
 }
@@ -507,6 +625,7 @@ impl MainCompiledGraphVulkanState {
         passes: Vec<PassObjectState>,
         physical_images: Vec<PhysicalImageData>,
         physical_buffers: Vec<PhysicalBufferData>,
+        input: &CompilationInput,
     ) -> Self {
         Self {
             shared: RefCell::new(SharedCompiledGraphVulkanState {
@@ -517,6 +636,7 @@ impl MainCompiledGraphVulkanState {
                         passes,
                         physical_images,
                         physical_buffers,
+                        input,
                     ),
                 ))),
             }),
@@ -542,13 +662,46 @@ impl MainCompiledGraphVulkanState {
     fn make_finalizer(&self) -> Box<dyn FnOnce() + Send> {
         let shared = self.make_shared();
         Box::new(
-            // this immediatelly closure drops shared when called
+            // this closure immediatelly drops `shared` when called
             move || {
                 // interesting fact: if we use a `let _ = shared;` statement, the closure doesn't capture the variable?
                 let friend = shared;
             },
         )
     }
+}
+
+pub struct GraphRunConfig {
+    pub swapchain_acquire_timeout_ns: u64,
+    /// nvidia drivers may let vkAcquireNextImageKHR pass with a timeout
+    /// and then block until the image is actually read on vkQueuePresentKHR
+    /// which on wayland, if the window is hidden, is indefinite
+    ///   https://github.com/KhronosGroup/Vulkan-Docs/issues/1158#issuecomment-573874821
+    /// it seems that the workaround is either to select some present mode like MAILBOX
+    /// or ensure the timeout through fences
+    ///
+    /// after further experimentation
+    ///   if the presentation mode is FIFO, vkQueuePresent will block on gnome/wayland if the window is hidden (minimized or covered by a window), otherwise it may still wait for a blanking interval
+    ///   it is thoroughly impossible to prevent vkQueuePresent from blocking, if we acquire the image with the fence and then immediatelly wait for it, it may return SUCCESS and then vkQueuePresent will still block
+    ///   funnily enough, if using acquire_swapchain_with_fence and swapchain minImageCount is 2, the third vkWaitForFences (the frame image #0 is reused) will keep returning TIMEOUT forever, if timeout is u64::MAX
+    ///   this will deadlock the application
+    ///   (for example on intel mesa drivers, minImageCount is 3, probably for some reason such as this)
+    /// so it seems that we should do the following
+    ///   try to use MAILBOX, otherwise fall back on FIFO, this will require application-side framerate limiting
+    ///   use at minimum 3 swapchain images
+    ///
+    /// pass a fence to vkAcquireNextImageKHR and then wait for it for swapchain_acquire_timeout_ns, this was created
+    /// in the hope of preventing an indefinite wait in vkQueuePresent on nvidia, but proved fruitless,
+    /// just use MAILBOX present mode as that partially fixes it
+    pub acquire_swapchain_with_fence: bool,
+    pub return_after_swapchain_recreate: bool,
+}
+
+#[derive(Debug)]
+pub enum GraphRunStatus {
+    Ok,
+    SwapchainAcquireTimeout,
+    SwapchainRecreated,
 }
 
 pub struct CompiledGraph {
@@ -568,6 +721,7 @@ pub struct CompiledGraph {
 
     pub(crate) current_generation: Cell<Option<GenerationId>>,
     pub(crate) prev_generation: Cell<Option<GenerationId>>,
+    pub(crate) early_returned: Cell<bool>,
 
     pub(crate) state: MainCompiledGraphVulkanState,
 }
@@ -613,6 +767,14 @@ impl CompiledGraph {
             }
         }
     }
+    pub(crate) fn get_image_format(&self, image: GraphImage) -> vk::Format {
+        let info = self.get_image_create_info(image);
+        match info {
+            ImageKindCreateInfo::Image(info) => info.format,
+            ImageKindCreateInfo::ImageRef(info) => info.format,
+            ImageKindCreateInfo::Swapchain(info) => info.format,
+        }
+    }
     pub(crate) fn get_physical_image(&self, image: PhysicalImage) -> Ref<'_, PhysicalImageData> {
         Ref::map(self.state(), |state| &state.physical_images[image.index()])
     }
@@ -635,19 +797,250 @@ impl CompiledGraph {
     pub(crate) fn device(&self) -> &Device {
         self.state.device()
     }
-    pub fn run(&mut self) {
-        // we can now start executing the graph (TODO move this to another function, allow the built graph to be executed multiple times)
-        // wait for previously submitted work to finish
-        if let Some(id) = self.prev_generation.get() {
-            self.state()
-                .device
-                .wait_for_generation_single(id, u64::MAX)
-                .unwrap();
+    pub fn run(&mut self, config: GraphRunConfig) -> GraphRunStatus {
+        if self.early_returned.get() {
+            assert!(self.prev_generation.get().is_none());
+            self.early_returned.set(false);
+        } else {
+            // we can now start executing the graph (TODO move this to another function, allow the built graph to be executed multiple times)
+            // wait for previously submitted work to finish
+            if let Some(id) = self.prev_generation.get() {
+                self.state()
+                    .device
+                    .wait_for_generation_single(id, u64::MAX)
+                    .unwrap();
+            }
+
+            // since we've now waited for all previous work to finish, we can safely reset the semaphores
+            unsafe {
+                self.state_mut().reset();
+            }
+
+            self.prev_generation.set(None);
         }
 
-        // since we've now waited for all previous work to finish, we can safely reset the semaphores
-        unsafe {
-            self.state_mut().reset();
+        let state = self.state();
+
+        let swapchain_storage_lock = state.device.swapchain_storage.acquire_all_exclusive();
+        let mut waited_idle = false;
+        let mut swapchain_image_indices: ahash::HashMap<GraphImage, u32> = constant_ahash_hashmap();
+        let mut submission_swapchains: ahash::HashMap<GraphSubmission, Vec<SwapchainPresent>> =
+            constant_ahash_hashmap();
+
+        let mut swapchain_fences = Vec::new();
+        let mut remaining_acquire_timeout_ns = config.swapchain_acquire_timeout_ns;
+
+        let skip_time = config.swapchain_acquire_timeout_ns == 0
+            || config.swapchain_acquire_timeout_ns == u64::MAX;
+        let start = skip_time.not().then(|| std::time::Instant::now());
+
+        let mut first_swapchain_acquire = true;
+
+        for (&handle, initial) in &self.external_resource_initial_access {
+            let &ResourceFirstAccess {
+                ref accessors,
+                dst_layout,
+                dst_queue_family,
+                dst_stages,
+                dst_access,
+            } = initial;
+
+            match handle.unpack() {
+                GraphResource::Image(image) => {
+                    let data = self.input.get_image_data(image);
+                    match data {
+                        ImageData::Swapchain(archandle) => unsafe {
+                            assert!(accessors.len() == 1, "Swapchains use legacy semaphores and do not support multiple signals or waits, using a swapchain in multiple submissions is disallowed (you should really just transfer the final image into it at the end of the frame)");
+
+                            let mut mutable = archandle
+                                .0
+                                .get_object_data()
+                                .get_mutable_state(&swapchain_storage_lock);
+
+                            let mut semaphores = state.swapchain_semaphores.borrow_mut();
+                            let mut fences = state.fences.borrow_mut();
+                            // let acquire_semaphore = semaphores.next(&state.device);
+                            let mut acquire_semaphore = None;
+                            let release_semaphore = semaphores.next(&state.device);
+
+                            let mut attempt = 0;
+                            let index = loop {
+                                // we allow the swapchain to be recreated two times, then crash
+                                if attempt == 3 {
+                                    panic!("Swapchain immediatelly invalid after being recreated two times");
+                                }
+
+                                if !first_swapchain_acquire && !skip_time {
+                                    remaining_acquire_timeout_ns =
+                                        (config.swapchain_acquire_timeout_ns as u128)
+                                            .saturating_sub(start.unwrap().elapsed().as_nanos())
+                                            .try_into()
+                                            .unwrap();
+                                }
+                                first_swapchain_acquire = false;
+
+                                let make_arguments = || {
+                                    let mut semaphore = vk::Semaphore::null();
+                                    let mut fence = vk::Fence::null();
+
+                                    if config.acquire_swapchain_with_fence {
+                                        fence = fences.next(&state.device);
+                                        swapchain_fences.push(fence);
+                                    } else {
+                                        semaphore = semaphores.next(&state.device);
+                                        acquire_semaphore = Some(semaphore);
+                                    };
+
+                                    (semaphore, fence)
+                                };
+
+                                // we'll stash it back into the swapchain, if we successfully acquire all swapchains, we'll clear the stashes
+                                match mutable.acquire_image(
+                                    remaining_acquire_timeout_ns,
+                                    make_arguments,
+                                    true,
+                                    &state.device,
+                                ) {
+                                    SwapchainAcquireStatus::Stashed(stashed) => {
+                                        if stashed.fence != vk::Fence::null() {
+                                            swapchain_fences.push(stashed.fence);
+                                        }
+                                        acquire_semaphore = Some(stashed.semaphore);
+                                        break stashed.index;
+                                    }
+                                    SwapchainAcquireStatus::Ok(index, suboptimal) => {
+                                        if suboptimal {
+                                            mutable.set_next_out_of_date();
+                                        }
+                                        break index;
+                                    }
+                                    // It seems to be invalid to destroy the swapchain while any image is acquired (an image is acquired when suboptimal is returned).
+                                    // However we're recreating the swapchain before destrying the old one? Also the wording on vkDestroySwapchainKHR is not clear,
+                                    // it's invalid to destroy it "until after completion of all outstanding operations on images that were acquired from the swapchain"
+                                    // Since VK_EXT_swapchain_maintenance1 exists (https://github.com/KhronosGroup/Vulkan-Docs/blob/main/proposals/VK_EXT_swapchain_maintenance1.adoc#15-releasing-acquired-images)
+                                    // it sadly seems to really work this way.
+                                    //
+                                    // every project does something different:
+                                    //   continues rendering on suboptimal
+                                    //    https://github.com/KhronosGroup/Vulkan-Tools/blob/a2304cb131353df94812e8a0c537a101e82bf831/cube/cube.c#L1083
+                                    //   immediatelly recreates
+                                    //    https://github.com/krh/vkcube/blob/f77395324a3297b2b6ffd7bce0383073e4670190/main.c#L1291
+                                    //   continues rendering
+                                    //    https://github.com/Overv/VulkanTutorial/blob/d4fca309a2b7a5d74d9c7e59692ea31b0a94994e/code/17_swap_chain_recreation.cpp#L688
+                                    //
+                                    // so until VK_EXT_swapchain_maintenance1 arrives, we'll continue presenting to the suboptimal swapchain, marking it as resized after the first image
+                                    SwapchainAcquireStatus::OutOfDate => {
+                                        if !waited_idle {
+                                            state.device.wait_idle();
+                                            waited_idle = true;
+                                        }
+
+                                        mutable
+                                            .recreate(&archandle.0.get_create_info(), &state.device)
+                                            .unwrap();
+
+                                        if config.return_after_swapchain_recreate {
+                                            self.early_returned.set(true);
+                                            return GraphRunStatus::SwapchainRecreated;
+                                        }
+
+                                        attempt += 1;
+                                        continue;
+                                    }
+                                    SwapchainAcquireStatus::Timeout => {
+                                        if config.swapchain_acquire_timeout_ns == u64::MAX {
+                                            panic!("Timeout when waiting u64::MAX");
+                                        }
+                                        self.early_returned.set(true);
+                                        return GraphRunStatus::SwapchainAcquireTimeout;
+                                    }
+                                    SwapchainAcquireStatus::Err(e) => {
+                                        panic!("Error acquiring swapchain image: {:?}", e)
+                                    }
+                                };
+                            };
+
+                            submission_swapchains.entry(accessors[0]).or_default().push(
+                                SwapchainPresent {
+                                    vkhandle: mutable.get_swapchain(index),
+                                    image_index: index,
+                                    image_acquire: acquire_semaphore
+                                        .unwrap_or(vk::Semaphore::null()),
+                                    image_release: release_semaphore,
+                                },
+                            );
+
+                            // we do not update any synchronization state here, since we already get synchronization from swapchain image acquire and the subsequent present
+                            swapchain_image_indices.insert(image, index);
+                        },
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if config.acquire_swapchain_with_fence && !swapchain_fences.is_empty() {
+            if !skip_time {
+                remaining_acquire_timeout_ns = (config.swapchain_acquire_timeout_ns as u128)
+                    .saturating_sub(start.unwrap().elapsed().as_nanos())
+                    .try_into()
+                    .unwrap();
+            }
+
+            let result = unsafe {
+                state.device.device().wait_for_fences(
+                    &swapchain_fences,
+                    true,
+                    remaining_acquire_timeout_ns,
+                )
+            };
+
+            match result {
+                Ok(vk::Result::SUCCESS) => {}
+                Ok(vk::Result::TIMEOUT) => {
+                    self.early_returned.set(true);
+                    return GraphRunStatus::SwapchainAcquireTimeout;
+                }
+                Err(
+                    e @ (vk::Result::ERROR_OUT_OF_HOST_MEMORY
+                    | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+                    | vk::Result::ERROR_DEVICE_LOST),
+                ) => {
+                    panic!("Fatal error calling wait_for_fences '{:?}'", e);
+                }
+                Ok(huh) | Err(huh) => {
+                    panic!("wait_for_fences returned unexpected result '{:?}'", huh);
+                }
+            }
+        }
+
+        // clear the stashed swapchain images, we're now sure that we'll continue rendering
+        for (&handle, initial) in &self.external_resource_initial_access {
+            let &ResourceFirstAccess {
+                ref accessors,
+                dst_layout,
+                dst_queue_family,
+                dst_stages,
+                dst_access,
+            } = initial;
+
+            match handle.unpack() {
+                GraphResource::Image(image) => {
+                    let data = self.input.get_image_data(image);
+                    match data {
+                        ImageData::Swapchain(archandle) => unsafe {
+                            let mut mutable = archandle
+                                .0
+                                .get_object_data()
+                                .get_mutable_state(&swapchain_storage_lock);
+                            mutable.clear_stashed_image();
+                        },
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
         }
 
         // each submission gets a semaphore
@@ -656,15 +1049,12 @@ impl CompiledGraph {
             .submissions
             .iter()
             .map(|s| {
-                self.state()
+                state
                     .device
                     .make_submission(self.input.get_queue_family(s.queue), None)
             })
             .collect::<Vec<_>>();
 
-        let state = self.state();
-
-        // TODO when we separate compiling and executing a graph, these two loops will be far away
         for (i, pass) in self.state().passes.borrow_mut().iter_mut().enumerate() {
             if self.alive_passes.contains(i) {
                 pass.on_created(|p| p.prepare());
@@ -674,12 +1064,6 @@ impl CompiledGraph {
         // TODO do something about this so that we don't hold the lock for all of execution
         let image_storage_lock = state.device.image_storage.acquire_all_exclusive();
         let buffer_storage_lock = state.device.buffer_storage.acquire_all_exclusive();
-        let swapchain_storage_lock = state.device.swapchain_storage.acquire_all_exclusive();
-
-        let mut waited_idle = false;
-        let mut swapchain_image_indices: ahash::HashMap<GraphImage, u32> = constant_ahash_hashmap();
-        let mut submission_swapchains: ahash::HashMap<QueueSubmission, Vec<SwapchainPresent>> =
-            constant_ahash_hashmap();
 
         let mut accessors_scratch = Vec::new();
 
@@ -729,71 +1113,8 @@ impl CompiledGraph {
                                 &mut submission_extra,
                             );
                         },
-                        ImageData::Swapchain(archandle) => unsafe {
-                            assert!(accessors_scratch.len() == 1, "Swapchains use legacy semaphores and do not support multiple signals or waits, using a swapchain in multiple submissions is disallowed (you should really just transfer the final image into it at the end of the frame)");
-
-                            let mut mutable = archandle
-                                .0
-                                .get_object_data()
-                                .get_mutable_state(&swapchain_storage_lock);
-
-                            let mut semaphores = state.swapchain_semaphores.borrow_mut();
-                            let acquire_semaphore = semaphores.next(&state.device);
-                            let release_semaphore = semaphores.next(&state.device);
-
-                            let mut attempt = 0;
-                            let index = loop {
-                                match mutable.acquire_image(
-                                    u64::MAX,
-                                    acquire_semaphore,
-                                    vk::Fence::null(),
-                                    &self.state().device,
-                                ) {
-                                    SwapchainAcquireStatus::Ok(index, false) => break index,
-                                    SwapchainAcquireStatus::OutOfDate
-                                    | SwapchainAcquireStatus::Ok(_, true) => {
-                                        // we allow the swapchain to be recreated two times, then crash
-                                        if attempt == 2 {
-                                            panic!("Swapchain immediatelly invalid after being recreated two times");
-                                        }
-
-                                        if !waited_idle {
-                                            self.state().device.wait_idle();
-                                            waited_idle = true;
-                                        }
-
-                                        mutable
-                                            .recreate(
-                                                &archandle.0.get_create_info(),
-                                                &self.state().device,
-                                            )
-                                            .unwrap();
-
-                                        attempt += 1;
-                                        continue;
-                                    }
-                                    SwapchainAcquireStatus::Timeout => {
-                                        panic!("Timeout when waiting u64::MAX")
-                                    }
-                                    SwapchainAcquireStatus::Err(e) => {
-                                        panic!("Error acquiring swapchain image: {:?}", e)
-                                    }
-                                };
-                            };
-
-                            submission_swapchains
-                                .entry(accessors_scratch[0])
-                                .or_default()
-                                .push(SwapchainPresent {
-                                    vkhandle: mutable.get_swapchain(index),
-                                    image_index: index,
-                                    image_acquire: acquire_semaphore,
-                                    image_release: release_semaphore,
-                                });
-
-                            // we do not update any synchronization state here, since we already get synchronization from swapchain image acquire and the subsequent present
-                            swapchain_image_indices.insert(image, index);
-                        },
+                        // swapchains have been handled earlier
+                        ImageData::Swapchain(archandle) => {}
                         _ => unreachable!("Not an external resource"),
                     }
                 }
@@ -924,6 +1245,9 @@ impl CompiledGraph {
         let mut raw_buffer_barriers = Vec::new();
 
         let bump = Bump::new();
+        let mut blackboard = RefCell::new(BlackBoard::new());
+
+        let mut swapchains_out_of_date = false;
 
         unsafe {
             let state = self.state();
@@ -1003,13 +1327,23 @@ impl CompiledGraph {
                     submit_infos.push(submit);
                 }
 
-                d.queue_submit_2_khr(
-                    dummy_submission_group[0].queue,
-                    &submit_infos,
-                    vk::Fence::null(),
-                )
-                .map_err(|e| panic!("Submit err {:?}", e))
-                .unwrap();
+                let queue = dummy_submission_group[0].queue;
+
+                if self.device().debug() {
+                    let info = vk::DebugUtilsLabelEXT {
+                        p_label_name: pumice::cstr!("Dummy passes").as_ptr(),
+                        ..Default::default()
+                    };
+                    d.queue_begin_debug_utils_label_ext(queue, &info);
+                }
+
+                d.queue_submit_2_khr(queue, &submit_infos, vk::Fence::null())
+                    .map_err(|e| panic!("Submit err {:?}", e))
+                    .unwrap();
+
+                if self.device().debug() {
+                    d.queue_end_debug_utils_label_ext(queue);
+                }
             }
 
             for (i, sub) in self.submissions.iter().enumerate() {
@@ -1040,17 +1374,39 @@ impl CompiledGraph {
                 )
                 .unwrap();
 
-                let mut memory_barriers = memory_barriers.iter().cloned();
-                let mut image_barriers = extra_image_barriers
-                    .into_iter()
-                    .map(|info| (SubmissionPass(0), info))
-                    .chain(image_barriers.iter().cloned());
-                let mut buffer_barriers = extra_buffer_barriers
-                    .into_iter()
-                    .map(|info| (SubmissionPass(0), info))
-                    .chain(buffer_barriers.iter().cloned());
+                self.do_barriers(
+                    0,
+                    d,
+                    &mut std::iter::empty(),
+                    &mut extra_image_barriers
+                        .into_iter()
+                        .map(|info| (SubmissionPass(0), info)),
+                    &mut extra_buffer_barriers
+                        .into_iter()
+                        .map(|info| (SubmissionPass(0), info)),
+                    &mut raw_memory_barriers,
+                    &mut raw_image_barriers,
+                    &mut raw_buffer_barriers,
+                    &raw_images,
+                    &raw_buffers,
+                    command_buffer,
+                );
 
-                for (i, pass) in passes.into_iter().enumerate() {
+                let mut memory_barriers = memory_barriers.iter().cloned();
+                let mut image_barriers = image_barriers.iter().cloned();
+                let mut buffer_barriers = buffer_barriers.iter().cloned();
+
+                for (i, &pass) in passes.into_iter().enumerate() {
+                    if self.device().debug() {
+                        with_temporary_cstr(&self.input.get_pass_display(pass), |cstr| {
+                            let info = vk::DebugUtilsLabelEXT {
+                                p_label_name: cstr,
+                                ..Default::default()
+                            };
+                            d.cmd_begin_debug_utils_label_ext(command_buffer, &info);
+                        })
+                    }
+
                     self.do_barriers(
                         i,
                         d,
@@ -1071,10 +1427,15 @@ impl CompiledGraph {
                         swapchain_image_indices: &swapchain_image_indices,
                         raw_images: &raw_images,
                         raw_buffers: &raw_buffers,
+                        blackboard: &blackboard,
                     };
                     state.passes.borrow_mut()[pass.index()]
                         .on_created(|p| p.execute(&executor, &state.device))
                         .unwrap();
+
+                    if self.device().debug() {
+                        d.cmd_end_debug_utils_label_ext(command_buffer);
+                    }
                 }
                 self.do_barriers(
                     usize::MAX,
@@ -1095,33 +1456,34 @@ impl CompiledGraph {
                 let pass_data = &self.input.passes[i];
                 let queue = self.input.queues[pass_data.queue.index()].inner.clone();
                 let (queue_submission, finished_semaphore) = submission_finish_semaphores[i];
-                let swapchains = submission_swapchains.get(&queue_submission);
+                let swapchains = submission_swapchains.get(&submission);
 
                 wait_semaphores.clear();
                 signal_semaphores.clear();
                 if let Some(swapchains) = swapchains {
-                    wait_semaphores = swapchains
-                        .iter()
-                        .map(|s| vk::SemaphoreSubmitInfoKHR {
-                            semaphore: s.image_acquire,
-                            // not a timeline semaphore, value ignored
-                            value: 0,
-                            // TODO we should probably bother to track this information
-                            // though then transitive reduction and such become invalid and have to be patched up ... eh
-                            stage_mask: vk::PipelineStageFlags2KHR::ALL_COMMANDS,
-                            ..Default::default()
-                        })
-                        .collect::<Vec<_>>();
-                    signal_semaphores = swapchains
-                        .iter()
-                        .map(|s| vk::SemaphoreSubmitInfoKHR {
+                    if !config.acquire_swapchain_with_fence {
+                        wait_semaphores.extend(swapchains.iter().map(|s| {
+                            assert!(s.image_acquire != vk::Semaphore::null());
+                            vk::SemaphoreSubmitInfoKHR {
+                                semaphore: s.image_acquire,
+                                // not a timeline semaphore, value ignored
+                                value: 0,
+                                // TODO we should probably bother to track this information
+                                // though then transitive reduction and such become invalid and have to be patched up ... eh
+                                stage_mask: vk::PipelineStageFlags2KHR::ALL_COMMANDS,
+                                ..Default::default()
+                            }
+                        }));
+                    }
+                    signal_semaphores.extend(swapchains.iter().map(|s| {
+                        vk::SemaphoreSubmitInfoKHR {
                             semaphore: s.image_release,
                             // not a timeline semaphore, value ignored
                             value: 0,
                             stage_mask: vk::PipelineStageFlags2KHR::ALL_COMMANDS,
                             ..Default::default()
-                        })
-                        .collect::<Vec<_>>();
+                        }
+                    }));
                 }
                 wait_semaphores.extend(extra_dependencies.iter().map(|timeline| {
                     vk::SemaphoreSubmitInfoKHR {
@@ -1155,11 +1517,11 @@ impl CompiledGraph {
                 let submit = vk::SubmitInfo2KHR {
                     flags: vk::SubmitFlagsKHR::empty(),
                     wait_semaphore_info_count: wait_semaphores.len() as u32,
-                    p_wait_semaphore_infos: wait_semaphores.as_ptr(),
+                    p_wait_semaphore_infos: wait_semaphores.as_ffi_ptr(),
                     command_buffer_info_count: 1,
                     p_command_buffer_infos: &command_buffer_info,
                     signal_semaphore_info_count: signal_semaphores.len() as u32,
-                    p_signal_semaphore_infos: signal_semaphores.as_ptr(),
+                    p_signal_semaphore_infos: signal_semaphores.as_ffi_ptr(),
                     ..Default::default()
                 };
 
@@ -1172,14 +1534,19 @@ impl CompiledGraph {
                 .map_err(|e| panic!("Submit err {:?}", e))
                 .unwrap();
 
-                if let Some(swapchains) = swapchains {
-                    let wait_semaphores = swapchains
+                if let Some(swapchain_presents) = swapchains {
+                    let wait_semaphores = swapchain_presents
                         .iter()
                         .map(|s| s.image_release)
                         .collect::<Vec<_>>();
-                    let image_indices =
-                        swapchains.iter().map(|s| s.image_index).collect::<Vec<_>>();
-                    let swapchains = swapchains.iter().map(|s| s.vkhandle).collect::<Vec<_>>();
+                    let image_indices = swapchain_presents
+                        .iter()
+                        .map(|s| s.image_index)
+                        .collect::<Vec<_>>();
+                    let swapchains = swapchain_presents
+                        .iter()
+                        .map(|s| s.vkhandle)
+                        .collect::<Vec<_>>();
 
                     let mut results = vec![std::mem::zeroed(); swapchains.len()];
 
@@ -1193,8 +1560,7 @@ impl CompiledGraph {
                         ..Default::default()
                     };
 
-                    d.queue_present_khr(queue.raw(), &present_info).unwrap();
-                    let result = Ok(vk::Result::SUCCESS);
+                    let result = d.queue_present_khr(queue.raw(), &present_info);
 
                     for result in std::iter::once(result).chain(
                         results
@@ -1204,6 +1570,7 @@ impl CompiledGraph {
                         match result {
                             Ok(vk::Result::SUCCESS) => {}
                             // the window became suboptimal while we were rendering, nothing to be done, the swapchain will be recreated in the next loop
+                            // if we tried to set notify the object::Swapchain that it needs to be resized, we risk racing with other code that may have started resizing it already
                             Ok(vk::Result::SUBOPTIMAL_KHR)
                             | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {}
                             Err(
@@ -1211,9 +1578,11 @@ impl CompiledGraph {
                                 | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
                                 | vk::Result::ERROR_DEVICE_LOST
                                 | vk::Result::ERROR_SURFACE_LOST_KHR),
-                            ) => panic!("Fatal error '{:?}' from queue_present_khr", err),
+                            ) => {
+                                panic!("Fatal error '{:?}' from queue_present_khr", err);
+                            }
                             Ok(huh) | Err(huh) => {
-                                panic!("queue_present_khr shouldn't return a result of '{:?}'", huh)
+                                panic!("queue_present_khr returned unexpected result '{:?}'", huh)
                             }
                         }
                     }
@@ -1222,6 +1591,8 @@ impl CompiledGraph {
         }
 
         self.prev_generation.set(Some(id));
+
+        GraphRunStatus::Ok
     }
     unsafe fn handle_imported_sync<T: ResourceMarker>(
         &self,
@@ -1369,7 +1740,7 @@ impl CompiledGraph {
                     vk::PipelineStageFlags2KHR::empty(),
                     vk::PipelineStageFlags2KHR::ALL_COMMANDS,
                     vk::AccessFlags2KHR::empty(),
-                    vk::AccessFlags2KHR::all(),
+                    vk::AccessFlags2KHR::MEMORY_WRITE | vk::AccessFlags2KHR::MEMORY_READ,
                     transition_layout_from.unwrap_or(dst_layout),
                     dst_layout,
                     transition_ownership_from.unwrap_or(dst_queue_family),
@@ -1462,27 +1833,45 @@ impl CompiledGraph {
         );
 
         map_collect_into(i, image_barriers, raw_image_barriers, |info| {
-            let usage = match self.get_image_create_info(info.image) {
-                ImageKindCreateInfo::ImageRef(i) => i.usage,
-                ImageKindCreateInfo::Image(i) => i.usage,
-                ImageKindCreateInfo::Swapchain(i) => i.usage,
+            let format = match self.get_image_create_info(info.image) {
+                ImageKindCreateInfo::ImageRef(i) => i.format,
+                ImageKindCreateInfo::Image(i) => i.format,
+                ImageKindCreateInfo::Swapchain(i) => i.format,
             };
 
-            let aspect = if usage.contains(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT) {
-                vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
-            } else {
-                vk::ImageAspectFlags::COLOR
-            };
+            let (aspects, _) = format.get_format_aspects();
 
             info.to_vk(
                 raw_images[info.image.index()].unwrap(),
-                self.input.get_image_subresource_range(info.image, aspect),
+                self.input.get_image_subresource_range(info.image, aspects),
             )
         });
 
         map_collect_into(i, buffer_barriers, raw_buffer_barriers, |info| {
             info.to_vk(raw_buffers[info.buffer.index()].unwrap())
         });
+
+        #[rustfmt::skip]
+        if /* full_barriers */ true {
+            for b in raw_memory_barriers.iter_mut() {
+                b.src_access_mask = vk::AccessFlags2KHR::MEMORY_READ | vk::AccessFlags2KHR::MEMORY_WRITE;
+                b.dst_access_mask = vk::AccessFlags2KHR::MEMORY_READ | vk::AccessFlags2KHR::MEMORY_WRITE;
+                b.src_stage_mask = vk::PipelineStageFlags2KHR::ALL_COMMANDS;
+                b.dst_stage_mask = vk::PipelineStageFlags2KHR::ALL_COMMANDS;
+            }
+            for b in raw_image_barriers.iter_mut() {
+                b.src_access_mask = vk::AccessFlags2KHR::MEMORY_READ | vk::AccessFlags2KHR::MEMORY_WRITE;
+                b.dst_access_mask = vk::AccessFlags2KHR::MEMORY_READ | vk::AccessFlags2KHR::MEMORY_WRITE;
+                b.src_stage_mask = vk::PipelineStageFlags2KHR::ALL_COMMANDS;
+                b.dst_stage_mask = vk::PipelineStageFlags2KHR::ALL_COMMANDS;
+            }
+            for b in raw_buffer_barriers.iter_mut() {
+                b.src_access_mask = vk::AccessFlags2KHR::MEMORY_READ | vk::AccessFlags2KHR::MEMORY_WRITE;
+                b.dst_access_mask = vk::AccessFlags2KHR::MEMORY_READ | vk::AccessFlags2KHR::MEMORY_WRITE;
+                b.src_stage_mask = vk::PipelineStageFlags2KHR::ALL_COMMANDS;
+                b.dst_stage_mask = vk::PipelineStageFlags2KHR::ALL_COMMANDS;
+            }
+        };
 
         if !(raw_memory_barriers.is_empty()
             && raw_image_barriers.is_empty()
@@ -1532,10 +1921,11 @@ impl CompiledGraph {
         collect_into(memory_barriers, raw_memory_barriers, MemoryBarrier::to_vk);
 
         collect_into(image_barriers, raw_image_barriers, |info| {
+            let format = self.get_image_format(info.image);
             info.to_vk(
                 raw_images[info.image.index()].unwrap(),
                 self.input
-                    .get_image_subresource_range(info.image, vk::ImageAspectFlags::all()),
+                    .get_image_subresource_range(info.image, format.get_format_aspects().0),
             )
         });
 
@@ -1592,4 +1982,11 @@ impl Default for SubmissionExtra {
             dependencies: constant_ahash_hashset(),
         }
     }
+}
+
+pub(crate) struct SwapchainPresent {
+    pub(crate) vkhandle: vk::SwapchainKHR,
+    pub(crate) image_index: u32,
+    pub(crate) image_acquire: vk::Semaphore,
+    pub(crate) image_release: vk::Semaphore,
 }

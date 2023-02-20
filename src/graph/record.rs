@@ -206,16 +206,24 @@ impl CompilationInput {
         vec
     }
     pub(crate) fn get_queue_display(&self, queue: GraphQueue) -> GraphObjectDisplay<'_> {
-        self.queues[queue.index()].display(queue.index())
+        self.queues[queue.index()]
+            .display(queue.index())
+            .set_prefix("queue")
     }
     pub(crate) fn get_pass_display(&self, pass: GraphPass) -> GraphObjectDisplay<'_> {
-        self.passes[pass.index()].display(pass.index())
+        self.passes[pass.index()]
+            .display(pass.index())
+            .set_prefix("pass")
     }
     pub(crate) fn get_image_display(&self, image: GraphImage) -> GraphObjectDisplay<'_> {
-        self.images[image.index()].display(image.index())
+        self.images[image.index()]
+            .display(image.index())
+            .set_prefix("image")
     }
     pub(crate) fn get_buffer_display(&self, buffer: GraphBuffer) -> GraphObjectDisplay<'_> {
-        self.buffers[buffer.index()].display(buffer.index())
+        self.buffers[buffer.index()]
+            .display(buffer.index())
+            .set_prefix("buffer")
     }
     pub(crate) fn get_concrete_image_data(&self, image: GraphImage) -> &ImageData {
         self.get_concrete_image_data_impl(image).1
@@ -337,30 +345,28 @@ impl GraphBuilder {
             .push(Named::to_graph_object(buffer).map(BufferData::Imported));
         handle
     }
-    pub fn create_image<N: Into<Cow<'static, str>>>(
+    pub fn create_image(
         &mut self,
         info: object::ImageCreateInfo,
         allocation: pumice_vma::AllocationCreateInfo,
-        name: N,
     ) -> GraphImage {
         let handle = GraphImage::new(self.0.input.images.len());
-        self.0.input.images.push(GraphObject::from_cow(
-            name.into(),
-            ImageData::TransientPrototype(info, allocation),
-        ));
+        self.0.input.images.push(GraphObject {
+            name: info.label.clone(),
+            inner: ImageData::TransientPrototype(info, allocation),
+        });
         handle
     }
-    pub fn create_buffer<N: Into<Cow<'static, str>>>(
+    pub fn create_buffer(
         &mut self,
         info: object::BufferCreateInfo,
         allocation: pumice_vma::AllocationCreateInfo,
-        name: N,
     ) -> GraphBuffer {
         let handle = GraphBuffer::new(self.0.input.buffers.len());
-        self.0.input.buffers.push(GraphObject::from_cow(
-            name.into(),
-            BufferData::TransientPrototype(info, allocation),
-        ));
+        self.0.input.buffers.push(GraphObject {
+            name: info.label.clone(),
+            inner: BufferData::TransientPrototype(info, allocation),
+        });
         handle
     }
     #[track_caller]
@@ -712,16 +718,12 @@ impl<'a> GraphPassBuilder<'a> {
         let mut access = vk::AccessFlags2KHR::default();
         let mut stages = vk::PipelineStageFlags2KHR::default();
         for i in &self.images {
-            if i.access.contains_write() {
-                access |= i.access;
-                stages |= i.stages;
-            }
+            access |= i.access;
+            stages |= i.stages;
         }
         for b in &self.buffers {
-            if b.access.contains_write() {
-                access |= b.access;
-                stages |= b.stages;
-            }
+            access |= b.access;
+            stages |= b.stages;
         }
 
         PassData {

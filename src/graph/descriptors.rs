@@ -9,7 +9,7 @@ use pumice::{util::ObjectHandle, vk, DeviceWrapper, VulkanResult};
 use smallvec::SmallVec;
 
 use crate::{
-    device::Device,
+    device::{debug::maybe_attach_debug_label, Device},
     graph::allocator::round_up_pow2_usize,
     object::{self, DescriptorBinding, ObjRef},
 };
@@ -82,12 +82,12 @@ impl DescriptorAllocator {
         }));
     }
     pub(crate) unsafe fn destroy(&mut self, device: &Device) {
-        for &pool in &self.pools {
+        for &pool in self.pools.iter().chain(&self.free_pools) {
             device
                 .device()
                 .destroy_descriptor_pool(pool, device.allocator_callbacks());
         }
-        for buffer in &self.buffers {
+        for buffer in self.buffers.iter().chain(&self.free_buffers) {
             device
                 .allocator()
                 .destroy_buffer(buffer.buffer, buffer.allocation)
@@ -179,6 +179,8 @@ impl DescriptorAllocator {
             .create_buffer(&buffer_info, &allocation_info)
             .unwrap();
 
+        maybe_attach_debug_label(buffer, &"DescriptorAllocator buffer", device);
+
         let start: NonNull<u8> = NonNull::new(info.mapped_data.cast()).unwrap();
         let end = NonNull::new(start.as_ptr().add(info.size.try_into().unwrap())).unwrap();
 
@@ -223,7 +225,7 @@ impl DescriptorAllocator {
     pub(crate) unsafe fn allocate_uniform_element<T>(
         &mut self,
         device: &Device,
-        value: T,
+        value: &T,
     ) -> UniformResult {
         let layout = std::alloc::Layout::new::<T>();
         let uniform = self.allocate_uniform_raw(device, layout);
@@ -234,7 +236,7 @@ impl DescriptorAllocator {
             memory,
         } = uniform;
         let ptr = memory.as_ptr().cast::<T>();
-        *ptr = value;
+        std::ptr::copy_nonoverlapping(value, ptr, 1);
 
         UniformResult {
             dynamic_offset,
@@ -696,6 +698,9 @@ pub struct FinishedSet<'a> {
 }
 
 impl<'a> FinishedSet<'a> {
+    pub unsafe fn into_raw(self) -> (vk::DescriptorSet, SmallVec<[u32; 4]>) {
+        (self.set, self.dynamic_offsets)
+    }
     pub unsafe fn bind(
         &self,
         bind_point: vk::PipelineBindPoint,

@@ -15,7 +15,7 @@ pumice-vma = {git = "https://github.com/mihavlic/pumice-vma.git"}
 spirq = "0.6.3"
 
 ahash = {version = "0.8.2", default-features = false, features = ["std"]}
-smallvec = {version = "1.10.0", features = ["union", "const_generics"]}
+smallvec = {version = "1.10.0", features = ["union", "const_generics", "write"]}
 parking_lot = {version = "0.12.1", features = ["send_guard"]}
 rayon = "1.6.1"
 slice-group-by = "0.3.0"
@@ -44,4 +44,4 @@ debug = 1
 
 [profile.dev.package.winit]
 opt-level = 1
-debug = 1
+debug = true

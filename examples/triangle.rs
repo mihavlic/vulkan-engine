@@ -6,9 +6,10 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::{io, slice};
 
-use graph::device::reflection::ReflectedLayout;
+use graph::device::reflection::{ReflectedLayout, SpirvModule};
 use graph::device::{self, read_spirv, DeviceCreateInfo, QueueFamilySelection};
 use graph::graph::compile::GraphCompiler;
+use graph::graph::execute::GraphRunConfig;
 use graph::instance::{Instance, InstanceCreateInfo, OwnedInstance};
 use graph::object::{self, ImageCreateInfo, PipelineStage, SwapchainCreateInfo};
 use graph::passes::{self, ClearImage, SimpleShader};
@@ -55,6 +56,7 @@ fn main() {
                 // pumice::cstr!("VK_LAYER_LUNARG_api_dump"),
             ],
             enable_debug_callback: true,
+            debug_labeling: true,
             app_name: "test application".to_owned(),
             verbose: false,
         };
@@ -135,8 +137,20 @@ fn main() {
         let frag_module = device.create_shader_module_spirv(&frag_spirv).unwrap();
 
         let pipeline_layout = ReflectedLayout::new(&[
-            (&vert_spirv, &["main"], true),
-            (&frag_spirv, &["main"], true),
+            SpirvModule {
+                spirv: &vert_spirv,
+                entry_points: &["main"],
+                dynamic_uniform_buffers: true,
+                dynamic_storage_buffers: false,
+                include_unused_descriptors: false,
+            },
+            SpirvModule {
+                spirv: &frag_spirv,
+                entry_points: &["main"],
+                dynamic_uniform_buffers: true,
+                dynamic_storage_buffers: false,
+                include_unused_descriptors: false,
+            },
         ])
         .create(&device, vk::DescriptorSetLayoutCreateFlags::empty())
         .unwrap();
@@ -200,7 +214,7 @@ fn main() {
         let pipeline = device.create_delayed_graphics_pipeline(pipeline_info);
 
         let mut compiler = GraphCompiler::new();
-        let mut graph = compiler.compile(device.clone(), |b| {
+        let graph = compiler.compile(device.clone(), |b| {
             let queue = b.import_queue(queue);
             let swapchain = b.acquire_swapchain(swapchain.clone());
             b.add_pass(
@@ -225,7 +239,11 @@ fn main() {
             );
         });
 
-        event_loop.run(move |event, _, control_flow| {
+        let mut graph = Some(graph);
+        let mut device = Some(device);
+        let mut swapchain = Some(swapchain);
+
+        event_loop.run_return(move |event, _, control_flow| {
             control_flow.set_poll();
 
             match event {
@@ -238,7 +256,7 @@ fn main() {
                             width: size.width,
                             height: size.height,
                         };
-                        swapchain.surface_resized(extent);
+                        swapchain.as_ref().unwrap().surface_resized(extent);
                     }
                     _ => {}
                 },
@@ -246,8 +264,19 @@ fn main() {
                     window.request_redraw();
                 }
                 Event::RedrawRequested(req) => {
-                    graph.run();
-                    device.idle_cleanup_poll();
+                    let status = graph.as_mut().unwrap().run(GraphRunConfig {
+                        swapchain_acquire_timeout_ns: 1000_000_000 / 2,
+                        acquire_swapchain_with_fence: false,
+                        return_after_swapchain_recreate: false,
+                    });
+                    device.as_ref().unwrap().idle_cleanup_poll();
+                }
+                Event::LoopDestroyed => {
+                    drop(graph.take());
+                    drop(swapchain.take());
+                    let device = device.take().unwrap();
+                    device.drain_work();
+                    device.attempt_destroy().unwrap();
                 }
                 _ => (),
             }
@@ -268,6 +297,25 @@ unsafe fn make_swapchain(
         }
     };
 
+    let (present_modes, result) = device
+        .instance()
+        .handle()
+        .get_physical_device_surface_present_modes_khr(
+            device.physical_device(),
+            surface.handle(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(result, vk::Result::SUCCESS);
+
+    let mut present_mode = vk::PresentModeKHR::FIFO;
+    // for mode in present_modes {
+    //     if mode == vk::PresentModeKHR::MAILBOX {
+    //         present_mode = vk::PresentModeKHR::MAILBOX;
+    //         break;
+    //     }
+    // }
+
     // TODO swapchain configuration fallback for formats, present modes, and color spaces
     let info = SwapchainCreateInfo {
         surface: surface.into_raw(),
@@ -280,7 +328,7 @@ unsafe fn make_swapchain(
         usage: vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST,
         pre_transform: vk::SurfaceTransformFlagsKHR::IDENTITY,
         composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
-        present_mode: vk::PresentModeKHR::FIFO,
+        present_mode,
         clipped: false,
     };
 

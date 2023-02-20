@@ -37,6 +37,7 @@ pub struct Instance {
 
     pub(crate) debug_messenger: Option<pumice::extensions::ext_debug_utils::DebugUtilsMessengerEXT>,
 
+    pub(crate) debug_labeling: bool,
     pub(crate) allocation_callbacks: Option<vk::AllocationCallbacks>,
 
     #[allow(unused)]
@@ -54,6 +55,7 @@ pub struct InstanceCreateInfo<'a, 'b> {
     pub config: &'a mut ApiLoadConfig<'b>,
     pub validation_layers: &'a [&'a CStr],
     pub enable_debug_callback: bool,
+    pub debug_labeling: bool,
     pub app_name: String,
     pub verbose: bool,
 }
@@ -76,6 +78,7 @@ impl Instance {
             config,
             validation_layers,
             enable_debug_callback,
+            debug_labeling,
             app_name,
             verbose,
         } = info;
@@ -272,6 +275,7 @@ impl Instance {
             instance,
             physical_devices,
             physical_device_properties,
+            debug_labeling,
             debug_messenger,
             allocation_callbacks,
             instance_table,
@@ -295,6 +299,9 @@ impl Instance {
     }
     pub fn app_name(&self) -> &str {
         &self.application_name
+    }
+    pub fn debug(&self) -> bool {
+        self.debug_labeling
     }
 }
 

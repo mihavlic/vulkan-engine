@@ -1,4 +1,4 @@
-use std::{mem::ManuallyDrop, ptr::NonNull};
+use std::{mem::ManuallyDrop, ptr::NonNull, time::Duration};
 
 use ahash::HashSet;
 use pumice::VulkanResult;
@@ -51,8 +51,9 @@ impl<T: Object<Storage = Self>> ObjectStorage<T> for SimpleStorage<T> {
         } = *alloc;
 
         self.lock.with_locked(|lock| {
+            std::thread::sleep(Duration::from_millis(20));
             let is_true = self.handles.get_mut(lock).remove(&handle);
-            assert!(is_true == true);
+            assert!(is_true == true, "Double free detected");
             T::destroy(&object_data, lock, parent.as_ref())
         })
     }

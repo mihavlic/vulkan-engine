@@ -1,11 +1,12 @@
 pub mod batch;
+pub mod debug;
 pub mod reflection;
 pub mod submission;
 
 use self::{batch::GenerationManager, submission::SubmissionManager};
 use super::instance::InstanceCreateInfo;
 use crate::{
-    instance::Instance,
+    instance::{self, Instance},
     object::{
         self, create_compute_pipeline_impl, Buffer, ComputePipeline, DescriptorSetLayout,
         GraphicsPipeline, Image, PipelineLayout, RenderPass, RenderPassMode, Sampler, ShaderModule,
@@ -32,6 +33,7 @@ use std::{
     ffi::{c_void, CStr},
     fmt::Display,
     io,
+    mem::ManuallyDrop,
     ops::Deref,
     ptr::NonNull,
     slice,
@@ -69,7 +71,7 @@ pub struct DeviceCreateInfo<'a> {
 }
 
 pub struct Device {
-    thread_pool: rayon::ThreadPool,
+    threadpool: ManuallyDrop<rayon::ThreadPool>,
     pipeline_cache: vk::PipelineCache,
 
     pub(crate) device: pumice::DeviceWrapper,
@@ -110,6 +112,21 @@ pub struct Device {
 
 #[derive(Clone)]
 pub struct OwnedDevice(pub(crate) Arc<Device>);
+
+impl OwnedDevice {
+    pub unsafe fn attempt_destroy(self) -> Result<(), ()> {
+        match Arc::try_unwrap(self.0) {
+            Ok(unique) => {
+                drop(unique);
+                Ok(())
+            }
+            Err(returned) => {
+                drop(returned);
+                Err(())
+            }
+        }
+    }
+}
 
 impl Deref for OwnedDevice {
     type Target = Device;
@@ -251,14 +268,14 @@ impl Device {
         };
 
         let name = instance.app_name().to_owned();
-        let thread_pool = rayon::ThreadPoolBuilder::new()
+        let threadpool = rayon::ThreadPoolBuilder::new()
             .thread_name(move |i| format!("{name} worker #{i}"))
             .build()
             .unwrap();
 
         let inner = Device {
             pipeline_cache: vk::PipelineCache::null(),
-            thread_pool,
+            threadpool: ManuallyDrop::new(threadpool),
 
             instance,
             device,
@@ -301,7 +318,7 @@ impl Device {
         self.physical_device
     }
     pub fn threadpool(&self) -> &rayon::ThreadPool {
-        &self.thread_pool
+        &self.threadpool
     }
     pub fn allocator(&self) -> &Allocator {
         &self.allocator
@@ -455,9 +472,9 @@ impl Device {
         self.device()
             .create_semaphore(&info, self.allocator_callbacks())
     }
-    pub unsafe fn create_raw_fence(&self, signalled: bool) -> VulkanResult<vk::Fence> {
+    pub unsafe fn create_raw_fence(&self, signaled: bool) -> VulkanResult<vk::Fence> {
         let info = vk::FenceCreateInfo {
-            flags: if signalled {
+            flags: if signaled {
                 vk::FenceCreateFlags::SIGNALED
             } else {
                 vk::FenceCreateFlags::empty()
@@ -467,8 +484,6 @@ impl Device {
         self.device()
             .create_fence(&info, self.allocator_callbacks())
     }
-    /// Create descriptor layouts and a pipeline layout from spirv data
-
     pub unsafe fn destroy_raw_semaphore(&self, semaphore: vk::Semaphore) {
         self.device()
             .destroy_semaphore(semaphore, self.allocator_callbacks())
@@ -476,6 +491,19 @@ impl Device {
     pub unsafe fn destroy_raw_fence(&self, fence: vk::Fence) {
         self.device()
             .destroy_fence(fence, self.allocator_callbacks())
+    }
+    pub fn instance(&self) -> &instance::OwnedInstance {
+        &self.instance
+    }
+    pub fn debug(&self) -> bool {
+        self.instance.debug()
+    }
+    pub fn drain_work(&self) {
+        self.wait_idle();
+        let mut synchronization_manager = self.synchronization_manager.write();
+        let mut generation_manager = self.generation_manager.write();
+        synchronization_manager.wait_all(&self);
+        unsafe { generation_manager.clear() };
     }
 }
 
@@ -488,14 +516,14 @@ impl Drop for Device {
     // the users to not do that
     fn drop(&mut self) {
         unsafe {
+            let threadpool = ManuallyDrop::take(&mut self.threadpool);
+            drop(threadpool);
+
+            self.drain_work();
+
             let callbacks = self.allocator_callbacks();
 
-            // we do both device_wait_idle and then also wait on all the registered semaphores
-            // since validation layers complain otherwise
-            let mut write = self.synchronization_manager.write();
-            write.wait_all(self);
-            // self.wait_idle();
-            write.destroy(self);
+            self.synchronization_manager.write().destroy(self);
             self.generation_manager.write().destroy(self);
 
             if self.pipeline_cache != vk::PipelineCache::null() {
@@ -517,6 +545,8 @@ impl Drop for Device {
             self.swapchain_storage.cleanup();
 
             self.render_passes.cleanup();
+
+            pumice_vma::vmaDestroyAllocator(self.allocator.clone());
 
             self.device().destroy_device(callbacks);
         }
@@ -555,6 +585,7 @@ fn test_device() {
             usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
             sharing_mode_concurrent: false,
             initial_layout: vk::ImageLayout::UNDEFINED,
+            ..Default::default()
         };
         let allocation_info = AllocationCreateInfo {
             flags: AllocationCreateFlags::MAPPED,
@@ -577,6 +608,7 @@ pub(crate) unsafe fn __test_init_device(mock_device: bool) -> OwnedDevice {
         config: &mut conf,
         validation_layers: &[pumice::cstr!("VK_LAYER_KHRONOS_validation")],
         enable_debug_callback: true,
+        debug_labeling: true,
         app_name: "test_context_new".to_owned(),
         verbose: false,
     };

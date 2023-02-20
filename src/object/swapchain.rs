@@ -9,6 +9,7 @@ use crate::storage::nostore::SimpleStorage;
 use crate::storage::{MutableShared, SynchronizationLock};
 use pumice::util::ObjectHandle;
 use pumice::vk;
+use pumice::vk10::Extent2D;
 use pumice::VulkanResult;
 
 #[derive(PartialEq, Eq, Hash)]
@@ -37,6 +38,7 @@ pub enum SwapchainAcquireStatus {
     // so VK_TIMEOUT and VK_NOT_READY do not actually acquire a valid image even though they are not error codes
     /// True if the acquired image is suboptimal
     Ok(u32, bool),
+    Stashed(StashedImage),
     Err(vk::Result),
 }
 
@@ -62,13 +64,23 @@ impl SwapchainImage {
     }
 }
 
+#[derive(Clone)]
+pub struct StashedImage {
+    pub index: u32,
+    pub semaphore: vk::Semaphore,
+    pub fence: vk::Fence,
+    pub suboptimal: bool,
+}
+
 pub(crate) struct SwapchainMutableState {
     swapchain: vk::SwapchainKHR,
     current_extent: vk::Extent2D,
     // signals that the surace has been resized and we need to recreate it the next time we acquire an image
     // this extent overrides the extent provided in SwapchainCreateInfo
+    next_out_of_date: bool,
     resized_to: Option<vk::Extent2D>,
     images: Vec<SwapchainImage>,
+    stashed_image: Option<StashedImage>,
 }
 
 impl SwapchainMutableState {
@@ -78,11 +90,13 @@ impl SwapchainMutableState {
             current_extent: vk::Extent2D::default(),
             resized_to: None,
             images: Vec::new(),
+            next_out_of_date: false,
+            stashed_image: None,
         };
 
         state.recreate(create_info, ctx).map(|_| state)
     }
-    /// Before calling this function, you must ensure that no access to the swapchain is occuring
+    /// Before calling this function, you must ensure that no access to the swapchain is occuring, whatever that means
     pub unsafe fn recreate(
         &mut self,
         create_info: &SwapchainCreateInfo,
@@ -120,6 +134,7 @@ impl SwapchainMutableState {
 
         self.current_extent = extent.clone();
         self.resized_to = None;
+        self.next_out_of_date = false;
 
         let max_image_count = if surface_info.max_image_count == 0 {
             u32::MAX
@@ -149,6 +164,10 @@ impl SwapchainMutableState {
             .create_swapchain_khr(&create_info, ctx.allocator_callbacks())?;
 
         if create_info.old_swapchain != vk::SwapchainKHR::null() {
+            assert!(
+                self.stashed_image.is_none(),
+                "Destroying a swapchain while its images are acquired is disallowed"
+            );
             ctx.device()
                 .destroy_swapchain_khr(create_info.old_swapchain, ctx.allocator_callbacks());
         }
@@ -182,30 +201,55 @@ impl SwapchainMutableState {
     pub unsafe fn acquire_image(
         &mut self,
         timeout: u64,
-        semaphore: vk::Semaphore,
-        fence: vk::Fence,
+        arguments: impl FnOnce() -> (vk::Semaphore, vk::Fence),
+        stash_acquired: bool,
         ctx: &Device,
     ) -> SwapchainAcquireStatus {
-        if self.resized_to.is_some() {
+        if let Some(stashed) = self.stashed_image.clone() {
+            if !stash_acquired {
+                self.stashed_image = None;
+            }
+
+            return SwapchainAcquireStatus::Stashed(stashed);
+        }
+
+        if self.resized_to.is_some() || self.next_out_of_date {
             return SwapchainAcquireStatus::OutOfDate;
         }
+
+        let (semaphore, fence) = arguments();
 
         let result = ctx
             .device()
             .acquire_next_image_khr(self.swapchain, timeout, semaphore, fence);
 
         match result {
-            Ok((index, vk::Result::SUCCESS)) => SwapchainAcquireStatus::Ok(index, false),
-            Ok((_index, vk::Result::TIMEOUT | vk::Result::NOT_READY)) => {
-                return SwapchainAcquireStatus::Timeout
+            Ok((index, res @ (vk::Result::SUCCESS | vk::Result::SUBOPTIMAL_KHR))) => {
+                let suboptimal = res == vk::Result::SUBOPTIMAL_KHR;
+                if stash_acquired {
+                    self.stash_acquired_image(StashedImage {
+                        index,
+                        semaphore,
+                        fence,
+                        suboptimal,
+                    })
+                }
+                SwapchainAcquireStatus::Ok(index, suboptimal)
             }
-            Ok((index, vk::Result::SUBOPTIMAL_KHR)) => {
-                return SwapchainAcquireStatus::Ok(index, true)
+            Ok((_, vk::Result::TIMEOUT | vk::Result::NOT_READY)) => {
+                return SwapchainAcquireStatus::Timeout
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return SwapchainAcquireStatus::OutOfDate,
             Err(err) => return SwapchainAcquireStatus::Err(err),
             Ok((_, res)) => unreachable!("Invalid Ok result value: {:?}", res),
         }
+    }
+    pub fn stash_acquired_image(&mut self, stash: StashedImage) {
+        assert!(self.stashed_image.is_none());
+        self.stashed_image = Some(stash);
+    }
+    pub unsafe fn clear_stashed_image(&mut self) {
+        self.stashed_image = None;
     }
     pub unsafe fn get_view(
         &mut self,
@@ -217,10 +261,18 @@ impl SwapchainMutableState {
         let swapchain_image = &mut self.images[image_index as usize];
         swapchain_image
             .state
-            .get_view(swapchain_image.image, info, batch_id, device)
+            .get_view(swapchain_image.image, info, batch_id, None, device)
     }
     pub fn surface_resized(&mut self, new_extent: vk::Extent2D) {
         self.resized_to = Some(new_extent);
+    }
+    pub fn set_next_out_of_date(&mut self) {
+        self.next_out_of_date = true;
+    }
+    pub fn get_extent(&self) -> Extent2D {
+        self.resized_to
+            .clone()
+            .unwrap_or(self.current_extent.clone())
     }
     pub fn get_swapchain(&self, _image_index: u32) -> vk::SwapchainKHR {
         self.swapchain
@@ -344,11 +396,6 @@ impl Swapchain {
         )
     }
     pub fn get_extent(&self) -> vk::Extent2D {
-        unsafe {
-            self.0.access_mutable(
-                |d| &d.mutable,
-                |s| s.resized_to.clone().unwrap_or(s.current_extent.clone()),
-            )
-        }
+        unsafe { self.0.access_mutable(|d| &d.mutable, |s| s.get_extent()) }
     }
 }

@@ -1,4 +1,6 @@
 use std::{
+    borrow::Cow,
+    fmt::Display,
     hash::{Hash, Hasher},
     ptr,
 };
@@ -7,6 +9,7 @@ use crate::{
     arena::uint::OptionalU32,
     device::{
         batch::GenerationId,
+        debug::maybe_attach_debug_label,
         submission::{QueueSubmission, ReaderWriterState},
         Device,
     },
@@ -18,12 +21,13 @@ use smallvec::SmallVec;
 
 use super::{ObjHandle, Object, ObjectData, SynchronizationState, SynchronizeResult};
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct BufferCreateInfo {
     pub flags: vk::BufferCreateFlags,
     pub size: u64,
     pub usage: vk::BufferUsageFlags,
     pub sharing_mode_concurrent: bool,
+    pub label: Option<Cow<'static, str>>,
 }
 
 impl BufferCreateInfo {
@@ -57,7 +61,6 @@ impl BufferSynchronizationState {
 #[derive(Clone, Hash)]
 pub struct BufferViewCreateInfo {
     pub flags: vk::BufferViewCreateFlags,
-    pub buffer: vk::Buffer,
     pub format: vk::Format,
     pub offset: vk::DeviceSize,
     pub range: vk::DeviceSize,
@@ -96,9 +99,10 @@ impl BufferMutableState {
     }
     pub unsafe fn get_view(
         &mut self,
-        _self_handle: vk::Buffer,
+        self_handle: vk::Buffer,
         info: &BufferViewCreateInfo,
         batch_id: GenerationId,
+        label: Option<&dyn Display>,
         device: &Device,
     ) -> VulkanResult<vk::BufferView> {
         let hash = info.get_hash();
@@ -109,7 +113,7 @@ impl BufferMutableState {
         } else {
             let raw = vk::BufferViewCreateInfo {
                 flags: info.flags,
-                buffer: info.buffer,
+                buffer: self_handle,
                 format: info.format,
                 offset: info.offset,
                 range: info.range,
@@ -119,6 +123,10 @@ impl BufferMutableState {
             let view = device
                 .device()
                 .create_buffer_view(&raw, device.allocator_callbacks())?;
+
+            if let Some(label) = label {
+                maybe_attach_debug_label(view, label, device);
+            }
 
             let entry = BufferViewEntry {
                 handle: view,
@@ -199,11 +207,17 @@ impl Object for Buffer {
         let buffer_info = data.0.to_vk();
         ctx.allocator
             .create_buffer(&buffer_info, &data.1)
-            .map(|(handle, allocation, _)| BufferState {
-                handle,
-                info: data.0,
-                allocation,
-                mutable: MutableShared::new(BufferMutableState::new()),
+            .map(|(handle, allocation, _)| {
+                if let Some(label) = data.0.label.as_ref() {
+                    maybe_attach_debug_label(handle, &label, ctx);
+                }
+
+                BufferState {
+                    handle,
+                    info: data.0,
+                    allocation,
+                    mutable: MutableShared::new(BufferMutableState::new()),
+                }
             })
     }
     unsafe fn destroy(

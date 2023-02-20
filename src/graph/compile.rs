@@ -18,6 +18,7 @@ use crate::{
     arena::uint::{Config, OptionalU32, PackedUint},
     device::{
         batch::GenerationId,
+        debug::maybe_attach_debug_label,
         submission::{self, QueueSubmission},
         Device, OwnedDevice,
     },
@@ -1505,6 +1506,22 @@ impl GraphCompiler {
             }
         }
 
+        // for (i, p) in self.input.passes.iter().enumerate() {
+        //     let pass = GraphPass::new(i);
+        //     println!("Pass: {}", self.input.get_pass_display(pass));
+        //     print!("  dependencies: ");
+        //     let mut first = true;
+        //     for d in &p.dependencies {
+        //         if !first {
+        //             print!(", ");
+        //         }
+        //         first = false;
+        //         let prefix = if d.is_hard() { "!" } else { "" };
+        //         print!("{prefix}\"{}\"", self.input.get_pass_display(d.get_pass()))
+        //     }
+        //     println!();
+        // }
+
         struct GraphFacade<'a>(&'a CompilationInput, ());
         impl<'a> NodeGraph for GraphFacade<'a> {
             type NodeData = ();
@@ -1795,7 +1812,7 @@ impl GraphCompiler {
                                         // TODO reconsider if it would be useful to be able to specify more granular dependencies
                                         src_stages: vk::PipelineStageFlags2KHR::ALL_COMMANDS,
                                         dst_stages: data.stages,
-                                        src_access: vk::AccessFlags2KHR::all(),
+                                        src_access: vk::AccessFlags2KHR::MEMORY_WRITE,
                                         dst_access: data.access,
                                     });
                                 }
@@ -2011,7 +2028,7 @@ impl GraphCompiler {
 
                 for (i, &p) in submission.passes.iter().enumerate() {
                     let data = self.input.get_pass_data(p);
-                    let device_wrapper = device.device();
+                    let d = device.device();
 
                     need_alloc.clear();
                     for a in &data.images {
@@ -2020,12 +2037,15 @@ impl GraphCompiler {
                         {
                             let vk_info = create_info.to_vk();
                             let image = unsafe {
-                                device_wrapper
-                                    .create_image(&vk_info, device.allocator_callbacks())
+                                d.create_image(&vk_info, device.allocator_callbacks())
                                     .unwrap()
                             };
-                            let requirements =
-                                unsafe { device_wrapper.get_image_memory_requirements(image) };
+                            maybe_attach_debug_label(
+                                image,
+                                &self.input.get_image_display(a.handle),
+                                &device,
+                            );
+                            let requirements = unsafe { d.get_image_memory_requirements(image) };
                             need_alloc.push((
                                 NeedAlloc::Image {
                                     vkhandle: image,
@@ -2041,12 +2061,15 @@ impl GraphCompiler {
                         {
                             let vk_info = create_info.to_vk();
                             let buffer = unsafe {
-                                device_wrapper
-                                    .create_buffer(&vk_info, device.allocator_callbacks())
+                                d.create_buffer(&vk_info, device.allocator_callbacks())
                                     .unwrap()
                             };
-                            let requirements =
-                                unsafe { device_wrapper.get_buffer_memory_requirements(buffer) };
+                            maybe_attach_debug_label(
+                                buffer,
+                                &self.input.get_buffer_display(a.handle),
+                                &device,
+                            );
+                            let requirements = unsafe { d.get_buffer_memory_requirements(buffer) };
                             need_alloc.push((
                                 NeedAlloc::Buffer {
                                     vkhandle: buffer,
@@ -2322,6 +2345,15 @@ impl GraphCompiler {
         )));
 
         CompiledGraph {
+            state: MainCompiledGraphVulkanState::new(
+                device,
+                &*suballocators,
+                std::mem::take(&mut self.pass_objects),
+                std::mem::take(&mut self.physical_images),
+                std::mem::take(&mut self.physical_buffers),
+                &self.input,
+            ),
+
             input: std::mem::take(&mut self.input),
             timeline: std::mem::take(&mut self.input.timeline),
             submissions,
@@ -2334,14 +2366,7 @@ impl GraphCompiler {
 
             current_generation: Cell::new(None),
             prev_generation: Cell::new(None),
-
-            state: MainCompiledGraphVulkanState::new(
-                device,
-                &*suballocators,
-                std::mem::take(&mut self.pass_objects),
-                std::mem::take(&mut self.physical_images),
-                std::mem::take(&mut self.physical_buffers),
-            ),
+            early_returned: Cell::new(false),
         }
     }
 
@@ -2897,11 +2922,4 @@ fn submission_fill_reuse<T: ResourceMarker>(
             }
         }
     }
-}
-
-pub(crate) struct SwapchainPresent {
-    pub(crate) vkhandle: vk::SwapchainKHR,
-    pub(crate) image_index: u32,
-    pub(crate) image_acquire: vk::Semaphore,
-    pub(crate) image_release: vk::Semaphore,
 }

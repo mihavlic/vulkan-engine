@@ -1,4 +1,6 @@
 use std::{
+    borrow::Cow,
+    fmt::Display,
     hash::{Hash, Hasher},
     ptr,
 };
@@ -8,7 +10,12 @@ use smallvec::{smallvec, SmallVec};
 
 use crate::{
     arena::uint::OptionalU32,
-    device::{batch::GenerationId, submission::QueueSubmission, Device},
+    device::{
+        batch::GenerationId,
+        debug::{maybe_attach_debug_label, LazyDisplay},
+        submission::QueueSubmission,
+        Device,
+    },
     graph::resource_marker::{ImageMarker, ResourceMarker, TypeOption, TypeSome},
     storage::{constant_ahash_hasher, nostore::SimpleStorage, MutableShared, SynchronizationLock},
 };
@@ -20,6 +27,12 @@ pub enum Extent {
     D1(u32),
     D2(u32, u32),
     D3(u32, u32, u32),
+}
+
+impl Default for Extent {
+    fn default() -> Self {
+        Self::D2(0, 0)
+    }
 }
 
 impl Extent {
@@ -69,7 +82,7 @@ impl Extent {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct ImageCreateInfo {
     pub flags: vk::ImageCreateFlags,
     pub size: Extent,
@@ -81,6 +94,7 @@ pub struct ImageCreateInfo {
     pub usage: vk::ImageUsageFlags,
     pub sharing_mode_concurrent: bool,
     pub initial_layout: vk::ImageLayout,
+    pub label: Option<Cow<'static, str>>,
 }
 
 impl ImageCreateInfo {
@@ -203,7 +217,7 @@ impl ImageViewCreateInfo {
             ..Default::default()
         }
     }
-    fn get_hash(&self) -> u32 {
+    pub fn get_hash(&self) -> u32 {
         let mut hasher = constant_ahash_hasher();
         self.hash(&mut hasher);
 
@@ -238,6 +252,7 @@ impl ImageMutableState {
         self_handle: vk::Image,
         info: &ImageViewCreateInfo,
         batch_id: GenerationId,
+        label: Option<&dyn Display>,
         device: &Device,
     ) -> VulkanResult<vk::ImageView> {
         let hash = info.get_hash();
@@ -251,6 +266,10 @@ impl ImageMutableState {
             let view = device
                 .device()
                 .create_image_view(&raw, device.allocator_callbacks())?;
+
+            if let Some(label) = label {
+                maybe_attach_debug_label(view, label, device);
+            }
 
             let entry = ImageViewEntry {
                 handle: view,
@@ -334,11 +353,16 @@ impl Object for Image {
         let image_info = data.0.to_vk();
         ctx.allocator
             .create_image(&image_info, &data.1)
-            .map(|(handle, allocation, _)| ImageState {
-                handle,
-                mutable: MutableShared::new(ImageMutableState::new(data.0.initial_layout)),
-                info: data.0,
-                allocation,
+            .map(|(handle, allocation, _)| {
+                if let Some(label) = data.0.label.as_ref() {
+                    maybe_attach_debug_label(handle, &label, ctx);
+                }
+                ImageState {
+                    handle,
+                    mutable: MutableShared::new(ImageMutableState::new(data.0.initial_layout)),
+                    info: data.0,
+                    allocation,
+                }
             })
     }
     unsafe fn destroy(
@@ -364,9 +388,19 @@ impl Image {
     ) -> VulkanResult<vk::ImageView> {
         let device = self.0.get_parent();
         let data = self.0.get_object_data();
+
+        let label = LazyDisplay(|f| {
+            write!(
+                f,
+                "{} view {:x}",
+                data.get_create_info().label.as_deref().unwrap_or("Image"),
+                info.get_hash()
+            )
+        });
+
         self.0.access_mutable(
             |d| &d.mutable,
-            |m| m.get_view(data.handle, info, batch_id, device),
+            |m| m.get_view(data.handle, info, batch_id, Some(&label), device),
         )
     }
 }

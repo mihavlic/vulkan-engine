@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    ops::Not,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -229,7 +230,7 @@ impl GenerationManager {
     ) -> VulkanResult<WaitResult> {
         // u64::MAX is specially cased by the specification to never ever end, try to preserve it
         let skip_time = timeout_ns == 0 || timeout_ns == u64::MAX;
-        let start = skip_time.then(|| std::time::Instant::now());
+        let start = skip_time.not().then(|| std::time::Instant::now());
         let mut remaining_timeout_ns = timeout_ns;
 
         while let Some(next) = self.batches.front() {
