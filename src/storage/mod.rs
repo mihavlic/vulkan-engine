@@ -112,6 +112,16 @@ impl ReentrantMutex {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct DefaultAhashRandomstate;
+
+impl BuildHasher for DefaultAhashRandomstate {
+    type Hasher = ahash::AHasher;
+    fn build_hasher(&self) -> Self::Hasher {
+        constant_ahash_randomstate().build_hasher()
+    }
+}
+
 pub(crate) fn constant_ahash_randomstate() -> ahash::RandomState {
     // seed pulled from the crate source
     const PI: [u64; 4] = [
