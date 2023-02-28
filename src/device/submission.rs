@@ -15,7 +15,16 @@ use crate::{
         debug::{maybe_attach_debug_label, DisplayConcat},
         Device,
     },
-    graph::task::SendUnsafeCell,
+    graph::{
+        compile::{
+            BufferBarrier, CombinedResourceHandle, GraphResource, ImageBarrier,
+            ResourceFirstAccessInterface,
+        },
+        execute::{DummySubmission, SubmissionExtra},
+        resource_marker::{ResourceMarker, TypeOption},
+        task::SendUnsafeCell,
+    },
+    object::{SynchronizationState, SynchronizeResult},
 };
 
 // little endian:
@@ -138,31 +147,22 @@ impl<T: Send> Drop for AtomicOption<T> {
 
 unsafe impl<T: Send> Send for AtomicOption<T> {}
 
-// the public version of SubmissionEntry
-pub struct SubmissionData {
-    pub queue_family: u32,
-    pub semaphore: TimelineSemaphore,
-}
-
 struct SubmissionEntry {
-    finalizer: AtomicOption<Option<Box<dyn FnOnce() + Send>>>,
-    queue_family: u32,
+    finalizer: AtomicOption<Option<Box<dyn FnOnce(&Device) + Send>>>,
+    // queue_family: u32,
     semaphore: SemaphoreEntry,
 }
 
 impl SubmissionEntry {
-    fn to_public(&self) -> SubmissionData {
-        SubmissionData {
-            queue_family: self.queue_family,
-            semaphore: self.semaphore.to_public(),
-        }
+    fn to_public(&self) -> TimelineSemaphore {
+        self.semaphore.to_public()
     }
     fn is_finished(&self) -> bool {
         self.finalizer.is_none()
     }
-    fn mark_finished(&self) {
+    fn mark_finished(&self, device: &Device) {
         if let Some(finalizer) = self.finalizer.take().unwrap() {
-            finalizer();
+            finalizer(device);
         }
     }
 }
@@ -187,7 +187,7 @@ impl SubmissionManager {
             semaphore_count: 0,
         }
     }
-    fn wait_for_submissions<T: IntoIterator<Item = QueueSubmission>>(
+    pub(crate) fn wait_for_submissions<T: IntoIterator<Item = QueueSubmission>>(
         &self,
         submissions: T,
         timeout_ns: u64,
@@ -229,7 +229,7 @@ impl SubmissionManager {
 
                 match result {
                     vk::Result::SUCCESS => {
-                        data.mark_finished();
+                        data.mark_finished(device);
                         true
                     }
                     vk::Result::TIMEOUT => {
@@ -259,24 +259,22 @@ impl SubmissionManager {
             return VulkanResult::Ok(WaitResult::AllFinished);
         }
     }
-    fn allocate(
+    pub(crate) fn allocate(
         &mut self,
-        queue_family: u32,
-        finalizer: Option<Box<dyn FnOnce() + Send>>,
+        finalizer: Option<Box<dyn FnOnce(&Device) + Send>>,
         device: &Device,
     ) -> (QueueSubmission, TimelineSemaphore) {
         let mut semaphore = self.get_fresh_semaphore(device);
         semaphore.bump_value();
         (
-            self.push_submission(semaphore, queue_family, finalizer, true),
+            self.push_submission(semaphore, finalizer, true),
             semaphore.to_public(),
         )
     }
     fn push_submission(
         &mut self,
         semaphore: SemaphoreEntry,
-        queue_family: u32,
-        finalizer: Option<Box<dyn FnOnce() + Send>>,
+        finalizer: Option<Box<dyn FnOnce(&Device) + Send>>,
         head: bool,
     ) -> QueueSubmission {
         let mut semaphore = semaphore;
@@ -284,28 +282,13 @@ impl SubmissionManager {
 
         let key = self.submissions.insert(SubmissionEntry {
             finalizer: AtomicOption::new(finalizer),
-            queue_family,
             semaphore,
         });
         QueueSubmission(key)
     }
     fn get_fresh_semaphore(&mut self, device: &Device) -> SemaphoreEntry {
         let semaphore = self.free_semaphores.pop().unwrap_or_else(|| {
-            let p_next = vk::SemaphoreTypeCreateInfoKHR {
-                semaphore_type: vk::SemaphoreTypeKHR::TIMELINE,
-                initial_value: 0,
-                ..Default::default()
-            };
-            let info = vk::SemaphoreCreateInfo {
-                p_next: &p_next as *const _ as *const c_void,
-                ..Default::default()
-            };
-            let raw = unsafe {
-                device
-                    .device()
-                    .create_semaphore(&info, device.allocator_callbacks())
-                    .unwrap()
-            };
+            let raw = unsafe { device.create_raw_timeline_semaphore().unwrap() };
             maybe_attach_debug_label(
                 raw,
                 &DisplayConcat::new(&[&"Submission timeline semaphore ", &self.semaphore_count]),
@@ -322,10 +305,13 @@ impl SubmissionManager {
 
         semaphore
     }
-    fn is_submission_finished(&self, submission: QueueSubmission) -> bool {
+    pub(crate) fn is_submission_finished(&self, submission: QueueSubmission) -> bool {
         self.submissions.get(submission.0).is_none()
     }
-    fn get_submission_data(&self, submission: QueueSubmission) -> Option<SubmissionData> {
+    pub(crate) fn get_submission_data(
+        &self,
+        submission: QueueSubmission,
+    ) -> Option<TimelineSemaphore> {
         self.submissions
             .get(submission.0)
             .map(SubmissionEntry::to_public)
@@ -381,13 +367,12 @@ pub struct AllocateSequential<'a> {
 impl<'a> AllocateSequential<'a> {
     fn alloc(
         &mut self,
-        queue_family: u32,
-        finalizer: Option<Box<dyn FnOnce() + Send>>,
+        finalizer: Option<Box<dyn FnOnce(&Device) + Send>>,
     ) -> (QueueSubmission, TimelineSemaphore) {
         self.semaphore.bump_value();
         let key = self
             .manager
-            .push_submission(self.semaphore, queue_family, finalizer, false);
+            .push_submission(self.semaphore, finalizer, false);
         self.last = Some(key);
         (key, self.semaphore.to_public())
     }
@@ -434,47 +419,35 @@ impl Device {
     }
     pub fn make_submission(
         &self,
-        queue_family: u32,
-        finalizer: Option<Box<dyn FnOnce() + Send>>,
+        finalizer: Option<Box<dyn FnOnce(&Device) + Send>>,
     ) -> (QueueSubmission, TimelineSemaphore) {
         self.synchronization_manager
             .write()
-            .allocate(queue_family, finalizer, self)
+            .allocate(finalizer, self)
     }
     pub fn is_submission_finished(&self, submission: QueueSubmission) -> bool {
         self.synchronization_manager
             .read()
             .is_submission_finished(submission)
     }
-    pub fn get_submission_data(&self, submission: QueueSubmission) -> Option<SubmissionData> {
+    pub fn get_submission_data(&self, submission: QueueSubmission) -> Option<TimelineSemaphore> {
         self.synchronization_manager
             .read()
             .get_submission_data(submission)
     }
-    pub fn collect_active_submission_datas<E: Extend<SubmissionData>>(
+    pub fn collect_active_submission_datas(
         &self,
         submissions: impl IntoIterator<Item = QueueSubmission>,
-        mut extend: &mut E,
-    ) {
-        self.collect_active_submission_datas_map(submissions, extend, |x| x)
-    }
-    pub fn collect_active_submission_datas_map<O, E: Extend<O>, F: FnMut(SubmissionData) -> O>(
-        &self,
-        submissions: impl IntoIterator<Item = QueueSubmission>,
-        mut extend: &mut E,
-        fun: F,
+        mut extend: &mut impl Extend<TimelineSemaphore>,
     ) {
         let guard = self.synchronization_manager.read();
-        let iter = submissions
-            .into_iter()
-            .filter_map(|s| {
-                guard
-                    .submissions
-                    .get(s.0)
-                    .filter(|e| !e.is_finished())
-                    .map(SubmissionEntry::to_public)
-            })
-            .map(fun);
+        let iter = submissions.into_iter().filter_map(|s| {
+            guard
+                .submissions
+                .get(s.0)
+                .filter(|e| !e.is_finished())
+                .map(SubmissionEntry::to_public)
+        });
         extend.extend(iter);
     }
     pub fn filter_active_submissions<E: Extend<QueueSubmission>>(
@@ -517,24 +490,3 @@ impl Device {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct QueueSubmission(U32Key);
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ReaderWriterState {
-    Read(SmallVec<[QueueSubmission; 4]>),
-    Write(QueueSubmission),
-    None,
-}
-
-impl ReaderWriterState {
-    pub fn write(&mut self) -> Synchronize {
-        todo!()
-    }
-    pub fn read(&mut self) -> Synchronize {
-        todo!()
-    }
-}
-
-pub enum Synchronize {
-    Barrier {},
-    None,
-}

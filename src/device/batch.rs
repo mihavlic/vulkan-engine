@@ -28,7 +28,7 @@ struct OpenGenerationEntry {
     id: GenerationId,
     mutex: parking_lot::RawMutex,
     submissions: SendUnsafeCell<ahash::HashSet<QueueSubmission>>,
-    finalizer: SendUnsafeCell<Option<Box<dyn FnOnce() + Send>>>,
+    finalizer: SendUnsafeCell<Option<Box<dyn FnOnce(&Device) + Send>>>,
 }
 
 enum GenerationEntry {
@@ -48,14 +48,14 @@ impl GenerationEntry {
 struct Generation {
     id: GenerationId,
     submissions: ahash::HashSet<QueueSubmission>,
-    finalizer: SendUnsafeCell<Option<Box<dyn FnOnce() + Send>>>,
+    finalizer: SendUnsafeCell<Option<Box<dyn FnOnce(&Device) + Send>>>,
 }
 
 impl Generation {
-    fn finalize(&mut self) {
+    fn finalize(&mut self, device: &Device) {
         unsafe {
             if let Some(finalizer) = self.finalizer.get_mut().take() {
-                finalizer();
+                finalizer(device);
             }
         }
     }
@@ -118,7 +118,7 @@ impl GenerationManager {
     }
     pub fn open_generation(
         &mut self,
-        finalizer: Option<Box<dyn FnOnce() + Send>>,
+        finalizer: Option<Box<dyn FnOnce(&Device) + Send>>,
         device: &Device,
     ) -> OpenGeneration {
         if self.batches.len() as u32 == self.max_in_flight {
@@ -196,7 +196,7 @@ impl GenerationManager {
         match res {
             WaitResult::Timeout => VulkanResult::Ok(WaitResult::Timeout),
             WaitResult::AllFinished => {
-                closed.finalize();
+                closed.finalize(device);
                 VulkanResult::Ok(WaitResult::AllFinished)
             }
             WaitResult::AnyFinished => unreachable!(),
@@ -268,7 +268,7 @@ impl GenerationManager {
                     self.inner_wait_for_generation(i, 0, device);
                 }
                 GenerationEntry::Closed(gen) => {
-                    gen.finalize();
+                    gen.finalize(device);
                 }
             }
             // try again
@@ -276,17 +276,26 @@ impl GenerationManager {
                 GenerationEntry::Open(_) => {
                     panic!("Generation is not closed! Is there some thread still running?")
                 }
-                GenerationEntry::Closed(gen) => gen.finalize(),
+                GenerationEntry::Closed(gen) => gen.finalize(device),
             }
         }
     }
 }
 
 impl Device {
-    pub fn open_generation(&self, finalizer: Option<Box<dyn FnOnce() + Send>>) -> OpenGeneration {
+    pub fn open_generation(
+        &self,
+        finalizer: Option<Box<dyn FnOnce(&Device) + Send>>,
+    ) -> OpenGeneration {
         self.generation_manager
             .write()
             .open_generation(finalizer, self)
+    }
+    pub fn open_generation_finalized(
+        &self,
+        finalizer: impl FnOnce(&Device) + Send + 'static,
+    ) -> OpenGeneration {
+        self.open_generation(Some(Box::new(finalizer)))
     }
     /// Returns the id of the oldest generation that is possibly still unfinished,
     /// this is useful for bulk lifetime comparison, the finer grained alternative is `is_generation_finished`

@@ -1,4 +1,10 @@
-use std::{any::Any, cell::UnsafeCell, marker::PhantomData, sync::Arc};
+use std::{
+    any::Any,
+    cell::UnsafeCell,
+    marker::PhantomData,
+    ops::{Deref, DerefMut},
+    sync::Arc,
+};
 
 use parking_lot::RawRwLock;
 use pumice::vk;
@@ -118,3 +124,30 @@ impl<T: Send> SendUnsafeCell<T> {
 
 unsafe impl<T: Send> Send for SendUnsafeCell<T> {}
 unsafe impl<T: Send> Sync for SendUnsafeCell<T> {}
+
+#[derive(Clone, Copy)]
+pub(crate) struct UnsafeSend<T>(T);
+
+unsafe impl<T> Send for UnsafeSend<T> {}
+
+impl<T> UnsafeSend<T> {
+    pub(crate) unsafe fn new(val: T) -> Self {
+        Self(val)
+    }
+    pub(crate) fn take(s: Self) -> T {
+        s.0
+    }
+}
+
+impl<T> Deref for UnsafeSend<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for UnsafeSend<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}

@@ -24,7 +24,8 @@ use crate::{
     device::{
         batch::GenerationId,
         debug::{maybe_attach_debug_label, with_temporary_cstr, DisplayConcat, LazyDisplay},
-        submission::{self, QueueSubmission, SubmissionData, TimelineSemaphore},
+        ringbuffer_collection::SuballocatedMemory,
+        submission::{self, QueueSubmission, TimelineSemaphore},
         OwnedDevice,
     },
     graph::{
@@ -50,12 +51,10 @@ use super::{
     blackboard::BlackBoard,
     compile::{
         BufferBarrier, GraphPassEvent, GraphResource, ImageBarrier, ImageKindCreateInfo,
-        MemoryBarrier, PassMeta, PassObjectState, ResourceFirstAccess, ResourceState,
-        ResourceSubresource, Submission,
+        MemoryBarrier, PassMeta, PassObjectState, ResourceFirstAccess,
+        ResourceFirstAccessInterface, ResourceState, ResourceSubresource, Submission,
     },
-    descriptors::{
-        bind_descriptor_sets, DescriptorAllocator, FinishedSet, UniformMemory, UniformResult,
-    },
+    descriptors::{bind_descriptor_sets, DescriptorAllocator, FinishedSet, UniformResult},
     record::{BufferData, CompilationInput, GraphBuilder, ImageData, ImageMove, PassData},
     resource_marker::{ResourceMarker, TypeNone, TypeOption, TypeSome},
     reverse_edges::{ChildRelativeKey, DFSCommand, ImmutableGraph, NodeGraph, NodeKey},
@@ -430,7 +429,7 @@ impl<'a> GraphExecutor<'a> {
         let res = state
             .descriptor_allocator
             .borrow_mut()
-            .allocate_uniform_iter(&state.device, iter);
+            .allocate_uniform_iter(iter, &state.device);
         res
     }
     pub unsafe fn allocate_uniform_element<T: 'static>(&self, value: &T) -> UniformResult {
@@ -438,15 +437,15 @@ impl<'a> GraphExecutor<'a> {
         let res = state
             .descriptor_allocator
             .borrow_mut()
-            .allocate_uniform_element(&state.device, value);
+            .allocate_uniform_element(value, &state.device);
         res
     }
-    pub unsafe fn allocate_uniform_raw(&self, layout: std::alloc::Layout) -> UniformMemory {
+    pub unsafe fn allocate_uniform_raw(&self, layout: std::alloc::Layout) -> SuballocatedMemory {
         let state = self.graph.state();
         let res = state
             .descriptor_allocator
             .borrow_mut()
-            .allocate_uniform_raw(&state.device, layout);
+            .allocate_uniform_raw(layout, &state.device);
         res
     }
     pub fn command_buffer(&self) -> vk::CommandBuffer {
@@ -659,11 +658,11 @@ impl MainCompiledGraphVulkanState {
     fn make_shared(&self) -> SharedCompiledGraphVulkanState {
         self.shared.borrow().clone()
     }
-    fn make_finalizer(&self) -> Box<dyn FnOnce() + Send> {
+    fn make_finalizer(&self) -> Box<dyn FnOnce(&Device) + Send> {
         let shared = self.make_shared();
         Box::new(
             // this closure immediatelly drops `shared` when called
-            move || {
+            move |_| {
                 // interesting fact: if we use a `let _ = shared;` statement, the closure doesn't capture the variable?
                 let friend = shared;
             },
@@ -1048,11 +1047,7 @@ impl CompiledGraph {
         let submission_finish_semaphores = self
             .submissions
             .iter()
-            .map(|s| {
-                state
-                    .device
-                    .make_submission(self.input.get_queue_family(s.queue), None)
-            })
+            .map(|s| state.device.make_submission(None))
             .collect::<Vec<_>>();
 
         for (i, pass) in self.state().passes.borrow_mut().iter_mut().enumerate() {
@@ -1100,17 +1095,24 @@ impl CompiledGraph {
                             let concurrent = archandle.0.get_create_info().sharing_mode_concurrent;
                             let state = archandle.0.get_object_data().get_mutable_state();
 
-                            self.handle_imported_sync(
+                            let final_queue_family = self
+                                .input
+                                .get_queue_family(self.submissions[accessors[0].index()].queue);
+
+                            handle_imported_sync_generic(
                                 handle,
-                                &accessors_scratch,
-                                initial,
                                 concurrent,
+                                initial,
+                                &accessors_scratch,
                                 layout,
+                                final_queue_family,
                                 state
                                     .get_mut(&image_storage_lock)
                                     .get_synchronization_state(),
-                                &mut dummy_submissions,
                                 &mut submission_extra,
+                                |d| dummy_submissions.push(d),
+                                |s, collection| collection.entry(s).or_default(),
+                                self.device(),
                             );
                         },
                         // swapchains have been handled earlier
@@ -1129,17 +1131,22 @@ impl CompiledGraph {
                             let concurrent = archandle.0.get_create_info().sharing_mode_concurrent;
                             let state = archandle.0.get_object_data().get_mutable_state();
 
-                            self.handle_imported_sync(
+                            let final_queue_family = self
+                                .input
+                                .get_queue_family(self.submissions[accessors[0].index()].queue);
+
+                            handle_imported_sync_generic(
                                 handle,
-                                &accessors_scratch,
-                                initial,
                                 concurrent,
+                                initial,
+                                &accessors_scratch,
                                 TypeNone::new_none(),
-                                state
-                                    .get_mut(&image_storage_lock)
-                                    .get_synchronization_state(),
-                                &mut dummy_submissions,
+                                final_queue_family,
+                                state.get_mut(&image_storage_lock).synchronization_state(),
                                 &mut submission_extra,
+                                |d| dummy_submissions.push(d),
+                                |s, collection| collection.entry(s).or_default(),
+                                self.device(),
                             );
                         },
                         _ => {}
@@ -1256,95 +1263,21 @@ impl CompiledGraph {
 
             dummy_submissions.sort_unstable_by_key(|s| s.queue);
 
-            use slice_group_by::BinaryGroupByKey;
-            for dummy_submission_group in dummy_submissions.binary_group_by_key(|s| s.queue) {
-                submit_infos.clear();
-
-                for dummy in dummy_submission_group {
-                    let wait_semaphores =
-                        bump.alloc_slice_fill_iter(dummy.dependencies.iter().map(|timeline| {
-                            vk::SemaphoreSubmitInfoKHR {
-                                semaphore: timeline.raw,
-                                value: timeline.value,
-                                stage_mask: vk::PipelineStageFlags2KHR::ALL_COMMANDS,
-                                ..Default::default()
-                            }
-                        }));
-                    let signal_semaphore = bump.alloc(vk::SemaphoreSubmitInfoKHR {
-                        semaphore: dummy.finished_semaphore.1.raw,
-                        value: dummy.finished_semaphore.1.value,
-                        stage_mask: vk::PipelineStageFlags2KHR::ALL_COMMANDS,
-                        ..Default::default()
-                    });
-
-                    let mut command_buffer_info = std::ptr::null();
-
-                    let contains_barriers = dummy.contains_barriers();
-                    if contains_barriers {
-                        let command_buffer = command_pools.next(dummy.queue_family, self.device());
-
-                        command_buffer_info = bump.alloc(vk::CommandBufferSubmitInfoKHR {
-                            command_buffer,
-                            ..Default::default()
-                        }) as *const _;
-
-                        d.begin_command_buffer(
-                            command_buffer,
-                            &vk::CommandBufferBeginInfo {
-                                flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
-                                ..Default::default()
-                            },
-                        )
-                        .unwrap();
-
-                        self.do_barriers_whole(
-                            d,
-                            std::iter::empty(),
-                            &dummy.image_barriers,
-                            &dummy.buffer_barriers,
-                            &mut raw_memory_barriers,
-                            &mut raw_image_barriers,
-                            &mut raw_buffer_barriers,
-                            &raw_images,
-                            &raw_buffers,
-                            command_buffer,
-                        );
-
-                        d.end_command_buffer(command_buffer);
-                    }
-
-                    let submit = vk::SubmitInfo2KHR {
-                        flags: vk::SubmitFlagsKHR::empty(),
-                        wait_semaphore_info_count: wait_semaphores.len() as u32,
-                        p_wait_semaphore_infos: wait_semaphores.as_ffi_ptr(),
-                        command_buffer_info_count: contains_barriers.then_some(1).unwrap_or(0),
-                        p_command_buffer_infos: command_buffer_info,
-                        signal_semaphore_info_count: 1,
-                        p_signal_semaphore_infos: signal_semaphore,
-                        ..Default::default()
-                    };
-
-                    submit_infos.push(submit);
-                }
-
-                let queue = dummy_submission_group[0].queue;
-
-                if self.device().debug() {
-                    let info = vk::DebugUtilsLabelEXT {
-                        p_label_name: pumice::cstr!("Dummy passes").as_ptr(),
-                        ..Default::default()
-                    };
-                    d.queue_begin_debug_utils_label_ext(queue, &info);
-                }
-
-                d.queue_submit_2_khr(queue, &submit_infos, vk::Fence::null())
-                    .map_err(|e| panic!("Submit err {:?}", e))
-                    .unwrap();
-
-                if self.device().debug() {
-                    d.queue_end_debug_utils_label_ext(queue);
-                }
-            }
+            do_dummy_submissions(
+                &bump,
+                &dummy_submissions,
+                &mut submit_infos,
+                // &mut command_pools,
+                &mut raw_memory_barriers,
+                &mut raw_image_barriers,
+                &mut raw_buffer_barriers,
+                &raw_images,
+                &raw_buffers,
+                self.device(),
+                |image| self.get_image_format(image),
+                |image, aspect| self.input.get_image_subresource_range(image, aspect),
+                |queue_family, device| command_pools.next(queue_family, device),
+            );
 
             for (i, sub) in self.submissions.iter().enumerate() {
                 let submission = GraphSubmission::new(i);
@@ -1594,203 +1527,6 @@ impl CompiledGraph {
 
         GraphRunStatus::Ok
     }
-    unsafe fn handle_imported_sync<T: ResourceMarker>(
-        &self,
-        handle: CombinedResourceHandle,
-        last_access_submissions: &[QueueSubmission],
-        first_access: &ResourceFirstAccess,
-        sharing_mode_concurrent: bool,
-        final_layout: T::IfImage<vk::ImageLayout>,
-        sync: &mut SynchronizationState<T>,
-        dummy_submissions: &mut Vec<DummySubmission>,
-        submission_extra: &mut ahash::HashMap<GraphSubmission, SubmissionExtra>,
-    ) where
-        T::IfImage<vk::ImageLayout>: Eq + Copy,
-    {
-        let ResourceFirstAccess {
-            ref accessors,
-            dst_layout,
-            dst_stages,
-            dst_access,
-            dst_queue_family,
-        } = *first_access;
-
-        let synchronize_result = sync.update_state(
-            dst_queue_family,
-            T::IfImage::new_some(dst_layout),
-            last_access_submissions,
-            final_layout,
-            dst_queue_family,
-            sharing_mode_concurrent,
-        );
-
-        let SynchronizeResult {
-            transition_layout_from,
-            transition_ownership_from,
-            prev_access,
-        } = synchronize_result;
-
-        let mut active: SmallVec<[TimelineSemaphore; 8]> = SmallVec::new();
-
-        // we need to synchronize against all prev_acess passes
-        // this is essentially the same as in emit_family_ownership_transition
-        if !prev_access.is_empty() {
-            self.state().device.collect_active_submission_datas_map(
-                prev_access.iter().cloned(),
-                &mut active,
-                |s| s.semaphore,
-            );
-        }
-
-        if transition_layout_from.is_none()
-            && transition_ownership_from.is_none()
-            && active.is_empty()
-        {
-            return;
-        }
-
-        assert!(!accessors.is_empty());
-
-        fn push_barrier(
-            resource: CombinedResourceHandle,
-            src_stages: vk::PipelineStageFlags2KHR,
-            dst_stages: vk::PipelineStageFlags2KHR,
-            src_access: vk::AccessFlags2KHR,
-            dst_access: vk::AccessFlags2KHR,
-            old_layout: vk::ImageLayout,
-            new_layout: vk::ImageLayout,
-            src_queue_family_index: u32,
-            dst_queue_family_index: u32,
-            image_barriers: &mut Vec<ImageBarrier>,
-            buffer_barriers: &mut Vec<BufferBarrier>,
-        ) {
-            match resource.unpack() {
-                GraphResource::Image(image) => {
-                    image_barriers.push(ImageBarrier {
-                        image,
-                        src_stages,
-                        dst_stages,
-                        src_access,
-                        dst_access,
-                        old_layout,
-                        new_layout,
-                        src_queue_family_index,
-                        dst_queue_family_index,
-                    });
-                }
-                GraphResource::Buffer(buffer) => {
-                    buffer_barriers.push(BufferBarrier {
-                        buffer,
-                        src_stages,
-                        dst_stages,
-                        src_access,
-                        dst_access,
-                        src_queue_family_index,
-                        dst_queue_family_index,
-                    });
-                }
-            }
-        }
-
-        if transition_layout_from.is_some() || transition_ownership_from.is_some() {
-            // create a dummy submission which will transition the ownership
-            if let Some(src_queue_family) = transition_ownership_from {
-                let finished_semaphore =
-                    self.state().device.make_submission(src_queue_family, None);
-
-                let mut release = DummySubmission {
-                    queue_family: src_queue_family,
-                    queue: self
-                        .state()
-                        .device
-                        .find_queue_for_family(src_queue_family)
-                        .unwrap(),
-                    image_barriers: Vec::new(),
-                    buffer_barriers: Vec::new(),
-                    dependencies: SmallVec::from_slice(&active),
-                    finished_semaphore,
-                };
-                push_barrier(
-                    handle,
-                    vk::PipelineStageFlags2KHR::empty(),
-                    vk::PipelineStageFlags2KHR::empty(),
-                    vk::AccessFlags2KHR::empty(),
-                    vk::AccessFlags2KHR::empty(),
-                    transition_layout_from.unwrap_or(dst_layout),
-                    dst_layout,
-                    src_queue_family,
-                    dst_queue_family,
-                    &mut release.image_barriers,
-                    &mut release.buffer_barriers,
-                );
-                dummy_submissions.push(release);
-
-                active.clear();
-                active.push(finished_semaphore.1);
-            }
-
-            let extra = submission_extra.entry(accessors[0]).or_default();
-
-            // we can just plop the acquire barrier onto the accessor submission
-            if accessors.len() == 1 {
-                push_barrier(
-                    handle,
-                    // it would possibly be beneficial to track the actual stages and access here?
-                    // since src_stages is empty, does this actually define any unwanted execution dependency?
-                    vk::PipelineStageFlags2KHR::empty(),
-                    vk::PipelineStageFlags2KHR::ALL_COMMANDS,
-                    vk::AccessFlags2KHR::empty(),
-                    vk::AccessFlags2KHR::MEMORY_WRITE | vk::AccessFlags2KHR::MEMORY_READ,
-                    transition_layout_from.unwrap_or(dst_layout),
-                    dst_layout,
-                    transition_ownership_from.unwrap_or(dst_queue_family),
-                    dst_queue_family,
-                    &mut extra.image_barriers,
-                    &mut extra.buffer_barriers,
-                );
-            }
-            // we need to create another dummy submission which will do the acquire and then all consumers will depend on it
-            else {
-                let finished_semaphore =
-                    self.state().device.make_submission(dst_queue_family, None);
-
-                let mut release = DummySubmission {
-                    queue_family: dst_queue_family,
-                    queue: self
-                        .state()
-                        .device
-                        .find_queue_for_family(dst_queue_family)
-                        .unwrap(),
-                    image_barriers: Vec::new(),
-                    buffer_barriers: Vec::new(),
-                    dependencies: SmallVec::from_slice(&active),
-                    finished_semaphore,
-                };
-                push_barrier(
-                    handle,
-                    vk::PipelineStageFlags2KHR::empty(),
-                    vk::PipelineStageFlags2KHR::empty(),
-                    vk::AccessFlags2KHR::empty(),
-                    vk::AccessFlags2KHR::empty(),
-                    transition_layout_from.unwrap_or(dst_layout),
-                    dst_layout,
-                    transition_ownership_from.unwrap_or(dst_queue_family),
-                    dst_queue_family,
-                    &mut release.image_barriers,
-                    &mut release.buffer_barriers,
-                );
-                dummy_submissions.push(release);
-
-                active.clear();
-                active.push(finished_semaphore.1);
-            }
-        }
-
-        for &submission in accessors {
-            let extra = submission_extra.entry(submission).or_default();
-            extra.dependencies.extend(active.iter().copied());
-        }
-    }
     unsafe fn do_barriers(
         &self,
         i: usize,
@@ -1897,73 +1633,15 @@ impl CompiledGraph {
             );
         }
     }
-    unsafe fn do_barriers_whole<'a>(
-        &self,
-        d: &DeviceWrapper,
-        memory_barriers: impl IntoIterator<Item = &'a MemoryBarrier>,
-        image_barriers: impl IntoIterator<Item = &'a ImageBarrier>,
-        buffer_barriers: impl IntoIterator<Item = &'a BufferBarrier>,
-
-        raw_memory_barriers: &mut Vec<vk::MemoryBarrier2KHR>,
-        raw_image_barriers: &mut Vec<vk::ImageMemoryBarrier2KHR>,
-        raw_buffer_barriers: &mut Vec<vk::BufferMemoryBarrier2KHR>,
-
-        raw_images: &[Option<vk::Image>],
-        raw_buffers: &[Option<vk::Buffer>],
-        command_buffer: vk::CommandBuffer,
-    ) {
-        fn collect_into<'a, T: 'a, A, F: Fn(&T) -> A>(
-            from: impl IntoIterator<Item = &'a T>,
-            into: &mut Vec<A>,
-            map: F,
-        ) {
-            into.clear();
-            into.extend(from.into_iter().map(map));
-        }
-
-        collect_into(memory_barriers, raw_memory_barriers, MemoryBarrier::to_vk);
-
-        collect_into(image_barriers, raw_image_barriers, |info| {
-            let format = self.get_image_format(info.image);
-            info.to_vk(
-                raw_images[info.image.index()].unwrap(),
-                self.input
-                    .get_image_subresource_range(info.image, format.get_format_aspects().0),
-            )
-        });
-
-        collect_into(buffer_barriers, raw_buffer_barriers, |info| {
-            info.to_vk(raw_buffers[info.buffer.index()].unwrap())
-        });
-
-        if !(raw_memory_barriers.is_empty()
-            && raw_image_barriers.is_empty()
-            && raw_buffer_barriers.is_empty())
-        {
-            d.cmd_pipeline_barrier_2_khr(
-                command_buffer,
-                &vk::DependencyInfoKHR {
-                    dependency_flags: vk::DependencyFlags::empty(),
-                    memory_barrier_count: raw_memory_barriers.len() as u32,
-                    p_memory_barriers: raw_memory_barriers.as_ffi_ptr(),
-                    buffer_memory_barrier_count: raw_buffer_barriers.len() as u32,
-                    p_buffer_memory_barriers: raw_buffer_barriers.as_ffi_ptr(),
-                    image_memory_barrier_count: raw_image_barriers.len() as u32,
-                    p_image_memory_barriers: raw_image_barriers.as_ffi_ptr(),
-                    ..Default::default()
-                },
-            );
-        }
-    }
 }
 
-struct DummySubmission {
-    queue_family: u32,
-    queue: vk::Queue,
-    image_barriers: Vec<ImageBarrier>,
-    buffer_barriers: Vec<BufferBarrier>,
-    dependencies: SmallVec<[TimelineSemaphore; 1]>,
-    finished_semaphore: (QueueSubmission, TimelineSemaphore),
+pub(crate) struct DummySubmission {
+    pub(crate) queue_family: u32,
+    pub(crate) queue: vk::Queue,
+    pub(crate) image_barriers: Vec<ImageBarrier>,
+    pub(crate) buffer_barriers: Vec<BufferBarrier>,
+    pub(crate) dependencies: SmallVec<[TimelineSemaphore; 1]>,
+    pub(crate) finished_semaphore: (QueueSubmission, TimelineSemaphore),
 }
 
 impl DummySubmission {
@@ -1971,10 +1649,10 @@ impl DummySubmission {
         !self.image_barriers.is_empty() || !self.buffer_barriers.is_empty()
     }
 }
-struct SubmissionExtra {
-    image_barriers: Vec<ImageBarrier>,
-    buffer_barriers: Vec<BufferBarrier>,
-    dependencies: ahash::HashSet<TimelineSemaphore>,
+pub(crate) struct SubmissionExtra {
+    pub(crate) image_barriers: Vec<ImageBarrier>,
+    pub(crate) buffer_barriers: Vec<BufferBarrier>,
+    pub(crate) dependencies: ahash::HashSet<TimelineSemaphore>,
 }
 
 impl Default for SubmissionExtra {
@@ -1992,4 +1670,362 @@ pub(crate) struct SwapchainPresent {
     pub(crate) image_index: u32,
     pub(crate) image_acquire: vk::Semaphore,
     pub(crate) image_release: vk::Semaphore,
+}
+
+pub(crate) unsafe fn handle_imported_sync_generic<
+    GenericSubmissionCollection,
+    F: ResourceFirstAccessInterface,
+    T: ResourceMarker,
+>(
+    resource_handle: CombinedResourceHandle,
+    sharing_mode_concurrent: bool,
+
+    next: &F,
+    final_accessors: &[QueueSubmission],
+    final_layout: T::IfImage<vk::ImageLayout>,
+    final_queue_family: u32,
+
+    sync: &mut SynchronizationState<T>,
+
+    submission_collection: &mut GenericSubmissionCollection,
+    mut add_dummy_submission: impl FnMut(DummySubmission),
+    mut get_submission_extra: impl Fn(
+        F::Accessor,
+        &mut GenericSubmissionCollection,
+    ) -> &mut SubmissionExtra,
+
+    device: &Device,
+) where
+    T::IfImage<vk::ImageLayout>: Eq + Copy,
+{
+    let synchronize_result = sync.update(
+        next.queue_family(),
+        T::IfImage::new_some(next.layout()),
+        final_accessors,
+        final_layout,
+        final_queue_family,
+        sharing_mode_concurrent,
+    );
+
+    let SynchronizeResult {
+        transition_layout_from,
+        transition_ownership_from,
+        prev_access,
+    } = synchronize_result;
+
+    let mut active: SmallVec<[TimelineSemaphore; 8]> = SmallVec::new();
+
+    // we need to synchronize against all prev_acess passes
+    // this is essentially the same as in emit_family_ownership_transition
+    if !prev_access.is_empty() {
+        device.collect_active_submission_datas(prev_access.iter().cloned(), &mut active);
+    }
+
+    if transition_layout_from.is_none() && transition_ownership_from.is_none() && active.is_empty()
+    {
+        return;
+    }
+
+    assert!(!next.accessors().is_empty());
+
+    fn push_barrier(
+        resource: CombinedResourceHandle,
+        src_stages: vk::PipelineStageFlags2KHR,
+        dst_stages: vk::PipelineStageFlags2KHR,
+        src_access: vk::AccessFlags2KHR,
+        dst_access: vk::AccessFlags2KHR,
+        old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout,
+        src_queue_family_index: u32,
+        dst_queue_family_index: u32,
+        image_barriers: &mut Vec<ImageBarrier>,
+        buffer_barriers: &mut Vec<BufferBarrier>,
+    ) {
+        match resource.unpack() {
+            GraphResource::Image(image) => {
+                image_barriers.push(ImageBarrier {
+                    image,
+                    src_stages,
+                    dst_stages,
+                    src_access,
+                    dst_access,
+                    old_layout,
+                    new_layout,
+                    src_queue_family_index,
+                    dst_queue_family_index,
+                });
+            }
+            GraphResource::Buffer(buffer) => {
+                buffer_barriers.push(BufferBarrier {
+                    buffer,
+                    src_stages,
+                    dst_stages,
+                    src_access,
+                    dst_access,
+                    src_queue_family_index,
+                    dst_queue_family_index,
+                });
+            }
+        }
+    }
+
+    if transition_layout_from.is_some() || transition_ownership_from.is_some() {
+        // create a dummy submission which will transition the ownership
+        if let Some(src_queue_family) = transition_ownership_from {
+            let finished_semaphore = device.make_submission(None);
+
+            let mut release = DummySubmission {
+                queue_family: src_queue_family,
+                queue: device.find_queue_for_family(src_queue_family).unwrap(),
+                image_barriers: Vec::new(),
+                buffer_barriers: Vec::new(),
+                dependencies: SmallVec::from_slice(&active),
+                finished_semaphore,
+            };
+            push_barrier(
+                resource_handle,
+                vk::PipelineStageFlags2KHR::empty(),
+                vk::PipelineStageFlags2KHR::empty(),
+                vk::AccessFlags2KHR::empty(),
+                vk::AccessFlags2KHR::empty(),
+                transition_layout_from.unwrap_or(next.layout()),
+                next.layout(),
+                src_queue_family,
+                next.queue_family(),
+                &mut release.image_barriers,
+                &mut release.buffer_barriers,
+            );
+            add_dummy_submission(release);
+
+            active.clear();
+            active.push(finished_semaphore.1);
+        }
+
+        let extra = get_submission_extra(next.accessors()[0], submission_collection);
+
+        // we can just plop the acquire barrier onto the accessor submission
+        if next.accessors().len() == 1 {
+            push_barrier(
+                resource_handle,
+                // it would possibly be beneficial to track the actual stages and access here?
+                // since src_stages is empty, does this actually define any unwanted execution dependency?
+                vk::PipelineStageFlags2KHR::empty(),
+                vk::PipelineStageFlags2KHR::ALL_COMMANDS,
+                vk::AccessFlags2KHR::empty(),
+                vk::AccessFlags2KHR::MEMORY_WRITE | vk::AccessFlags2KHR::MEMORY_READ,
+                transition_layout_from.unwrap_or(next.layout()),
+                next.layout(),
+                transition_ownership_from.unwrap_or(next.queue_family()),
+                next.queue_family(),
+                &mut extra.image_barriers,
+                &mut extra.buffer_barriers,
+            );
+        }
+        // we need to create another dummy submission which will do the acquire and then all consumers will depend on it
+        else {
+            let finished_semaphore = device.make_submission(None);
+
+            let mut release = DummySubmission {
+                queue_family: next.queue_family(),
+                queue: device.find_queue_for_family(next.queue_family()).unwrap(),
+                image_barriers: Vec::new(),
+                buffer_barriers: Vec::new(),
+                dependencies: SmallVec::from_slice(&active),
+                finished_semaphore,
+            };
+            push_barrier(
+                resource_handle,
+                vk::PipelineStageFlags2KHR::empty(),
+                vk::PipelineStageFlags2KHR::empty(),
+                vk::AccessFlags2KHR::empty(),
+                vk::AccessFlags2KHR::empty(),
+                transition_layout_from.unwrap_or(next.layout()),
+                next.layout(),
+                transition_ownership_from.unwrap_or(next.queue_family()),
+                next.queue_family(),
+                &mut release.image_barriers,
+                &mut release.buffer_barriers,
+            );
+            add_dummy_submission(release);
+
+            active.clear();
+            active.push(finished_semaphore.1);
+        }
+    }
+
+    for &submission in next.accessors() {
+        let extra = get_submission_extra(submission, submission_collection);
+        extra.dependencies.extend(active.iter().copied());
+    }
+}
+
+pub(crate) unsafe fn do_barriers_whole<'a>(
+    d: &DeviceWrapper,
+    memory_barriers: impl IntoIterator<Item = &'a MemoryBarrier>,
+    image_barriers: impl IntoIterator<Item = &'a ImageBarrier>,
+    buffer_barriers: impl IntoIterator<Item = &'a BufferBarrier>,
+
+    raw_memory_barriers: &mut Vec<vk::MemoryBarrier2KHR>,
+    raw_image_barriers: &mut Vec<vk::ImageMemoryBarrier2KHR>,
+    raw_buffer_barriers: &mut Vec<vk::BufferMemoryBarrier2KHR>,
+
+    raw_images: &[Option<vk::Image>],
+    raw_buffers: &[Option<vk::Buffer>],
+    command_buffer: vk::CommandBuffer,
+
+    get_image_format: impl Fn(GraphImage) -> vk::Format,
+    get_image_subresource_range: impl Fn(GraphImage, vk::ImageAspectFlags) -> vk::ImageSubresourceRange,
+) {
+    fn collect_into<'a, T: 'a, A, F: Fn(&T) -> A>(
+        from: impl IntoIterator<Item = &'a T>,
+        into: &mut Vec<A>,
+        map: F,
+    ) {
+        into.clear();
+        into.extend(from.into_iter().map(map));
+    }
+
+    collect_into(memory_barriers, raw_memory_barriers, MemoryBarrier::to_vk);
+
+    collect_into(image_barriers, raw_image_barriers, |info| {
+        let format = get_image_format(info.image);
+        info.to_vk(
+            raw_images[info.image.index()].unwrap(),
+            get_image_subresource_range(info.image, format.get_format_aspects().0),
+        )
+    });
+
+    collect_into(buffer_barriers, raw_buffer_barriers, |info| {
+        info.to_vk(raw_buffers[info.buffer.index()].unwrap())
+    });
+
+    if !(raw_memory_barriers.is_empty()
+        && raw_image_barriers.is_empty()
+        && raw_buffer_barriers.is_empty())
+    {
+        d.cmd_pipeline_barrier_2_khr(
+            command_buffer,
+            &vk::DependencyInfoKHR {
+                dependency_flags: vk::DependencyFlags::empty(),
+                memory_barrier_count: raw_memory_barriers.len() as u32,
+                p_memory_barriers: raw_memory_barriers.as_ffi_ptr(),
+                buffer_memory_barrier_count: raw_buffer_barriers.len() as u32,
+                p_buffer_memory_barriers: raw_buffer_barriers.as_ffi_ptr(),
+                image_memory_barrier_count: raw_image_barriers.len() as u32,
+                p_image_memory_barriers: raw_image_barriers.as_ffi_ptr(),
+                ..Default::default()
+            },
+        );
+    }
+}
+
+pub(crate) unsafe fn do_dummy_submissions(
+    bump: &Bump,
+    dummy_submissions: &Vec<DummySubmission>,
+    submit_infos: &mut Vec<vk::SubmitInfo2>,
+    raw_memory_barriers: &mut Vec<vk::MemoryBarrier2>,
+    raw_image_barriers: &mut Vec<vk::ImageMemoryBarrier2>,
+    raw_buffer_barriers: &mut Vec<vk::BufferMemoryBarrier2>,
+    raw_images: &[Option<vk::Image>],
+    raw_buffers: &[Option<vk::Buffer>],
+    device: &Device,
+
+    get_image_format: impl Fn(GraphImage) -> vk::Format + Copy,
+    get_image_subresource_range: impl Fn(GraphImage, vk::ImageAspectFlags) -> vk::ImageSubresourceRange
+        + Copy,
+    mut get_command_buffer: impl FnMut(u32, &Device) -> vk::CommandBuffer,
+) {
+    let d = device.device();
+
+    use slice_group_by::BinaryGroupByKey;
+    for dummy_submission_group in dummy_submissions.binary_group_by_key(|s| s.queue) {
+        submit_infos.clear();
+
+        for dummy in dummy_submission_group {
+            let wait_semaphores =
+                bump.alloc_slice_fill_iter(dummy.dependencies.iter().map(|timeline| {
+                    vk::SemaphoreSubmitInfoKHR {
+                        semaphore: timeline.raw,
+                        value: timeline.value,
+                        stage_mask: vk::PipelineStageFlags2KHR::ALL_COMMANDS,
+                        ..Default::default()
+                    }
+                }));
+            let signal_semaphore = bump.alloc(vk::SemaphoreSubmitInfoKHR {
+                semaphore: dummy.finished_semaphore.1.raw,
+                value: dummy.finished_semaphore.1.value,
+                stage_mask: vk::PipelineStageFlags2KHR::ALL_COMMANDS,
+                ..Default::default()
+            });
+
+            let mut command_buffer_info = std::ptr::null();
+
+            let contains_barriers = dummy.contains_barriers();
+            if contains_barriers {
+                let command_buffer = get_command_buffer(dummy.queue_family, device);
+
+                command_buffer_info = bump.alloc(vk::CommandBufferSubmitInfoKHR {
+                    command_buffer,
+                    ..Default::default()
+                }) as *const _;
+
+                d.begin_command_buffer(
+                    command_buffer,
+                    &vk::CommandBufferBeginInfo {
+                        flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+
+                do_barriers_whole(
+                    d,
+                    std::iter::empty(),
+                    &dummy.image_barriers,
+                    &dummy.buffer_barriers,
+                    raw_memory_barriers,
+                    raw_image_barriers,
+                    raw_buffer_barriers,
+                    raw_images,
+                    raw_buffers,
+                    command_buffer,
+                    get_image_format,
+                    get_image_subresource_range,
+                );
+
+                d.end_command_buffer(command_buffer);
+            }
+
+            let submit = vk::SubmitInfo2KHR {
+                flags: vk::SubmitFlagsKHR::empty(),
+                wait_semaphore_info_count: wait_semaphores.len() as u32,
+                p_wait_semaphore_infos: wait_semaphores.as_ffi_ptr(),
+                command_buffer_info_count: contains_barriers.then_some(1).unwrap_or(0),
+                p_command_buffer_infos: command_buffer_info,
+                signal_semaphore_info_count: 1,
+                p_signal_semaphore_infos: signal_semaphore,
+                ..Default::default()
+            };
+
+            submit_infos.push(submit);
+        }
+
+        let queue = dummy_submission_group[0].queue;
+
+        if device.debug() {
+            let info = vk::DebugUtilsLabelEXT {
+                p_label_name: pumice::cstr!("Dummy passes").as_ptr(),
+                ..Default::default()
+            };
+            d.queue_begin_debug_utils_label_ext(queue, &info);
+        }
+
+        d.queue_submit_2_khr(queue, &submit_infos, vk::Fence::null())
+            .map_err(|e| panic!("Submit err {:?}", e))
+            .unwrap();
+
+        if device.debug() {
+            d.queue_end_debug_utils_label_ext(queue);
+        }
+    }
 }

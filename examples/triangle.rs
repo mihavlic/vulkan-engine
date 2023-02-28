@@ -309,12 +309,12 @@ unsafe fn make_swapchain(
     assert_eq!(result, vk::Result::SUCCESS);
 
     let mut present_mode = vk::PresentModeKHR::FIFO;
-    // for mode in present_modes {
-    //     if mode == vk::PresentModeKHR::MAILBOX {
-    //         present_mode = vk::PresentModeKHR::MAILBOX;
-    //         break;
-    //     }
-    // }
+    for mode in present_modes {
+        if mode == vk::PresentModeKHR::MAILBOX {
+            present_mode = vk::PresentModeKHR::MAILBOX;
+            break;
+        }
+    }
 
     // TODO swapchain configuration fallback for formats, present modes, and color spaces
     let info = SwapchainCreateInfo {

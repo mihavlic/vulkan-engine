@@ -20,7 +20,7 @@ use crate::{
     storage::{constant_ahash_hasher, nostore::SimpleStorage, MutableShared, SynchronizationLock},
 };
 
-use super::{ObjHandle, Object, ObjectData};
+use super::{ObjHandle, ObjRef, Object, ObjectData};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Extent {
@@ -125,6 +125,11 @@ pub struct SynchronizeResult {
     pub prev_access: SmallVec<[QueueSubmission; 4]>,
 }
 
+pub enum HostAccessKind {
+    Immediate,
+    Synchronized(QueueSubmission),
+}
+
 pub(crate) struct SynchronizationState<T: ResourceMarker> {
     owning_family: OptionalU32,
     layout: T::IfImage<vk::ImageLayout>,
@@ -148,13 +153,13 @@ impl<T: ResourceMarker> SynchronizationState<T> {
             ..Self::blank()
         }
     }
-    pub(crate) fn update_state(
+    pub(crate) fn update(
         &mut self,
         // the initial state of the resource
         dst_family: u32,
         dst_layout: T::IfImage<vk::ImageLayout>,
         // the state of the resource at the end of the scheduled work
-        final_access: &[QueueSubmission],
+        final_accessors: &[QueueSubmission],
         final_layout: T::IfImage<vk::ImageLayout>,
         final_family: u32,
         // whether the resource was created with VK_ACCESS_MODE_CONCURRENT and does not need queue ownership transitions
@@ -163,16 +168,16 @@ impl<T: ResourceMarker> SynchronizationState<T> {
     where
         T::IfImage<vk::ImageLayout>: Eq + Copy,
     {
-        assert!(!final_access.is_empty());
+        assert!(!final_accessors.is_empty());
 
-        let mut transition_layout = false;
-        let mut transition_ownership = false;
+        let mut transition_layout_from = None;
+        let mut transition_ownership_from = None;
 
         if T::IS_IMAGE
             && dst_layout.unwrap() != vk::ImageLayout::UNDEFINED
             && self.layout != dst_layout
         {
-            transition_layout = true;
+            transition_layout_from = Some(self.layout.unwrap());
         }
 
         if !resource_concurrent
@@ -180,21 +185,41 @@ impl<T: ResourceMarker> SynchronizationState<T> {
             && (T::IS_BUFFER || dst_layout.unwrap() != vk::ImageLayout::UNDEFINED)
             && self.owning_family.unwrap() != dst_family
         {
-            transition_ownership = true;
+            transition_ownership_from = Some(self.owning_family.unwrap());
         }
 
         let result = SynchronizeResult {
-            transition_layout_from: transition_layout.then(|| self.layout.unwrap()),
-            transition_ownership_from: transition_ownership.then(|| self.owning_family.unwrap()),
+            transition_layout_from,
+            transition_ownership_from,
             prev_access: self.access.clone(),
         };
 
         self.owning_family = OptionalU32::new_some(final_family);
         self.layout = final_layout;
         self.access.clear();
-        self.access.extend(final_access.iter().cloned());
+        self.access.extend(final_accessors.iter().cloned());
 
         result
+    }
+    /// performs host access which is finished while the resource lock is held
+    /// the accessor must wait for the submissions returned
+    pub(crate) fn update_host_access(
+        &mut self,
+        update_fn: impl FnOnce(&[QueueSubmission]) -> HostAccessKind,
+    ) -> SmallVec<[QueueSubmission; 4]> {
+        let prev_accessors = self.access.clone();
+        self.access.clear();
+
+        let kind = update_fn(&prev_accessors);
+
+        match kind {
+            HostAccessKind::Immediate => {}
+            HostAccessKind::Synchronized(submission) => {
+                self.access.push(submission);
+            }
+        }
+
+        prev_accessors
     }
 }
 
@@ -314,7 +339,7 @@ impl ImageState {
         resource_concurrent: bool,
         lock: &SynchronizationLock,
     ) -> SynchronizeResult {
-        self.mutable.get_mut(lock).synchronization.update_state(
+        self.mutable.get_mut(lock).synchronization.update(
             dst_family,
             TypeSome::new_some(dst_layout),
             final_access,
@@ -380,14 +405,17 @@ impl Object for Image {
     }
 }
 
-impl Image {
+impl ObjRef<Image> {
+    pub fn get_allocation(&self) -> &pumice_vma::Allocation {
+        &self.get_object_data().allocation
+    }
     pub unsafe fn get_view(
         &self,
         info: &ImageViewCreateInfo,
         batch_id: GenerationId,
     ) -> VulkanResult<vk::ImageView> {
-        let device = self.0.get_parent();
-        let data = self.0.get_object_data();
+        let device = self.get_parent();
+        let data = self.get_object_data();
 
         let label = LazyDisplay(|f| {
             write!(
@@ -398,7 +426,7 @@ impl Image {
             )
         });
 
-        self.0.access_mutable(
+        self.access_mutable(
             |d| &d.mutable,
             |m| m.get_view(data.handle, info, batch_id, Some(&label), device),
         )

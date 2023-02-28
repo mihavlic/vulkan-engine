@@ -1,4 +1,4 @@
-mod allocator;
+pub(crate) mod allocator;
 pub mod blackboard;
 pub mod compile;
 pub mod descriptors;

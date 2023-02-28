@@ -1,6 +1,8 @@
 pub mod batch;
 pub mod debug;
 pub mod reflection;
+pub mod ringbuffer_collection;
+pub mod staging;
 pub mod submission;
 
 use self::{batch::GenerationManager, submission::SubmissionManager};
@@ -469,6 +471,20 @@ impl Device {
     }
     pub unsafe fn create_raw_semaphore(&self) -> VulkanResult<vk::Semaphore> {
         let info = vk::SemaphoreCreateInfo::default();
+        self.device()
+            .create_semaphore(&info, self.allocator_callbacks())
+    }
+    pub unsafe fn create_raw_timeline_semaphore(&self) -> VulkanResult<vk::Semaphore> {
+        let p_next = vk::SemaphoreTypeCreateInfoKHR {
+            semaphore_type: vk::SemaphoreTypeKHR::TIMELINE,
+            initial_value: 0,
+            ..Default::default()
+        };
+        let info = vk::SemaphoreCreateInfo {
+            p_next: &p_next as *const _ as *const c_void,
+            ..Default::default()
+        };
+
         self.device()
             .create_semaphore(&info, self.allocator_callbacks())
     }

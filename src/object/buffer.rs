@@ -8,10 +8,7 @@ use std::{
 use crate::{
     arena::uint::OptionalU32,
     device::{
-        batch::GenerationId,
-        debug::maybe_attach_debug_label,
-        submission::{QueueSubmission, ReaderWriterState},
-        Device,
+        batch::GenerationId, debug::maybe_attach_debug_label, submission::QueueSubmission, Device,
     },
     graph::resource_marker::{BufferMarker, TypeNone, TypeOption},
     storage::{constant_ahash_hasher, nostore::SimpleStorage, MutableShared, SynchronizationLock},
@@ -19,7 +16,7 @@ use crate::{
 use pumice::{vk, VulkanResult};
 use smallvec::SmallVec;
 
-use super::{ObjHandle, Object, ObjectData, SynchronizationState, SynchronizeResult};
+use super::{ObjHandle, ObjRef, Object, ObjectData, SynchronizationState, SynchronizeResult};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct BufferCreateInfo {
@@ -43,19 +40,6 @@ impl BufferCreateInfo {
             ..Default::default()
         }
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct BufferSynchronizationState {
-    owning_family: OptionalU32,
-    state: ReaderWriterState,
-}
-
-impl BufferSynchronizationState {
-    pub const BLANK: Self = Self {
-        owning_family: OptionalU32::NONE,
-        state: ReaderWriterState::None,
-    };
 }
 
 #[derive(Clone, Hash)]
@@ -94,7 +78,7 @@ impl BufferMutableState {
             synchronization: SynchronizationState::blank(),
         }
     }
-    pub(crate) fn get_synchronization_state(&mut self) -> &mut SynchronizationState<BufferMarker> {
+    pub(crate) fn synchronization_state(&mut self) -> &mut SynchronizationState<BufferMarker> {
         &mut self.synchronization
     }
     pub unsafe fn get_view(
@@ -169,7 +153,7 @@ impl BufferState {
         resource_concurrent: bool,
         lock: &SynchronizationLock,
     ) -> SynchronizeResult {
-        self.mutable.get_mut(lock).synchronization.update_state(
+        self.mutable.get_mut(lock).synchronization.update(
             dst_family,
             TypeNone::new_none(),
             final_access,
@@ -232,5 +216,11 @@ impl Object for Buffer {
 
     fn get_storage(parent: &Self::Parent) -> &Self::Storage {
         &parent.buffer_storage
+    }
+}
+
+impl ObjRef<Buffer> {
+    pub fn get_allocation(&self) -> pumice_vma::Allocation {
+        self.get_object_data().allocation
     }
 }

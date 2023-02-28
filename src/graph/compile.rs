@@ -902,6 +902,15 @@ struct ResourceAccessEntry {
     dst_queue_family: u32,
 }
 
+pub trait ResourceFirstAccessInterface {
+    type Accessor: Copy;
+    fn accessors(&self) -> &[Self::Accessor];
+    fn layout(&self) -> vk::ImageLayout;
+    fn stages(&self) -> vk::PipelineStageFlags2KHR;
+    fn access(&self) -> vk::AccessFlags2KHR;
+    fn queue_family(&self) -> u32;
+}
+
 #[derive(Default)]
 pub(crate) struct ResourceFirstAccess {
     pub(crate) accessors: SmallVec<[GraphSubmission; 4]>,
@@ -909,6 +918,25 @@ pub(crate) struct ResourceFirstAccess {
     pub(crate) dst_stages: vk::PipelineStageFlags2KHR,
     pub(crate) dst_access: vk::AccessFlags2KHR,
     pub(crate) dst_queue_family: u32,
+}
+
+impl ResourceFirstAccessInterface for ResourceFirstAccess {
+    type Accessor = GraphSubmission;
+    fn accessors(&self) -> &[Self::Accessor] {
+        &self.accessors
+    }
+    fn layout(&self) -> vk::ImageLayout {
+        self.dst_layout
+    }
+    fn stages(&self) -> vk::PipelineStageFlags2KHR {
+        self.dst_stages
+    }
+    fn access(&self) -> vk::AccessFlags2KHR {
+        self.dst_access
+    }
+    fn queue_family(&self) -> u32 {
+        self.dst_queue_family
+    }
 }
 
 pub(crate) enum ImageKindCreateInfo<'a> {

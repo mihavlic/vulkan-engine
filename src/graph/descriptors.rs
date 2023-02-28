@@ -9,26 +9,41 @@ use pumice::{util::ObjectHandle, vk, DeviceWrapper, VulkanResult};
 use smallvec::SmallVec;
 
 use crate::{
-    device::{debug::maybe_attach_debug_label, Device},
+    device::{
+        debug::maybe_attach_debug_label,
+        ringbuffer_collection::{
+            BufferEntry, RingBufferCollection, RingBufferCollectionConfig, SuballocatedMemory,
+        },
+        Device,
+    },
     graph::allocator::round_up_pow2_usize,
     object::{self, DescriptorBinding, ObjRef},
 };
 
 use super::execute::GraphExecutor;
 
-struct UniformBuffer {
-    buffer: vk::Buffer,
-    allocation: pumice_vma::Allocation,
-    start: NonNull<u8>,
-    cursor: NonNull<u8>,
-    end: NonNull<u8>,
+struct DescriptorAllocatorConfig;
+impl RingBufferCollectionConfig for DescriptorAllocatorConfig {
+    const BUFFER_SIZE: u64 = 16384;
+    const USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags(
+        vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER.0
+            | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER.0
+            | vk::BufferUsageFlags::UNIFORM_BUFFER.0
+            | vk::BufferUsageFlags::STORAGE_BUFFER.0,
+    );
+    const ALLOCATION_FLAGS: pumice_vma::AllocationCreateFlags = pumice_vma::AllocationCreateFlags(
+        pumice_vma::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE.0
+            | pumice_vma::AllocationCreateFlags::MAPPED.0,
+    );
+    const REQUIRED_FLAGS: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::HOST_COHERENT;
+    const PREFERRED_FLAGS: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::empty();
+    const LABEL: &'static str = "DescriptorAllocator buffer";
 }
 
 pub struct DescriptorAllocator {
-    free_buffers: Vec<UniformBuffer>,
     free_pools: Vec<vk::DescriptorPool>,
-    buffers: Vec<UniformBuffer>,
     pools: Vec<vk::DescriptorPool>,
+    buffers: RingBufferCollection<DescriptorAllocatorConfig>,
 }
 
 macro_rules! desc_set_sizes {
@@ -64,22 +79,17 @@ const DESCRIPTOR_SET_SIZES: &[vk::DescriptorPoolSize] = desc_set_sizes!(
 impl DescriptorAllocator {
     pub(crate) fn new() -> Self {
         Self {
-            free_buffers: Vec::new(),
             free_pools: Vec::new(),
-            buffers: Vec::new(),
             pools: Vec::new(),
+            buffers: RingBufferCollection::new(),
         }
     }
     pub(crate) unsafe fn reset(&mut self, device: &Device) {
-        self.free_buffers
-            .extend(self.buffers.drain(..).map(|mut b| {
-                b.cursor = b.start;
-                b
-            }));
         self.free_pools.extend(self.pools.drain(..).map(|p| {
             device.device().reset_descriptor_pool(p, None);
             p
         }));
+        self.buffers.reset();
     }
     pub(crate) unsafe fn destroy(&mut self, device: &Device) {
         for &pool in self.pools.iter().chain(&self.free_pools) {
@@ -87,16 +97,12 @@ impl DescriptorAllocator {
                 .device()
                 .destroy_descriptor_pool(pool, device.allocator_callbacks());
         }
-        for buffer in self.buffers.iter().chain(&self.free_buffers) {
-            device
-                .allocator()
-                .destroy_buffer(buffer.buffer, buffer.allocation)
-        }
+        self.buffers.destroy(device);
     }
     pub(crate) unsafe fn allocate_set(
         &mut self,
-        device: &Device,
         layout: &ObjRef<object::DescriptorSetLayout>,
+        device: &Device,
     ) -> vk::DescriptorSet {
         if self.pools.is_empty() {
             self.add_descriptor_pool(device);
@@ -150,52 +156,10 @@ impl DescriptorAllocator {
             .unwrap();
         self.pools.push(pool);
     }
-    unsafe fn add_buffer(&mut self, device: &Device) {
-        if let Some(free) = self.free_buffers.pop() {
-            self.buffers.push(free);
-            return;
-        }
-
-        let buffer_info = vk::BufferCreateInfo {
-            flags: vk::BufferCreateFlags::empty(),
-            size: UNIFORM_BUFFER_SIZE,
-            usage: vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
-                | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER
-                | vk::BufferUsageFlags::UNIFORM_BUFFER
-                | vk::BufferUsageFlags::STORAGE_BUFFER,
-            sharing_mode: vk::SharingMode::EXCLUSIVE,
-            ..Default::default()
-        };
-
-        let allocation_info = pumice_vma::AllocationCreateInfo {
-            flags: pumice_vma::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
-                | pumice_vma::AllocationCreateFlags::MAPPED,
-            usage: pumice_vma::MemoryUsage::Auto,
-            ..Default::default()
-        };
-
-        let (buffer, allocation, info) = device
-            .allocator()
-            .create_buffer(&buffer_info, &allocation_info)
-            .unwrap();
-
-        maybe_attach_debug_label(buffer, &"DescriptorAllocator buffer", device);
-
-        let start: NonNull<u8> = NonNull::new(info.mapped_data.cast()).unwrap();
-        let end = NonNull::new(start.as_ptr().add(info.size.try_into().unwrap())).unwrap();
-
-        self.buffers.push(UniformBuffer {
-            buffer,
-            allocation,
-            start,
-            cursor: start,
-            end,
-        });
-    }
     pub unsafe fn allocate_uniform_iter<T, I: IntoIterator<Item = T>>(
         &mut self,
-        device: &Device,
         iter: I,
+        device: &Device,
     ) -> UniformResult
     where
         I::IntoIter: ExactSizeIterator,
@@ -204,9 +168,9 @@ impl DescriptorAllocator {
         assert!(iter.len() > 0);
 
         let layout = std::alloc::Layout::array::<T>(iter.len()).unwrap();
-        let uniform = self.allocate_uniform_raw(device, layout);
+        let uniform = self.allocate_uniform_raw(layout, device);
 
-        let UniformMemory {
+        let SuballocatedMemory {
             dynamic_offset,
             buffer,
             memory,
@@ -224,13 +188,13 @@ impl DescriptorAllocator {
     }
     pub(crate) unsafe fn allocate_uniform_element<T>(
         &mut self,
-        device: &Device,
         value: &T,
+        device: &Device,
     ) -> UniformResult {
         let layout = std::alloc::Layout::new::<T>();
-        let uniform = self.allocate_uniform_raw(device, layout);
+        let uniform = self.allocate_uniform_raw(layout, device);
 
-        let UniformMemory {
+        let SuballocatedMemory {
             dynamic_offset,
             buffer,
             memory,
@@ -245,67 +209,11 @@ impl DescriptorAllocator {
     }
     pub(crate) unsafe fn allocate_uniform_raw(
         &mut self,
-        device: &Device,
-        layout: std::alloc::Layout,
-    ) -> UniformMemory {
-        assert!(layout.size() as u64 <= UNIFORM_BUFFER_SIZE);
-
-        if self.buffers.is_empty() {
-            self.add_buffer(device);
-        }
-
-        let buffer = self.buffers.last_mut().unwrap();
-        let (ptr, dynamic_offset) =
-            Self::bump_buffer(buffer, layout, device).unwrap_or_else(|| {
-                self.add_buffer(device);
-                let buffer = self.buffers.last_mut().unwrap();
-                Self::bump_buffer(buffer, layout, device)
-                    .expect("Failed to bump allocate from a fresh buffer")
-            });
-
-        let buffer = self.buffers.last().unwrap();
-
-        UniformMemory {
-            dynamic_offset,
-            buffer: buffer.buffer,
-            memory: ptr,
-        }
-    }
-    unsafe fn bump_buffer(
-        buffer: &mut UniformBuffer,
         layout: std::alloc::Layout,
         device: &Device,
-    ) -> Option<(NonNull<u8>, u32)> {
-        let start = buffer.cursor.as_ptr() as usize;
-        let aligned = round_up_pow2_usize(start, layout.align());
-        let mut offset = aligned - start;
-
-        let offset_align = device
-            .physical_device_properties
-            .limits
-            .min_uniform_buffer_offset_alignment;
-        if offset_align > 0 {
-            offset = round_up_pow2_usize(offset, offset_align as usize);
-        }
-
-        let start_ptr = buffer.cursor.as_ptr().add(offset);
-        let end_ptr = start_ptr.add(layout.size());
-
-        if end_ptr > buffer.end.as_ptr() {
-            return None;
-        }
-
-        buffer.cursor = NonNull::new(end_ptr).unwrap();
-
-        Some((NonNull::new(start_ptr).unwrap(), offset.try_into().unwrap()))
+    ) -> SuballocatedMemory {
+        self.buffers.allocate(layout, device)
     }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct UniformMemory {
-    pub dynamic_offset: u32,
-    pub buffer: vk::Buffer,
-    pub memory: NonNull<u8>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -589,7 +497,7 @@ impl<'a> DescSetBuilder<'a> {
         }
 
         if self.set == vk::DescriptorSet::null() {
-            self.set = allocator.allocate_set(device, self.layout);
+            self.set = allocator.allocate_set(self.layout, device);
             let bindings = &self.layout.get_create_info().bindings;
 
             write_descriptors(device, &[self]);
