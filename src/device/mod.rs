@@ -269,9 +269,8 @@ impl Device {
             Allocator::new(&info).unwrap()
         };
 
-        let name = instance.app_name().to_owned();
         let threadpool = rayon::ThreadPoolBuilder::new()
-            .thread_name(move |i| format!("{name} worker #{i}"))
+            .thread_name(move |i| format!("worker #{i}"))
             .build()
             .unwrap();
 
