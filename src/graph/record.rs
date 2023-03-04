@@ -653,6 +653,7 @@ impl<'a> GraphPassBuilder<'a> {
         }
     }
     // TODO check (possibly update for transients) usage flags against their create info
+    #[track_caller]
     pub fn use_image(
         &mut self,
         image: GraphImage,

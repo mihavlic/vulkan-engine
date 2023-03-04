@@ -368,7 +368,7 @@ impl CommandBufferPool {
             let signal = vk::SemaphoreSubmitInfoKHR {
                 semaphore: semaphore.raw,
                 value: semaphore.value,
-                stage_mask: vk::PipelineStageFlags2KHR::COPY_KHR,
+                stage_mask: vk::PipelineStageFlags2KHR::COPY,
                 ..Default::default()
             };
 
