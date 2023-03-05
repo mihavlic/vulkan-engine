@@ -734,12 +734,15 @@ impl<'a> SubmissionRecorder<'a> {
 
         // the pass is on another queue in an open submission, close it for the next step
         if data.queue != queue && scheduled.is_none() {
-            let queue_index = self.find_queue_internal_index(data.queue).unwrap();
-            self.__close_submission(queue_index)
+            self.close_queue_submission(data.queue)
                 .expect("Dependency must be scheduled before the dependee");
         }
 
         scheduled.get().map(GraphSubmission)
+    }
+    pub fn close_queue_submission(&mut self, queue: GraphQueue) -> Option<GraphSubmission> {
+        let queue_index = self.find_queue_internal_index(queue).unwrap();
+        self.__close_submission(queue_index)
     }
     /// False if src_pass is from a separate submission and thus requires no further execution or memory synchronization
     pub(crate) fn add_execution_dependency(&mut self, src_pass: GraphPass) -> bool {
@@ -939,7 +942,7 @@ impl ResourceFirstAccessInterface for ResourceFirstAccess {
     }
 }
 
-pub(crate) enum ImageKindCreateInfo<'a> {
+pub enum ImageKindCreateInfo<'a> {
     ImageRef(std::cell::Ref<'a, object::ImageCreateInfo>),
     Image(&'a object::ImageCreateInfo),
     Swapchain(&'a object::SwapchainCreateInfo),
@@ -1335,7 +1338,7 @@ impl GraphCompiler {
                 },
             );
 
-            sender.send((a, b)).unwrap();
+            sender.send((a, b));
         });
 
         // src dst
@@ -1658,50 +1661,58 @@ impl GraphCompiler {
             loop {
                 let len = scheduled.len();
                 for queue_i in 0..self.input.queues.len() {
+                    let queue = GraphQueue::new(queue_i);
                     let (position, heap) = &mut available[queue_i];
 
-                    let pass;
-                    if let Some(AvailablePass { pass: p, .. }) = heap.pop() {
-                        pass = p;
-                    } else {
-                        // we've depleted the last flush region, continue to the next one
+                    // we've depleted the last flush region, continue to the next one
+                    if heap.is_empty() {
+                        let mut added_passes = false;
+                        let mut added_flush = false;
                         let index = &mut queue_flush_region[queue_i];
                         for &e in &self.input.timeline[*index..] {
                             *index += 1;
                             match e.get() {
                                 PassEventData::Pass(next_pass) => {
                                     let data = &self.input.get_pass_data(next_pass);
-                                    if data.queue.index() != queue_i {
-                                        continue;
+                                    if data.queue == queue {
+                                        let dependency_info =
+                                            &mut dependency_count[next_pass.index()];
+                                        // if the pass has no outstanding dependencies, we measure its priority and add it to the heap
+                                        if dependency_info.0 == 0 {
+                                            let _queue = data.queue;
+                                            let item = AvailablePass::new(
+                                                next_pass,
+                                                self,
+                                                &mut graph_layers,
+                                            );
+                                            heap.push(item);
+                                        }
+                                        dependency_info.1 = true;
+                                        added_passes = true;
                                     }
-                                    let dependency_info = &mut dependency_count[next_pass.index()];
-                                    // if the pass has no outstanding deendencies, we measure its priority and add it to the heap
-                                    if dependency_info.0 == 0 {
-                                        let _queue = data.queue;
-                                        let item =
-                                            AvailablePass::new(next_pass, self, &mut graph_layers);
-                                        heap.push(item);
-                                    }
-                                    dependency_info.1 = true;
                                 }
                                 PassEventData::Flush(f) => {
-                                    if f.index() == queue_i {
-                                        scheduled.push(GraphPassEvent::new(PassEventData::Flush(
-                                            GraphQueue::new(queue_i),
-                                        )));
-                                        break;
+                                    if f == queue {
+                                        if added_passes {
+                                            // roll back the index, since we wan't this flush to be reprocessed when `scheduled` runs out again
+                                            *index = index.checked_sub(1).unwrap();
+                                            break;
+                                        } else if !added_flush {
+                                            scheduled.push(GraphPassEvent::new(
+                                                PassEventData::Flush(queue),
+                                            ));
+                                            added_flush = true;
+                                        }
                                     }
                                 }
                                 // moves are handled later
                                 PassEventData::Move(_) => {}
                             }
                         }
+                    };
 
-                        if let Some(AvailablePass { pass: p, .. }) = heap.pop() {
-                            pass = p;
-                        } else {
-                            continue;
-                        }
+                    let Some(AvailablePass { pass, .. }) = heap.pop() else {
+                        continue;
                     };
 
                     scheduled.push(GraphPassEvent::new(PassEventData::Pass(pass)));
@@ -1781,7 +1792,7 @@ impl GraphCompiler {
                 (pass, mov)
             })
             .collect::<Vec<_>>();
-        image_moves.sort_unstable_by_key(|(p, _)| *p);
+        image_moves.sort_by_key(|(p, _)| *p);
 
         // separate the scheduled passes into specific submissions
         // this is a greedy process, but due to the previous scheduling it should yield somewhat decent results
@@ -1876,7 +1887,9 @@ impl GraphCompiler {
                         }
                     }
                     PassEventData::Move(_) => {} // this is handled differently
-                    PassEventData::Flush(_q) => recorder.borrow_mut().close_current_submission(),
+                    PassEventData::Flush(q) => {
+                        recorder.borrow_mut().close_queue_submission(q);
+                    }
                 }
             }
 
@@ -1894,7 +1907,7 @@ impl GraphCompiler {
             {
                 // make sure that the dependencies are in topological order (ie are sorted)
                 for sub in &mut submissions {
-                    sub.semaphore_dependencies.sort_unstable();
+                    sub.semaphore_dependencies.sort();
                 }
 
                 let len = submissions.len();
@@ -1947,8 +1960,7 @@ impl GraphCompiler {
                 let ResourceAccessEntry { closed, accessors, dst_layout, dst_stages, dst_access, dst_queue_family } = accessor;
 
                 submissions_scratch.clear();
-                submissions_scratch.extend(accessors.iter().map(|a| {
-                    let pass = self.input.timeline[a.index()].get_pass().unwrap();
+                submissions_scratch.extend(accessors.iter().map(|&pass| {
                     GraphSubmission(self.get_pass_meta(pass).scheduled_submission.get().unwrap())
                 }));
                 submissions_scratch.sort();
@@ -2109,7 +2121,7 @@ impl GraphCompiler {
                     }
 
                     // first deal with the largest resources
-                    need_alloc.sort_unstable_by(|(_, a), (_, b)| a.size.cmp(&b.size).reverse());
+                    need_alloc.sort_by(|(_, a), (_, b)| a.size.cmp(&b.size).reverse());
 
                     for (resource, reqs) in &need_alloc {
                         let (tiling, allocation_info, availability, display) = match *resource {
@@ -2229,7 +2241,6 @@ impl GraphCompiler {
                                 let physical = PhysicalBuffer::new(self.physical_buffers.len());
                                 self.physical_buffers.push(PhysicalBufferData {
                                     info: create_info.clone(),
-                                    // memory: suballocation,
                                     vkhandle,
                                     state: RefCell::new(BufferMutableState::new()),
                                 });
@@ -2282,13 +2293,7 @@ impl GraphCompiler {
                         ImageData::Swapchain(_) => {
                             assert!(accessors.len() == 1, "Swapchains use legacy semaphores and do not support multiple signals or waits, using a swapchain in multiple submissions is disallowed (you should really just transfer the final image into it at the end of the frame)");
 
-                            let first_access_submission = {
-                                let a = accessors[0];
-                                let pass = self.input.timeline[a.index()].get_pass().unwrap();
-                                let submission =
-                                    self.get_pass_meta(pass).scheduled_submission.get().unwrap();
-                                &mut submissions[submission as usize]
-                            };
+                            let first_access_submission = &mut submissions[accessors[0].index()];
 
                             if dst_layout != vk::ImageLayout::UNDEFINED {
                                 // acquired images start out as UNDEFINED, since we are currently allowing swapchains to only be used in a single submission,
@@ -2451,7 +2456,7 @@ impl GraphCompiler {
                         )
                     } else {
                         use slice_group_by::GroupBy;
-                        scratch.sort_unstable_by_key(|(sub, _)| *sub);
+                        scratch.sort_by_key(|(sub, _)| *sub);
                         let groups = scratch.binary_group_by_key(|(sub, _)| *sub);
                         ResourceLastUse::Multiple(groups.map(|slice| slice[0].0).collect())
                     }
@@ -2601,7 +2606,6 @@ impl GraphCompiler {
             ResourceState::Moved => panic!("Attempt to access moved resource"),
         }
 
-        let writes = dst_writes;
         if imported {
             let ResourceAccessEntry {
                 closed,
@@ -2622,14 +2626,14 @@ impl GraphCompiler {
                 });
 
             if !*closed {
-                if !writes || accessors.is_empty() {
+                if !dst_writes || accessors.is_empty() {
                     *dst_stages |= dst_touch.stages;
                     *dst_access |= dst_touch.access;
                     if !accessors.contains(&pass) {
                         accessors.push(pass);
                     }
                 }
-                if writes {
+                if dst_writes {
                     *closed = true;
                 }
             }
@@ -2717,7 +2721,7 @@ impl GraphCompiler {
                         // there are multiple submissions which we need to synchronize against to transfer the ownership
                         // the only way to wait for them on a src_queue family is to create a dummy submission which binds them together
                         else {
-                            access_submissions.sort_unstable();
+                            access_submissions.sort();
                             access_submissions.dedup();
 
                             let queue = recorder.find_queue_with_family(*src_queue_family).unwrap();

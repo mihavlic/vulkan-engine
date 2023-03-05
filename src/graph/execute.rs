@@ -289,6 +289,12 @@ impl<'a> GraphExecutor<'a> {
     pub fn get_image_format(&self, image: GraphImage) -> vk::Format {
         self.graph.get_image_format(image)
     }
+    pub fn get_image_layer_count(&self, image: GraphImage) -> u32 {
+        self.graph.get_image_layer_count(image)
+    }
+    pub fn get_image_create_info(&self, image: GraphImage) -> ImageKindCreateInfo {
+        self.graph.get_image_create_info(image)
+    }
     pub fn get_image_extent(&self, image: GraphImage) -> object::Extent {
         let info = self.graph.get_image_create_info(image);
         match info {
@@ -309,6 +315,37 @@ impl<'a> GraphExecutor<'a> {
         aspect: vk::ImageAspectFlags,
     ) -> vk::ImageSubresourceRange {
         self.graph.input.get_image_subresource_range(image, aspect)
+    }
+    pub fn get_image_subresource_layers(
+        &self,
+        image: GraphImage,
+        aspect: vk::ImageAspectFlags,
+        mip_level: u32,
+    ) -> vk::ImageSubresourceLayers {
+        self.graph
+            .input
+            .get_image_subresource_layers(image, aspect, mip_level)
+    }
+    /// Returns the vk::ImageSubresourceLayers describing the graph image
+    /// without using VK_REMAINING_ARRAY_LAYERS
+    /// you should prefer using `get_image_subresource_layers`
+    pub fn get_image_subresource_layers_concrete(
+        &self,
+        image: GraphImage,
+        aspect: vk::ImageAspectFlags,
+        mip_level: u32,
+    ) -> vk::ImageSubresourceLayers {
+        let mut layers = self
+            .graph
+            .input
+            .get_image_subresource_layers(image, aspect, mip_level);
+
+        if layers.layer_count == vk::REMAINING_ARRAY_LAYERS {
+            let total_count = self.get_image_layer_count(image);
+            layers.layer_count = total_count - layers.base_array_layer;
+        }
+
+        layers
     }
     pub unsafe fn get_image_view(
         &self,
@@ -772,6 +809,14 @@ impl CompiledGraph {
             ImageKindCreateInfo::Image(info) => info.format,
             ImageKindCreateInfo::ImageRef(info) => info.format,
             ImageKindCreateInfo::Swapchain(info) => info.format,
+        }
+    }
+    pub(crate) fn get_image_layer_count(&self, image: GraphImage) -> u32 {
+        let info = self.get_image_create_info(image);
+        match info {
+            ImageKindCreateInfo::Image(info) => info.array_layers,
+            ImageKindCreateInfo::ImageRef(info) => info.array_layers,
+            ImageKindCreateInfo::Swapchain(info) => info.array_layers,
         }
     }
     pub(crate) fn get_physical_image(&self, image: PhysicalImage) -> Ref<'_, PhysicalImageData> {
@@ -1887,7 +1932,7 @@ pub(crate) unsafe fn do_barriers_whole<'a>(
 
     collect_into(memory_barriers, raw_memory_barriers, MemoryBarrier::to_vk);
 
-    collect_into(image_barriers, raw_image_barriers, |info| {
+    collect_into(image_barriers, raw_image_barriers, |info: &ImageBarrier| {
         let format = get_image_format(info.image);
         info.to_vk(
             raw_images[info.image.index()].unwrap(),
@@ -1895,9 +1940,11 @@ pub(crate) unsafe fn do_barriers_whole<'a>(
         )
     });
 
-    collect_into(buffer_barriers, raw_buffer_barriers, |info| {
-        info.to_vk(raw_buffers[info.buffer.index()].unwrap())
-    });
+    collect_into(
+        buffer_barriers,
+        raw_buffer_barriers,
+        |info: &BufferBarrier| info.to_vk(raw_buffers[info.buffer.index()].unwrap()),
+    );
 
     if !(raw_memory_barriers.is_empty()
         && raw_image_barriers.is_empty()

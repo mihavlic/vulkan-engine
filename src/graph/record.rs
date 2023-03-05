@@ -299,6 +299,20 @@ impl CompilationInput {
             layer_count: layer_count.unwrap_or(vk::REMAINING_ARRAY_LAYERS),
         }
     }
+    pub fn get_image_subresource_layers(
+        &self,
+        image: GraphImage,
+        aspect: vk::ImageAspectFlags,
+        mip_level: u32,
+    ) -> vk::ImageSubresourceLayers {
+        let (base_array_layer, layer_count) = self.get_image_subresource_layer_offset_count(image);
+        vk::ImageSubresourceLayers {
+            aspect_mask: aspect,
+            mip_level,
+            base_array_layer,
+            layer_count: layer_count.unwrap_or(vk::REMAINING_ARRAY_LAYERS),
+        }
+    }
 }
 
 #[repr(transparent)]
@@ -320,7 +334,7 @@ impl GraphBuilder {
             .input
             .queues
             .iter()
-            .position(|q| q.inner.raw() == queue.raw())
+            .position(|q| q.inner.raw() == queue.inner.raw())
         {
             GraphQueue::new(i)
         } else {
