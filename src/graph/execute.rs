@@ -846,9 +846,8 @@ impl CompiledGraph {
             assert!(self.prev_generation.get().is_none());
             self.early_returned.set(false);
         } else {
-            // we can now start executing the graph (TODO move this to another function, allow the built graph to be executed multiple times)
             // wait for previously submitted work to finish
-            if let Some(id) = self.prev_generation.get() {
+            if let Some(id) = self.prev_generation.take() {
                 self.state()
                     .device
                     .wait_for_generation_single(id, u64::MAX)
@@ -859,8 +858,6 @@ impl CompiledGraph {
             unsafe {
                 self.state_mut().reset();
             }
-
-            self.prev_generation.set(None);
         }
 
         let state = self.state();
@@ -903,7 +900,6 @@ impl CompiledGraph {
 
                             let mut semaphores = state.swapchain_semaphores.borrow_mut();
                             let mut fences = state.fences.borrow_mut();
-                            // let acquire_semaphore = semaphores.next(&state.device);
                             let mut acquire_semaphore = None;
                             let release_semaphore = semaphores.next(&state.device);
 
@@ -1106,9 +1102,7 @@ impl CompiledGraph {
         let buffer_storage_lock = state.device.buffer_storage.acquire_all_exclusive();
 
         let mut accessors_scratch = Vec::new();
-
         let mut dummy_submissions = Vec::new();
-
         let mut submission_extra: ahash::HashMap<GraphSubmission, SubmissionExtra> =
             constant_ahash_hashmap();
 

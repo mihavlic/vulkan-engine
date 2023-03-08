@@ -143,10 +143,13 @@ impl GraphContext {
                 lock.lock_shared();
 
                 let result = unsafe {
-                    archandle
-                        .0
-                        .access_mutable(|d| &d.mutable, |m| m.get_pipeline(*mode_hash, || panic!()))
+                    archandle.0.access_mutable(
+                        |d| &d.mutable,
+                        |m| m.get_pipeline(*mode_hash, || unreachable!()),
+                    )
                 };
+
+                unsafe { lock.unlock_shared() };
 
                 let handle = match result {
                     GetPipelineResult::Ready(handle) => handle,
@@ -1258,7 +1261,7 @@ impl GraphCompiler {
 
                                 // todo possibly try to keep this allocator alive longer
                                 let bump = Bump::new();
-                                let template = unsafe { info.to_vk(&bump, &owned_device) };
+                                let template = unsafe { info.to_vk(&bump) };
                                 // we clone the one info multiple times and then patch it with its RenderPassMode
                                 let mut infos = vec![template; modes.len()];
 

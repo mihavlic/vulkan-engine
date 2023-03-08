@@ -13,7 +13,7 @@ use crate::{
     util::ffi_ptr::AsFFiPtr,
 };
 use bumpalo::Bump;
-use parking_lot::{RawMutex, RawRwLock};
+use parking_lot::{lock_api::RawRwLock, RawMutex};
 use pumice::{util::ObjectHandle, vk, VulkanResult};
 use smallvec::{Array, SmallVec};
 
@@ -402,18 +402,11 @@ impl<F: FnOnce()> Drop for DropClosure<F> {
     }
 }
 
-macro_rules! add_pnext {
-    ($head:expr, $next:expr) => {
-        $next.p_next = $head;
-        $head = $next as *const _ as *const std::ffi::c_void;
-    };
-}
-
 impl GraphicsPipelineCreateInfo {
     pub fn builder() -> GraphicsPipelineCreateInfoBuilder {
         GraphicsPipelineCreateInfoBuilder::new()
     }
-    pub unsafe fn to_vk(&self, bump: &Bump, ctx: &Device) -> vk::GraphicsPipelineCreateInfo {
+    pub unsafe fn to_vk(&self, bump: &Bump) -> vk::GraphicsPipelineCreateInfo {
         let mut pnext_head: *const std::ffi::c_void = std::ptr::null();
 
         let (render_pass, subpass) =
@@ -640,7 +633,7 @@ pub(crate) fn raw_info_handle_renderpass(
 }
 
 enum GraphicsPipelineEntryHandle {
-    Promised(Arc<RawRwLock>),
+    Promised(Arc<parking_lot::RawRwLock>),
     Created(vk::Pipeline, RenderPassMode),
 }
 
@@ -653,8 +646,8 @@ pub(crate) struct GraphicsPipelineEntry {
 
 pub enum GetPipelineResult {
     Ready(vk::Pipeline),
-    Promised(Arc<RawRwLock>),
-    MustCreate(Arc<RawRwLock>),
+    Promised(Arc<parking_lot::RawRwLock>),
+    MustCreate(Arc<parking_lot::RawRwLock>),
 }
 
 pub struct GraphicsPipelineMutableState {
@@ -671,7 +664,7 @@ impl GraphicsPipelineMutableState {
     pub(crate) unsafe fn get_pipeline(
         &mut self,
         mode_hash: u64,
-        make_lock: impl FnOnce() -> Arc<RawRwLock>,
+        make_lock: impl FnOnce() -> Arc<parking_lot::RawRwLock>,
     ) -> GetPipelineResult {
         if let Some(found) = self.pipelines.iter().find(|e| e.mode_hash == mode_hash) {
             match &found.handle {
@@ -795,6 +788,97 @@ impl std::ops::Deref for GraphicsPipeline {
 impl GraphicsPipeline {
     pub fn get_descriptor_set_layouts(&self) -> &Vec<super::DescriptorSetLayout> {
         self.get_create_info().layout.get_descriptor_set_layouts()
+    }
+    pub fn get_concrete_for_mode(
+        &self,
+        mode: RenderPassMode,
+        device: &Device,
+    ) -> VulkanResult<ConcreteGraphicsPipeline> {
+        let hash = mode.get_hash();
+
+        let mut created_lock = false;
+        let make_lock = || {
+            let lock = Arc::new(parking_lot::RawRwLock::INIT);
+            assert!(lock.try_lock_exclusive());
+
+            assert!(!created_lock);
+            created_lock = true;
+
+            lock
+        };
+
+        unsafe {
+            let result = self.access_mutable(|s| &s.mutable, |s| s.get_pipeline(hash, make_lock));
+            let handle = match result {
+                GetPipelineResult::Ready(handle) => {
+                    assert!(!created_lock);
+                    handle
+                }
+                GetPipelineResult::Promised(wait) => {
+                    assert!(!created_lock);
+                    wait.lock_shared();
+
+                    let result = unsafe {
+                        self.access_mutable(
+                            |d| &d.mutable,
+                            |m| m.get_pipeline(hash, || unreachable!()),
+                        )
+                    };
+
+                    unsafe { wait.unlock_shared() };
+
+                    let handle = match result {
+                        GetPipelineResult::Ready(handle) => handle,
+                        GetPipelineResult::Promised(_) => unreachable!(),
+                        GetPipelineResult::MustCreate(_) => unreachable!(),
+                    };
+
+                    handle
+                }
+                GetPipelineResult::MustCreate(lock) => {
+                    assert!(created_lock);
+
+                    // TODO do better than a transient bump
+                    let bump = Bump::new();
+
+                    let info = self.get_create_info();
+                    let mut info = info.to_vk(&bump);
+                    let mut pnext_head: *const std::ffi::c_void = std::ptr::null();
+
+                    let (render_pass, subpass) =
+                        raw_info_handle_renderpass(&mode, &mut pnext_head, &bump);
+
+                    assert!(info.p_next.is_null());
+                    info.p_next = pnext_head;
+                    info.render_pass = render_pass;
+                    info.subpass = subpass;
+
+                    let (handles, result) = unsafe {
+                        // FIXME if an error occurs, we return an error without ever
+                        // unlocking the completion lock because we have no handle to
+                        // return, this will cause hangs in other parts of the code
+                        device.device().create_graphics_pipelines(
+                            device.pipeline_cache(),
+                            std::slice::from_ref(&info),
+                            device.allocator_callbacks(),
+                        )?
+                    };
+
+                    assert_eq!(result, vk::Result::SUCCESS);
+
+                    let handle = handles[0];
+                    self.access_mutable(
+                        |s| &s.mutable,
+                        |s| s.add_promised_pipeline(handle, hash, mode),
+                    );
+
+                    lock.unlock_exclusive();
+                    handle
+                }
+            };
+
+            Ok(ConcreteGraphicsPipeline(self.clone(), handle))
+        }
     }
 }
 

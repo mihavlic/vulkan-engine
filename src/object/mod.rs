@@ -33,9 +33,17 @@ macro_rules! derive_raw_handle {
     };
 }
 
+macro_rules! add_pnext {
+    ($head:expr, $next:expr) => {
+        $next.p_next = $head;
+        $head = $next as *const _ as *const std::ffi::c_void;
+    };
+}
+
 mod buffer;
 mod compute_pipeline;
 mod descriptor_set_layout;
+mod framebuffer;
 mod graphics_pipeline;
 mod image;
 mod pipeline_layout;
@@ -48,6 +56,7 @@ mod swapchain;
 pub use buffer::*;
 pub use compute_pipeline::*;
 pub use descriptor_set_layout::*;
+pub use framebuffer::*;
 pub use graphics_pipeline::*;
 pub use image::*;
 pub use pipeline_layout::*;

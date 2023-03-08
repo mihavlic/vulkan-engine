@@ -135,6 +135,10 @@ impl SwapchainMutableState {
         self.current_extent = extent.clone();
         self.resized_to = None;
         self.next_out_of_date = false;
+        assert!(
+            self.stashed_image.is_none(),
+            "Destroying a swapchain while its images are acquired is disallowed"
+        );
 
         let max_image_count = if surface_info.max_image_count == 0 {
             u32::MAX
@@ -164,10 +168,6 @@ impl SwapchainMutableState {
             .create_swapchain_khr(&create_info, ctx.allocator_callbacks())?;
 
         if create_info.old_swapchain != vk::SwapchainKHR::null() {
-            assert!(
-                self.stashed_image.is_none(),
-                "Destroying a swapchain while its images are acquired is disallowed"
-            );
             ctx.device()
                 .destroy_swapchain_khr(create_info.old_swapchain, ctx.allocator_callbacks());
         }

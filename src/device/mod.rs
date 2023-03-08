@@ -11,8 +11,8 @@ use crate::{
     instance::{self, Instance},
     object::{
         self, create_compute_pipeline_impl, Buffer, ComputePipeline, DescriptorSetLayout,
-        GraphicsPipeline, Image, PipelineLayout, RenderPass, RenderPassMode, Sampler, ShaderModule,
-        Swapchain,
+        Framebuffer, GraphicsPipeline, Image, PipelineLayout, RenderPass, RenderPassMode, Sampler,
+        ShaderModule, Swapchain,
     },
     storage::{nostore::SimpleStorage, ObjectStorage},
     tracing::shim_macros::{info, trace},
@@ -91,6 +91,7 @@ pub struct Device {
     pub(crate) compute_pipelines: SimpleStorage<ComputePipeline>,
     pub(crate) shader_modules: SimpleStorage<ShaderModule>,
     pub(crate) samplers: SimpleStorage<Sampler>,
+    pub(crate) framebuffers: SimpleStorage<Framebuffer>,
     pub(crate) render_passes: SimpleStorage<RenderPass>,
     pub(crate) pipeline_layouts: SimpleStorage<PipelineLayout>,
     pub(crate) descriptor_set_layouts: SimpleStorage<DescriptorSetLayout>,
@@ -275,36 +276,37 @@ impl Device {
             .unwrap();
 
         let inner = Device {
-            pipeline_cache: vk::PipelineCache::null(),
             threadpool: ManuallyDrop::new(threadpool),
+            pipeline_cache: vk::PipelineCache::null(),
 
-            instance,
             device,
             physical_device,
             physical_device_properties,
             physical_device_features,
-
-            queue_families,
             queue_selection_mapping,
-            queues,
 
+            queues,
+            queue_families,
             graphics_pipelines: SimpleStorage::new(),
+
             compute_pipelines: SimpleStorage::new(),
             shader_modules: SimpleStorage::new(),
             samplers: SimpleStorage::new(),
+            framebuffers: SimpleStorage::new(),
             render_passes: SimpleStorage::new(),
             pipeline_layouts: SimpleStorage::new(),
             descriptor_set_layouts: SimpleStorage::new(),
             image_storage: SimpleStorage::new(),
             buffer_storage: SimpleStorage::new(),
             swapchain_storage: SimpleStorage::new(),
-
             allocator,
 
             synchronization_manager: parking_lot::RwLock::new(SubmissionManager::new()),
-            generation_manager: parking_lot::RwLock::new(GenerationManager::new(10)),
 
+            generation_manager: parking_lot::RwLock::new(GenerationManager::new(10)),
             device_table,
+
+            instance,
         };
 
         OwnedDevice(Arc::new(inner))
@@ -379,6 +381,12 @@ impl Device {
             .get_or_create(spirv.as_ref(), self)
             .map(object::ShaderModule)
     }
+    pub unsafe fn create_descriptor_sampler(
+        &self,
+        info: object::SamplerCreateInfo,
+    ) -> VulkanResult<object::Sampler> {
+        self.samplers.get_or_create(info, self).map(object::Sampler)
+    }
     pub unsafe fn create_descriptor_set_layout(
         &self,
         info: object::DescriptorSetLayoutCreateInfo,
@@ -405,6 +413,29 @@ impl Device {
             .map(object::GraphicsPipeline)
             // infallible since the pipeline creation is delayed and no api calls are made
             .unwrap()
+    }
+    // FIXME this currently uses the same type as delayed pipelines which may be more elegant
+    // but in cases where we know the pipeline's formats we don't really need all the machinery
+    pub unsafe fn create_graphics_pipeline(
+        &self,
+        info: object::GraphicsPipelineCreateInfo,
+    ) -> VulkanResult<object::ConcreteGraphicsPipeline> {
+        let mut info = info;
+        assert!(
+            !matches!(info.render_pass, RenderPassMode::Delayed),
+            "A delayed pipeline cannot be created as concrete"
+        );
+        // eh
+        let mode = std::mem::take(&mut info.render_pass);
+
+        let delayed = self
+            .graphics_pipelines
+            .get_or_create(info, self)
+            .map(object::GraphicsPipeline)
+            // infallible since the pipeline creation is delayed and no api calls are made
+            .unwrap();
+
+        delayed.get_concrete_for_mode(mode, self)
     }
     pub unsafe fn create_compute_pipeline(
         &self,
@@ -650,6 +681,7 @@ pub(crate) unsafe fn __test_init_device(mock_device: bool) -> OwnedDevice {
     device
 }
 
+#[allow(unused)]
 unsafe fn select_device(
     physical_devices: &Vec<vk::PhysicalDevice>,
     physical_device_properties: &Vec<vk::PhysicalDeviceProperties>,
@@ -688,7 +720,6 @@ unsafe fn select_device(
                     device_considered[i] == false
                         &&
                         // FIXME quadratic complexity, maybe do this beforehand into a vector?
-                        // though I think we can at most 4 devices in a system
                         CStr::from_ptr(device.device_name.as_ptr())
                             .to_str()
                             .expect("Device name is invalid UTF8")
@@ -727,7 +758,7 @@ unsafe fn select_device(
         let physical_device = physical_devices[i];
         let physical_device_properties = &physical_device_properties[i];
 
-        let _device_name =
+        let device_name =
             CStr::from_ptr(physical_device_properties.device_name.as_ptr()).to_string_lossy();
 
         // extension criteria
@@ -746,7 +777,7 @@ unsafe fn select_device(
             let difference = device_extensions.difference(&scratch_extensions);
 
             if difference.clone().next().is_some() {
-                let _iter =
+                let iter =
                     format_utils::IterDisplay::new(difference, |i, d| i.to_string_lossy().fmt(d));
 
                 trace!("Device '{device_name}' is missing extensions:\n{iter}");
@@ -842,8 +873,7 @@ unsafe fn select_device(
                 }
 
                 info!(
-                    "Device '{}' skipped because it couldn't satisfy queue selection:\nTODO",
-                    device_name, /* selection */
+                    "Device '{device_name}' skipped because it couldn't satisfy queue selection:\nTODO",
                 );
             }
         }
