@@ -1,4 +1,3 @@
-#![feature(iter_array_chunks)]
 #![allow(unused)]
 
 pub extern crate pumice_vma as vma;
