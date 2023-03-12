@@ -16,7 +16,7 @@ pub fn to_version(version: u32) -> (u16, u16, u16, u16) {
     )
 }
 
-pub struct Colored<'a>(Severity, &'a dyn Display);
+pub struct Colored<'a>(pub Severity, pub &'a dyn Display);
 
 impl<'a> Display for Colored<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

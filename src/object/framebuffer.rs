@@ -58,6 +58,12 @@ pub enum AttachmentMode {
     Imageless(Vec<ImagelessAttachment>),
 }
 
+impl Default for AttachmentMode {
+    fn default() -> Self {
+        Self::Normal(Vec::new())
+    }
+}
+
 impl AttachmentMode {
     pub fn imageless_from_images<'a>(
         images: impl IntoIterator<Item = &'a ObjRef<super::Image>>,
@@ -87,11 +93,15 @@ impl FramebufferCreateInfo {
         let bump = Bump::new();
         let mut pnext_head: *const std::ffi::c_void = std::ptr::null();
 
+        let mut flags = self.flags;
+
         let attachments = match &self.attachments {
             AttachmentMode::Normal(s) => {
                 &*bump.alloc_slice_fill_iter(s.iter().map(|&(_, view)| view))
             }
             AttachmentMode::Imageless(s) => {
+                flags |= vk::FramebufferCreateFlags::IMAGELESS;
+
                 let imageless =
                     bump.alloc_slice_fill_iter(s.iter().map(ImagelessAttachment::to_vk));
                 let p = bump.alloc(vk::FramebufferAttachmentsCreateInfoKHR {
@@ -107,7 +117,7 @@ impl FramebufferCreateInfo {
 
         let info = vk::FramebufferCreateInfo {
             p_next: pnext_head,
-            flags: self.flags,
+            flags,
             render_pass: self.render_pass.get_handle(),
             attachment_count: attachments.len() as u32,
             p_attachments: attachments.as_ffi_ptr(),

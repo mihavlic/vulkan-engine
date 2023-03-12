@@ -40,14 +40,9 @@ impl RingBufferCollectionConfig for DescriptorAllocatorConfig {
     const LABEL: &'static str = "DescriptorAllocator buffer";
 }
 
-pub struct DescriptorAllocator {
-    free_pools: Vec<vk::DescriptorPool>,
-    pools: Vec<vk::DescriptorPool>,
-    buffers: RingBufferCollection<DescriptorAllocatorConfig>,
-}
-
+#[macro_export]
 macro_rules! desc_set_sizes {
-    ($($count:literal * $kind:ident,)+) => {
+    ($($count:literal * $kind:ident),+ $(,)?) => {
         &[
             $(
                 vk::DescriptorPoolSize {
@@ -76,30 +71,21 @@ const DESCRIPTOR_SET_SIZES: &[vk::DescriptorPoolSize] = desc_set_sizes!(
     256 * INPUT_ATTACHMENT,
 );
 
-impl DescriptorAllocator {
-    pub(crate) fn new() -> Self {
+pub struct DescriptorSetAllocator {
+    free_pools: Vec<vk::DescriptorPool>,
+    pools: Vec<vk::DescriptorPool>,
+    sizes: &'static [vk::DescriptorPoolSize],
+}
+
+impl DescriptorSetAllocator {
+    pub fn new(sizes: &'static [vk::DescriptorPoolSize]) -> Self {
         Self {
             free_pools: Vec::new(),
             pools: Vec::new(),
-            buffers: RingBufferCollection::new(),
+            sizes,
         }
     }
-    pub(crate) unsafe fn reset(&mut self, device: &Device) {
-        self.free_pools.extend(self.pools.drain(..).map(|p| {
-            device.device().reset_descriptor_pool(p, None);
-            p
-        }));
-        self.buffers.reset();
-    }
-    pub(crate) unsafe fn destroy(&mut self, device: &Device) {
-        for &pool in self.pools.iter().chain(&self.free_pools) {
-            device
-                .device()
-                .destroy_descriptor_pool(pool, device.allocator_callbacks());
-        }
-        self.buffers.destroy(device);
-    }
-    pub(crate) unsafe fn allocate_set(
+    pub unsafe fn allocate_set(
         &mut self,
         layout: &ObjRef<object::DescriptorSetLayout>,
         device: &Device,
@@ -146,8 +132,8 @@ impl DescriptorAllocator {
         let info = vk::DescriptorPoolCreateInfo {
             flags: vk::DescriptorPoolCreateFlags::empty(),
             max_sets: 512,
-            pool_size_count: DESCRIPTOR_SET_SIZES.len() as u32,
-            p_pool_sizes: DESCRIPTOR_SET_SIZES.as_ptr(),
+            pool_size_count: self.sizes.len() as u32,
+            p_pool_sizes: self.sizes.as_ptr(),
             ..Default::default()
         };
         let pool = device
@@ -155,6 +141,59 @@ impl DescriptorAllocator {
             .create_descriptor_pool(&info, device.allocator_callbacks())
             .unwrap();
         self.pools.push(pool);
+    }
+    pub unsafe fn reset(&mut self, device: &Device) {
+        self.free_pools.extend(self.pools.drain(..).map(|p| {
+            device.device().reset_descriptor_pool(p, None);
+            p
+        }));
+    }
+    pub unsafe fn destroy(&mut self, device: &Device) {
+        for &pool in self.pools.iter().chain(&self.free_pools) {
+            device
+                .device()
+                .destroy_descriptor_pool(pool, device.allocator_callbacks());
+        }
+    }
+}
+
+pub struct UniformAllocator {
+    buffers: RingBufferCollection<DescriptorAllocatorConfig>,
+}
+
+pub struct UniformSetAllocator {
+    pub sets: DescriptorSetAllocator,
+    pub uniforms: UniformAllocator,
+}
+
+impl UniformSetAllocator {
+    pub fn new() -> Self {
+        Self {
+            sets: DescriptorSetAllocator::new(DESCRIPTOR_SET_SIZES),
+            uniforms: UniformAllocator::new(),
+        }
+    }
+    pub(crate) unsafe fn reset(&mut self, device: &Device) {
+        self.sets.reset(device);
+        self.uniforms.reset();
+    }
+    pub(crate) unsafe fn destroy(&mut self, device: &Device) {
+        self.sets.destroy(device);
+        self.uniforms.destroy(device);
+    }
+}
+
+impl UniformAllocator {
+    pub(crate) fn new() -> Self {
+        Self {
+            buffers: RingBufferCollection::new(),
+        }
+    }
+    pub(crate) unsafe fn reset(&mut self) {
+        self.buffers.reset();
+    }
+    pub(crate) unsafe fn destroy(&mut self, device: &Device) {
+        self.buffers.destroy(device);
     }
     pub unsafe fn allocate_uniform_iter<T, I: IntoIterator<Item = T>>(
         &mut self,
@@ -474,7 +513,7 @@ impl<'a> DescSetBuilder<'a> {
     unsafe fn finish_internal(
         &mut self,
         device: &Device,
-        allocator: &mut DescriptorAllocator,
+        allocator: &mut UniformSetAllocator,
     ) -> FinishedSet {
         let mut dynamic_offsets = SmallVec::new();
         for (desc, data) in self
@@ -497,7 +536,7 @@ impl<'a> DescSetBuilder<'a> {
         }
 
         if self.set == vk::DescriptorSet::null() {
-            self.set = allocator.allocate_set(self.layout, device);
+            self.set = allocator.sets.allocate_set(self.layout, device);
             let bindings = &self.layout.get_create_info().bindings;
 
             write_descriptors(device, &[self]);

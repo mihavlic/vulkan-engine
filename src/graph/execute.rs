@@ -54,7 +54,9 @@ use super::{
         MemoryBarrier, PassMeta, PassObjectState, ResourceFirstAccess,
         ResourceFirstAccessInterface, ResourceState, ResourceSubresource, Submission,
     },
-    descriptors::{bind_descriptor_sets, DescriptorAllocator, FinishedSet, UniformResult},
+    descriptors::{
+        bind_descriptor_sets, FinishedSet, UniformAllocator, UniformResult, UniformSetAllocator,
+    },
     record::{BufferData, CompilationInput, GraphBuilder, ImageData, ImageMove, PassData},
     resource_marker::{ResourceMarker, TypeNone, TypeOption, TypeSome},
     reverse_edges::{ChildRelativeKey, DFSCommand, ImmutableGraph, NodeGraph, NodeKey},
@@ -466,6 +468,7 @@ impl<'a> GraphExecutor<'a> {
         let res = state
             .descriptor_allocator
             .borrow_mut()
+            .uniforms
             .allocate_uniform_iter(iter, &state.device);
         res
     }
@@ -474,6 +477,7 @@ impl<'a> GraphExecutor<'a> {
         let res = state
             .descriptor_allocator
             .borrow_mut()
+            .uniforms
             .allocate_uniform_element(value, &state.device);
         res
     }
@@ -482,6 +486,7 @@ impl<'a> GraphExecutor<'a> {
         let res = state
             .descriptor_allocator
             .borrow_mut()
+            .uniforms
             .allocate_uniform_raw(layout, &state.device);
         res
     }
@@ -526,7 +531,7 @@ pub(crate) struct CompiledGraphVulkanState {
     fences: RefCell<FenceStack>,
     command_pools: RefCell<CommandBufferStack>,
 
-    pub(crate) descriptor_allocator: RefCell<DescriptorAllocator>,
+    pub(crate) descriptor_allocator: RefCell<UniformSetAllocator>,
     pub(crate) device: OwnedDevice,
 }
 
@@ -577,7 +582,7 @@ impl CompiledGraphVulkanState {
             physical_buffers,
             external_resources,
             device,
-            descriptor_allocator: RefCell::new(DescriptorAllocator::new()),
+            descriptor_allocator: RefCell::new(UniformSetAllocator::new()),
             fences: RefCell::new(FenceStack::new()),
         }
     }
@@ -1145,9 +1150,7 @@ impl CompiledGraph {
                                 &accessors_scratch,
                                 layout,
                                 final_queue_family,
-                                state
-                                    .get_mut(&image_storage_lock)
-                                    .get_synchronization_state(),
+                                state.get_mut(&image_storage_lock).synchronization_state(),
                                 &mut submission_extra,
                                 |d| dummy_submissions.push(d),
                                 |s, collection| collection.entry(s).or_default(),

@@ -481,7 +481,6 @@ impl GraphBuilder {
         pass: T,
         name: N,
     ) -> GraphPass {
-        // we don't use impl Named here because it breaks type inference and we cannot name the closure type to resolve it so it makes the trait unusable
         let handle = GraphPass::new(self.0.input.passes.len());
         let (data, pass_object) = {
             let mut builder = GraphPassBuilder::new(self, handle);

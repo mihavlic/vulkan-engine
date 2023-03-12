@@ -269,7 +269,7 @@ impl ImageMutableState {
             synchronization: SynchronizationState::with_initial_layout(layout),
         }
     }
-    pub(crate) fn get_synchronization_state(&mut self) -> &mut SynchronizationState<ImageMarker> {
+    pub(crate) fn synchronization_state(&mut self) -> &mut SynchronizationState<ImageMarker> {
         &mut self.synchronization
     }
     pub(crate) unsafe fn get_view(
@@ -430,5 +430,15 @@ impl ObjRef<Image> {
             |d| &d.mutable,
             |m| m.get_view(data.handle, info, batch_id, Some(&label), device),
         )
+    }
+    pub fn get_whole_subresource_range(&self) -> vk::ImageSubresourceRange {
+        let info = self.get_create_info();
+        vk::ImageSubresourceRange {
+            aspect_mask: info.format.get_format_aspects().0,
+            base_mip_level: 0,
+            level_count: vk::REMAINING_MIP_LEVELS,
+            base_array_layer: 0,
+            layer_count: vk::REMAINING_ARRAY_LAYERS,
+        }
     }
 }

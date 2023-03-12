@@ -204,6 +204,7 @@ impl Object for Buffer {
                 }
             })
     }
+
     unsafe fn destroy(
         data: &Self::Data,
         lock: &SynchronizationLock,

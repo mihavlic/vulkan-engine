@@ -14,7 +14,7 @@ use pumice::vk;
 use pumice::VulkanResult;
 use smallvec::SmallVec;
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Default)]
 pub struct SubpassDescription {
     pub input_attachments: Vec<vk::AttachmentReference>,
     pub color_attachments: Vec<vk::AttachmentReference>,
@@ -57,7 +57,7 @@ impl SubpassDescription {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct RenderPassCreateInfo {
     pub flags: vk::RenderPassCreateFlags,
     pub attachments: Vec<vk::AttachmentDescription>,

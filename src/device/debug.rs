@@ -1,4 +1,7 @@
-use std::{ffi::c_char, fmt::Display};
+use std::{
+    ffi::c_char,
+    fmt::{Display, Formatter},
+};
 
 use pumice::{util::ObjectHandle, vk};
 use smallvec::SmallVec;
@@ -10,6 +13,31 @@ pub fn with_temporary_cstr<F: FnOnce(*const c_char)>(display: &dyn Display, fun:
     use std::io::Write;
     write!(name_buf, "{display}\0");
     fun(name_buf.as_ptr().cast());
+}
+
+pub unsafe fn debug_label_span(
+    cmd: vk::CommandBuffer,
+    device: &Device,
+    label: impl Fn(&mut Formatter) -> std::fmt::Result,
+    fun: impl FnOnce(),
+) {
+    let d = device.device();
+    if device.debug() {
+        let display = LazyDisplay(label);
+        with_temporary_cstr(&display, |cstr| {
+            let info = vk::DebugUtilsLabelEXT {
+                p_label_name: cstr,
+                ..Default::default()
+            };
+            d.cmd_begin_debug_utils_label_ext(cmd, &info);
+        });
+    }
+
+    fun();
+
+    if device.debug() {
+        d.cmd_end_debug_utils_label_ext(cmd);
+    }
 }
 
 pub fn maybe_attach_debug_label<H: ObjectHandle>(handle: H, name: &dyn Display, device: &Device) {

@@ -5,7 +5,7 @@ pub mod ringbuffer_collection;
 pub mod staging;
 pub mod submission;
 
-use self::{batch::GenerationManager, submission::SubmissionManager};
+use self::{batch::GenerationManager, staging::StagingManager, submission::SubmissionManager};
 use super::instance::InstanceCreateInfo;
 use crate::{
     instance::{self, Instance},
@@ -65,6 +65,7 @@ pub struct DeviceCreateInfo<'a> {
     pub config: &'a mut ApiLoadConfig<'a>,
     pub device_features: vk::PhysicalDeviceFeatures,
     pub queue_family_selection: &'a [QueueFamilySelection<'a>],
+    pub staging_transfer_queue: (usize, usize),
     /// substrings of device names, devices that contain them are prioritized
     pub device_substrings: &'a [&'a str],
     pub verbose: bool,
@@ -102,6 +103,8 @@ pub struct Device {
     // allocator
     pub(crate) allocator: Allocator,
 
+    // staged memory transfers to and fro
+    pub(crate) staging_manager: parking_lot::RwLock<StagingManager>,
     // synchronization
     pub(crate) synchronization_manager: parking_lot::RwLock<SubmissionManager>,
     // coarse grained synchronization
@@ -147,6 +150,7 @@ impl Device {
             device_features,
             queue_family_selection,
             device_substrings,
+            staging_transfer_queue,
             verbose: _,
             p_next,
         } = info;
@@ -275,6 +279,23 @@ impl Device {
             .build()
             .unwrap();
 
+        let staging_transfer_queue = {
+            let (index, offset) = staging_transfer_queue;
+            let (family, range) = queue_selection_mapping[index].clone();
+            let queue = queues[range][offset];
+
+            submission::Queue {
+                raw: queue,
+                family: family as u32,
+            }
+        };
+
+        let staging_manager = StagingManager::new(
+            staging_transfer_queue,
+            instance.allocator_callbacks(),
+            &device,
+        );
+
         let inner = Device {
             threadpool: ManuallyDrop::new(threadpool),
             pipeline_cache: vk::PipelineCache::null(),
@@ -301,8 +322,8 @@ impl Device {
             swapchain_storage: SimpleStorage::new(),
             allocator,
 
+            staging_manager: parking_lot::RwLock::new(staging_manager),
             synchronization_manager: parking_lot::RwLock::new(SubmissionManager::new()),
-
             generation_manager: parking_lot::RwLock::new(GenerationManager::new(10)),
             device_table,
 
@@ -366,12 +387,19 @@ impl Device {
     }
     pub unsafe fn create_shader_module_read<R: io::Read + io::Seek>(
         &self,
-        data: &mut R,
+        spirv: &mut R,
     ) -> VulkanResult<object::ShaderModule> {
-        let data = read_spirv(data).map_err(|_| vk::Result::ERROR_UNKNOWN)?;
+        let data = read_spirv(spirv).map_err(|_| vk::Result::ERROR_UNKNOWN)?;
         self.shader_modules
             .get_or_create(data.as_ref(), self)
             .map(object::ShaderModule)
+    }
+    pub unsafe fn create_shader_module_spirv_unaligned(
+        &self,
+        spirv: impl AsRef<[u8]>,
+    ) -> VulkanResult<object::ShaderModule> {
+        let mut cursor = std::io::Cursor::new(spirv.as_ref());
+        self.create_shader_module_read(&mut cursor)
     }
     pub unsafe fn create_shader_module_spirv(
         &self,
@@ -394,6 +422,22 @@ impl Device {
         self.descriptor_set_layouts
             .get_or_create(info, self)
             .map(object::DescriptorSetLayout)
+    }
+    pub unsafe fn create_render_pass(
+        &self,
+        info: object::RenderPassCreateInfo,
+    ) -> VulkanResult<object::RenderPass> {
+        self.render_passes
+            .get_or_create(info, self)
+            .map(object::RenderPass)
+    }
+    pub unsafe fn create_framebuffer(
+        &self,
+        info: object::FramebufferCreateInfo,
+    ) -> VulkanResult<object::Framebuffer> {
+        self.framebuffers
+            .get_or_create(info, self)
+            .map(object::Framebuffer)
     }
     pub unsafe fn create_pipeline_layout(
         &self,
@@ -672,6 +716,7 @@ pub(crate) unsafe fn __test_init_device(mock_device: bool) -> OwnedDevice {
             coalesce: true,
             support_surfaces: &[],
         }],
+        staging_transfer_queue: (0, 0),
         // in case the user has the Mock ICD installed, possibly prefer that
         device_substrings: if mock_device { &["Mock"] } else { &[] },
         verbose: false,
