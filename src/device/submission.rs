@@ -5,7 +5,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use parking_lot::{MappedRwLockReadGuard, RwLockReadGuard};
+use parking_lot::{MappedRwLockReadGuard, RwLockReadGuard, RwLockWriteGuard};
 use pumice::{vk, VulkanResult};
 use smallvec::SmallVec;
 
@@ -466,7 +466,10 @@ impl Device {
         extend.extend(iter);
     }
     pub fn idle_cleanup_poll(&self) {
-        self.synchronization_manager.write().collect();
+        let mut submission = self.synchronization_manager.write();
+        submission.collect();
+        let submission = RwLockWriteGuard::downgrade(submission);
+        self.staging_manager.write().collect(&submission);
     }
     pub fn wait_idle(&self) {
         // let mut submissions = self.synchronization_manager.write();

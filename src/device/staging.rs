@@ -483,6 +483,27 @@ impl StagingManager {
             },
         );
     }
+    pub(crate) unsafe fn flush(&mut self, device: &Device) -> Option<QueueSubmission> {
+        self.command.flush(self.queue, device)
+    }
+    pub(crate) fn collect(&mut self, submission_manager: &SubmissionManager) {
+        self.command.poll(submission_manager)
+    }
+}
+
+pub enum WriteCommand<'a> {
+    Buffer {
+        buffer: &'a ObjRef<object::Buffer>,
+        offset: u64,
+        layout: std::alloc::Layout,
+        callback: Box<dyn FnMut(*mut u8) + Send>,
+    },
+    Image {
+        image: &'a ObjRef<object::Image>,
+        texel_layout: std::alloc::Layout,
+        regions: Vec<ImageWrite>,
+        callback: Box<dyn FnMut(*mut u8, usize, &ImageWrite) + Send>,
+    },
 }
 
 impl Device {
@@ -507,6 +528,36 @@ impl Device {
         self.staging_manager
             .write()
             .write_image(image, texel_layout, regions, fun, self)
+    }
+    pub unsafe fn flush_staged_transfers(&self) -> Option<QueueSubmission> {
+        self.staging_manager.write().flush(self)
+    }
+    pub unsafe fn write_multiple<'a>(
+        &self,
+        commands: impl IntoIterator<Item = WriteCommand<'a>>,
+    ) -> Option<QueueSubmission> {
+        let mut staging = None;
+
+        for c in commands {
+            let staging = staging.get_or_insert_with(|| self.staging_manager.write());
+
+            match c {
+                WriteCommand::Buffer {
+                    buffer,
+                    offset,
+                    layout,
+                    callback,
+                } => staging.write_buffer(buffer, offset, layout, callback, self),
+                WriteCommand::Image {
+                    image,
+                    texel_layout,
+                    regions,
+                    callback,
+                } => staging.write_image(image, texel_layout, regions, callback, self),
+            }
+        }
+
+        staging?.flush(self)
     }
 }
 

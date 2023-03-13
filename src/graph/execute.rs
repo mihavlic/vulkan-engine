@@ -42,7 +42,9 @@ use crate::{
     },
     passes::RenderPass,
     simple_handle,
-    storage::{constant_ahash_hashmap, constant_ahash_hashset, ObjectStorage},
+    storage::{
+        constant_ahash_hashmap, constant_ahash_hashset, DefaultAhashRandomstate, ObjectStorage,
+    },
     util::ffi_ptr::AsFFiPtr,
 };
 
@@ -272,8 +274,10 @@ impl CommandBufferStack {
     }
 }
 
-pub struct GraphExecutor<'a> {
+pub struct GraphExecutor<'a, 'b> {
     pub(crate) graph: &'a CompiledGraph,
+    pub(crate) extra_submission_dependencies:
+        RefCell<&'b mut std::collections::HashSet<QueueSubmission, DefaultAhashRandomstate>>,
     pub(crate) blackboard: &'a RefCell<BlackBoard>,
     pub(crate) command_buffer: vk::CommandBuffer,
     pub(crate) swapchain_image_indices: &'a ahash::HashMap<GraphImage, u32>,
@@ -281,7 +285,12 @@ pub struct GraphExecutor<'a> {
     pub(crate) raw_buffers: &'a [Option<vk::Buffer>],
 }
 
-impl<'a> GraphExecutor<'a> {
+impl<'a, 'b> GraphExecutor<'a, 'b> {
+    pub fn add_extra_submission_dependency(&self, dependency: QueueSubmission) {
+        self.extra_submission_dependencies
+            .borrow_mut()
+            .insert(dependency);
+    }
     pub fn execution_blackboard(&self) -> Ref<BlackBoard> {
         self.blackboard.borrow()
     }
@@ -1340,6 +1349,10 @@ impl CompiledGraph {
                     dependencies: extra_dependencies,
                 } = submission_extra.remove(&submission).unwrap_or_default();
 
+                let mut extra_submission_dependencies =
+                    std::collections::HashSet::<QueueSubmission, DefaultAhashRandomstate>::default(
+                    );
+
                 d.begin_command_buffer(
                     command_buffer,
                     &vk::CommandBufferBeginInfo {
@@ -1403,6 +1416,9 @@ impl CompiledGraph {
                         raw_images: &raw_images,
                         raw_buffers: &raw_buffers,
                         blackboard: &blackboard,
+                        extra_submission_dependencies: RefCell::new(
+                            &mut extra_submission_dependencies,
+                        ),
                     };
                     state.passes.borrow_mut()[pass.index()]
                         .on_created(|p| p.execute(&executor, &state.device))
@@ -1460,7 +1476,12 @@ impl CompiledGraph {
                         }
                     }));
                 }
-                wait_semaphores.extend(extra_dependencies.iter().map(|timeline| {
+                let mut active = Vec::new();
+                state
+                    .device
+                    .collect_active_submission_datas(extra_submission_dependencies, &mut active);
+
+                wait_semaphores.extend(extra_dependencies.iter().chain(&active).map(|timeline| {
                     vk::SemaphoreSubmitInfoKHR {
                         semaphore: timeline.raw,
                         value: timeline.value,
@@ -1691,20 +1712,11 @@ impl DummySubmission {
         !self.image_barriers.is_empty() || !self.buffer_barriers.is_empty()
     }
 }
+#[derive(Default)]
 pub(crate) struct SubmissionExtra {
     pub(crate) image_barriers: Vec<ImageBarrier>,
     pub(crate) buffer_barriers: Vec<BufferBarrier>,
-    pub(crate) dependencies: ahash::HashSet<TimelineSemaphore>,
-}
-
-impl Default for SubmissionExtra {
-    fn default() -> Self {
-        Self {
-            image_barriers: Default::default(),
-            buffer_barriers: Default::default(),
-            dependencies: constant_ahash_hashset(),
-        }
-    }
+    pub(crate) dependencies: std::collections::HashSet<TimelineSemaphore, DefaultAhashRandomstate>,
 }
 
 pub(crate) struct SwapchainPresent {

@@ -22,6 +22,7 @@ pub struct GenerationId(u32);
 
 impl GenerationId {
     pub const EARLIEST: Self = Self(0);
+    pub const NEVER: Self = Self(u32::MAX);
 }
 
 struct OpenGenerationEntry {

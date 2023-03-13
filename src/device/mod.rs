@@ -5,6 +5,8 @@ pub mod ringbuffer_collection;
 pub mod staging;
 pub mod submission;
 
+pub use {batch::*, debug::*, reflection::*, ringbuffer_collection::*, staging::*, submission::*};
+
 use self::{batch::GenerationManager, staging::StagingManager, submission::SubmissionManager};
 use super::instance::InstanceCreateInfo;
 use crate::{
