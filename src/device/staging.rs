@@ -491,21 +491,6 @@ impl StagingManager {
     }
 }
 
-pub enum WriteCommand<'a> {
-    Buffer {
-        buffer: &'a ObjRef<object::Buffer>,
-        offset: u64,
-        layout: std::alloc::Layout,
-        callback: Box<dyn FnMut(*mut u8) + Send>,
-    },
-    Image {
-        image: &'a ObjRef<object::Image>,
-        texel_layout: std::alloc::Layout,
-        regions: Vec<ImageWrite>,
-        callback: Box<dyn FnMut(*mut u8, usize, &ImageWrite) + Send>,
-    },
-}
-
 impl Device {
     pub unsafe fn write_buffer<F: FnMut(*mut u8) + Send + 'static>(
         &self,
@@ -513,10 +498,10 @@ impl Device {
         offset: u64,
         layout: std::alloc::Layout,
         mut fun: F,
-    ) {
-        self.staging_manager
-            .write()
-            .write_buffer(buffer, offset, layout, fun, self);
+    ) -> QueueSubmission {
+        let mut write = self.staging_manager.write();
+        write.write_buffer(buffer, offset, layout, fun, self);
+        write.flush(self).unwrap()
     }
     pub unsafe fn write_image<F: FnMut(*mut u8, usize, &ImageWrite) + Send + 'static>(
         &self,
@@ -524,40 +509,18 @@ impl Device {
         texel_layout: std::alloc::Layout,
         regions: Vec<ImageWrite>,
         mut fun: F,
-    ) {
-        self.staging_manager
-            .write()
-            .write_image(image, texel_layout, regions, fun, self)
-    }
-    pub unsafe fn flush_staged_transfers(&self) -> Option<QueueSubmission> {
-        self.staging_manager.write().flush(self)
+    ) -> QueueSubmission {
+        let mut write = self.staging_manager.write();
+        write.write_image(image, texel_layout, regions, fun, self);
+        write.flush(self).unwrap()
     }
     pub unsafe fn write_multiple<'a>(
         &self,
-        commands: impl IntoIterator<Item = WriteCommand<'a>>,
+        fun: impl FnOnce(&mut StagingManager),
     ) -> Option<QueueSubmission> {
-        let mut staging = None;
-
-        for c in commands {
-            let staging = staging.get_or_insert_with(|| self.staging_manager.write());
-
-            match c {
-                WriteCommand::Buffer {
-                    buffer,
-                    offset,
-                    layout,
-                    callback,
-                } => staging.write_buffer(buffer, offset, layout, callback, self),
-                WriteCommand::Image {
-                    image,
-                    texel_layout,
-                    regions,
-                    callback,
-                } => staging.write_image(image, texel_layout, regions, callback, self),
-            }
-        }
-
-        staging?.flush(self)
+        let mut write = self.staging_manager.write();
+        fun(&mut write);
+        write.flush(self)
     }
 }
 
