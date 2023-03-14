@@ -24,7 +24,7 @@ use crate::{
     device::{
         batch::GenerationId,
         debug::{maybe_attach_debug_label, with_temporary_cstr, DisplayConcat, LazyDisplay},
-        ringbuffer_collection::SuballocatedMemory,
+        ring::SuballocatedMemory,
         submission::{self, QueueSubmission, TimelineSemaphore},
         OwnedDevice,
     },

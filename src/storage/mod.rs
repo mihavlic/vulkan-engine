@@ -114,6 +114,8 @@ impl ReentrantMutex {
 
 #[derive(Clone, Copy, Default)]
 pub struct DefaultAhashRandomstate;
+pub type DefaultAhashMap<K, V> = std::collections::HashMap<K, V, DefaultAhashRandomstate>;
+pub type DefaultAhashSet<K> = std::collections::HashSet<K, DefaultAhashRandomstate>;
 
 impl BuildHasher for DefaultAhashRandomstate {
     type Hasher = ahash::AHasher;

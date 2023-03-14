@@ -1,11 +1,11 @@
 pub mod batch;
 pub mod debug;
 pub mod reflection;
-pub mod ringbuffer_collection;
+pub mod ring;
 pub mod staging;
 pub mod submission;
 
-pub use {batch::*, debug::*, reflection::*, ringbuffer_collection::*, staging::*, submission::*};
+pub use {batch::*, debug::*, reflection::*, ring::*, staging::*, submission::*};
 
 use self::{batch::GenerationManager, staging::StagingManager, submission::SubmissionManager};
 use super::instance::InstanceCreateInfo;
@@ -41,7 +41,7 @@ use std::{
     ops::Deref,
     ptr::NonNull,
     slice,
-    sync::Arc,
+    sync::{atomic::AtomicU64, Arc},
     time::Duration,
 };
 

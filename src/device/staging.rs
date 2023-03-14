@@ -2,6 +2,7 @@ use std::{
     cell::{Cell, UnsafeCell},
     collections::VecDeque,
     ffi::c_void,
+    mem::ManuallyDrop,
     sync::Arc,
 };
 
@@ -22,15 +23,15 @@ use crate::{
         GraphBuffer, GraphImage,
     },
     object::{self, HostAccessKind, ObjRef},
-    storage::constant_ahash_hashset,
+    storage::{constant_ahash_hashset, DefaultAhashMap, DefaultAhashSet},
     util::ffi_ptr::AsFFiPtr,
 };
 
 use super::{
     debug::debug_label_span,
-    ringbuffer_collection::{RingBufferCollection, RingBufferCollectionConfig},
+    ring::{QueueRing, RingConfig},
     submission::{self, QueueSubmission, SubmissionManager, TimelineSemaphore},
-    Device,
+    Device, SparseRing,
 };
 
 struct BufferFlushRange {
@@ -39,62 +40,25 @@ struct BufferFlushRange {
     size: u64,
 }
 
-struct StagingManagerConfig;
-impl RingBufferCollectionConfig for StagingManagerConfig {
-    const BUFFER_SIZE: u64 = 16 * 1024 * 1024;
-    const USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags(
+const CONFIG: RingConfig = RingConfig {
+    buffer_size: 16 * 1024 * 1024,
+    usage: vk::BufferUsageFlags(
         vk::BufferUsageFlags::TRANSFER_SRC.0 | vk::BufferUsageFlags::TRANSFER_DST.0,
-    );
-    const ALLOCATION_FLAGS: pumice_vma::AllocationCreateFlags = pumice_vma::AllocationCreateFlags(
-        pumice_vma::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE.0
-            | pumice_vma::AllocationCreateFlags::MAPPED.0,
-    );
-    const REQUIRED_FLAGS: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::HOST_COHERENT;
-    const PREFERRED_FLAGS: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::empty();
-    const LABEL: &'static str = "DescriptorAllocator buffer";
-}
+    ),
+    allocation_flags: vma::AllocationCreateFlags(
+        vma::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE.0
+            | vma::AllocationCreateFlags::MAPPED.0,
+    ),
+    required_flags: vk::MemoryPropertyFlags::HOST_COHERENT,
+    preferred_flags: vk::MemoryPropertyFlags::empty(),
+    label: "DescriptorAllocator buffer",
+};
 
 pub struct StagingManager {
     queue: submission::Queue,
-    buffers: RingBufferCollection<StagingManagerConfig>,
+    ring: SparseRing,
     command: CommandBufferPool,
 }
-
-// #[repr(align(8))]
-// pub struct Align8(u8);
-
-// impl Align8 {
-//     #[inline]
-//     fn new(bytes: *const u8) -> Option<*const Align8> {
-//         ((bytes as usize & 7) == 0).then_some(bytes.cast())
-//     }
-//     #[inline]
-//     fn new_mut(bytes: *mut u8) -> Option<*mut Align8> {
-//         ((bytes as usize & 7) == 0).then_some(bytes.cast())
-//     }
-// }
-
-// pub trait AlignedBytes {
-//     fn bytes(self) -> *const u8;
-// }
-
-// pub trait AlignedBytesMut {
-//     fn bytes_mut(self) -> *mut u8;
-// }
-
-// impl AlignedBytes for *const Align8 {
-//     #[inline(always)]
-//     fn bytes(self) -> *const u8 {
-//         self.cast::<u8>()
-//     }
-// }
-
-// impl AlignedBytesMut for *mut Align8 {
-//     #[inline(always)]
-//     fn bytes_mut(self) -> *mut u8 {
-//         self.cast::<u8>()
-//     }
-// }
 
 pub struct ImageWrite {
     pub buffer_row_length: u32,
@@ -114,7 +78,7 @@ impl StagingManager {
     ) -> Self {
         Self {
             queue: transfer_queue,
-            buffers: RingBufferCollection::new(),
+            ring: SparseRing::new(&CONFIG),
             command: CommandBufferPool::new(transfer_queue.family, callbacks, device),
         }
     }
@@ -217,7 +181,7 @@ impl StagingManager {
         wait_submissions.extend(result.prev_access);
         let mut fun = fun.take().unwrap();
 
-        let staging = self.buffers.allocate(layout, device);
+        let staging = self.ring.allocate(layout, submission, device);
         fun(staging.memory.as_ptr());
 
         // struct A(u32);
@@ -402,7 +366,7 @@ impl StagingManager {
                 texel_layout.align(),
             )
             .unwrap();
-            let staging = self.buffers.allocate(layout, device);
+            let staging = self.ring.allocate(layout, submission, device);
 
             fun(staging.memory.as_ptr(), i, region);
 
@@ -487,7 +451,8 @@ impl StagingManager {
         self.command.flush(self.queue, device)
     }
     pub(crate) fn collect(&mut self, submission_manager: &SubmissionManager) {
-        self.command.poll(submission_manager)
+        self.command.collect(submission_manager);
+        self.ring.collect(submission_manager);
     }
 }
 
@@ -560,7 +525,7 @@ impl CommandBufferPool {
             free_buffers: Vec::new(),
         }
     }
-    pub(crate) fn poll(&mut self, submission_manager: &SubmissionManager) {
+    pub(crate) fn collect(&mut self, submission_manager: &SubmissionManager) {
         while let Some(&(submission, buffer)) = self.buffers.front() {
             if submission_manager.is_submission_finished(submission) {
                 self.buffers.pop_front();

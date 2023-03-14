@@ -103,6 +103,7 @@ fn main() {
             device_substrings: &["NVIDIA"],
             verbose: false,
             p_next: (&dynamic) as *const _ as *const _,
+            staging_transfer_queue: (0, 0),
         };
 
         let device = device::Device::new(info);

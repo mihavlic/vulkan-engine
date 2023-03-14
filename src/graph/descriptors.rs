@@ -11,9 +11,7 @@ use smallvec::SmallVec;
 use crate::{
     device::{
         debug::maybe_attach_debug_label,
-        ringbuffer_collection::{
-            BufferEntry, RingBufferCollection, RingBufferCollectionConfig, SuballocatedMemory,
-        },
+        ring::{BufferEntry, QueueRing, RingConfig, SuballocatedMemory},
         Device,
     },
     graph::allocator::round_up_pow2_usize,
@@ -21,24 +19,6 @@ use crate::{
 };
 
 use super::execute::GraphExecutor;
-
-struct DescriptorAllocatorConfig;
-impl RingBufferCollectionConfig for DescriptorAllocatorConfig {
-    const BUFFER_SIZE: u64 = 16384;
-    const USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags(
-        vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER.0
-            | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER.0
-            | vk::BufferUsageFlags::UNIFORM_BUFFER.0
-            | vk::BufferUsageFlags::STORAGE_BUFFER.0,
-    );
-    const ALLOCATION_FLAGS: pumice_vma::AllocationCreateFlags = pumice_vma::AllocationCreateFlags(
-        pumice_vma::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE.0
-            | pumice_vma::AllocationCreateFlags::MAPPED.0,
-    );
-    const REQUIRED_FLAGS: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::HOST_COHERENT;
-    const PREFERRED_FLAGS: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::empty();
-    const LABEL: &'static str = "DescriptorAllocator buffer";
-}
 
 #[macro_export]
 macro_rules! desc_set_sizes {
@@ -158,7 +138,7 @@ impl DescriptorSetAllocator {
 }
 
 pub struct UniformAllocator {
-    buffers: RingBufferCollection<DescriptorAllocatorConfig>,
+    buffers: QueueRing,
 }
 
 pub struct UniformSetAllocator {
@@ -185,12 +165,29 @@ impl UniformSetAllocator {
 
 impl UniformAllocator {
     pub(crate) fn new() -> Self {
+        const CONFIG: RingConfig = RingConfig {
+            buffer_size: 16384,
+            usage: vk::BufferUsageFlags(
+                vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER.0
+                    | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER.0
+                    | vk::BufferUsageFlags::UNIFORM_BUFFER.0
+                    | vk::BufferUsageFlags::STORAGE_BUFFER.0,
+            ),
+            allocation_flags: pumice_vma::AllocationCreateFlags(
+                pumice_vma::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE.0
+                    | pumice_vma::AllocationCreateFlags::MAPPED.0,
+            ),
+            required_flags: vk::MemoryPropertyFlags::HOST_COHERENT,
+            preferred_flags: vk::MemoryPropertyFlags::empty(),
+            label: "DescriptorAllocator buffer",
+        };
+
         Self {
-            buffers: RingBufferCollection::new(),
+            buffers: QueueRing::new(&CONFIG),
         }
     }
     pub(crate) unsafe fn reset(&mut self) {
-        self.buffers.reset();
+        self.buffers.reset_all();
     }
     pub(crate) unsafe fn destroy(&mut self, device: &Device) {
         self.buffers.destroy(device);

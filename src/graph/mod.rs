@@ -243,11 +243,11 @@ macro_rules! simple_handle {
                 }
                 #[inline]
                 $visibility fn to_raw(&self) -> $crate::graph::RawHandle {
-                    $crate::graph::RawHandle(self.0)
+                    $crate::graph::RawHandle::new(self.index())
                 }
                 #[inline]
                 $visibility fn from_raw(raw: $crate::graph::RawHandle) -> Self {
-                    Self(raw.0)
+                    Self::new(raw.index())
                 }
             }
         )+

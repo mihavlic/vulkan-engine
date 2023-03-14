@@ -100,7 +100,7 @@ impl FramebufferCreateInfo {
                 &*bump.alloc_slice_fill_iter(s.iter().map(|&(_, view)| view))
             }
             AttachmentMode::Imageless(s) => {
-                flags |= vk::FramebufferCreateFlags::IMAGELESS;
+                flags |= vk::FramebufferCreateFlags::IMAGELESS_KHR;
 
                 let imageless =
                     bump.alloc_slice_fill_iter(s.iter().map(ImagelessAttachment::to_vk));
