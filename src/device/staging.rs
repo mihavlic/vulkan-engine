@@ -41,7 +41,7 @@ struct BufferFlushRange {
 }
 
 const CONFIG: RingConfig = RingConfig {
-    buffer_size: 16 * 1024 * 1024,
+    buffer_size: 256 * 1024 * 1024,
     usage: vk::BufferUsageFlags(
         vk::BufferUsageFlags::TRANSFER_SRC.0 | vk::BufferUsageFlags::TRANSFER_DST.0,
     ),
@@ -301,6 +301,7 @@ impl StagingManager {
     pub unsafe fn write_image<F: FnMut(*mut u8, usize, &ImageWrite) + Send + 'static>(
         &mut self,
         dst_image: &ObjRef<object::Image>,
+        final_layout: Option<vk::ImageLayout>,
         texel_layout: std::alloc::Layout,
         regions: Vec<ImageWrite>,
         mut fun: F,
@@ -332,7 +333,9 @@ impl StagingManager {
                     self.queue.family(),
                     TypeSome::new_some(vk::ImageLayout::TRANSFER_DST_OPTIMAL),
                     &[submission],
-                    TypeSome::new_some(vk::ImageLayout::TRANSFER_DST_OPTIMAL),
+                    TypeSome::new_some(
+                        final_layout.unwrap_or(vk::ImageLayout::TRANSFER_DST_OPTIMAL),
+                    ),
                     self.queue.family(),
                     dst_image.get_create_info().sharing_mode_concurrent,
                 );
@@ -444,6 +447,26 @@ impl StagingManager {
                 }
                 // flush the last buffer with a null buffer (specially handled)
                 convert_region((vk::Buffer::null(), 0, regions.first().unwrap()));
+
+                if let Some(to) = final_layout {
+                    if to != vk::ImageLayout::TRANSFER_DST_OPTIMAL {
+                        let barrier = vk::ImageMemoryBarrier2KHR {
+                            src_stage_mask: vk::PipelineStageFlags2KHR::COPY,
+                            src_access_mask: vk::AccessFlags2KHR::TRANSFER_WRITE,
+                            old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            new_layout: to,
+                            image: raw_image,
+                            subresource_range: dst_image.get_whole_subresource_range(),
+                            ..Default::default()
+                        };
+                        let dependency_info = vk::DependencyInfoKHR {
+                            image_memory_barrier_count: 1,
+                            p_image_memory_barriers: &barrier,
+                            ..Default::default()
+                        };
+                        d.cmd_pipeline_barrier_2_khr(cmd, &dependency_info);
+                    }
+                }
             },
         );
     }
@@ -453,6 +476,10 @@ impl StagingManager {
     pub(crate) fn collect(&mut self, submission_manager: &SubmissionManager) {
         self.command.collect(submission_manager);
         self.ring.collect(submission_manager);
+    }
+    pub(crate) unsafe fn destroy(&mut self, device: &Device) {
+        self.command.destroy(device);
+        self.ring.destroy(device);
     }
 }
 
@@ -471,12 +498,13 @@ impl Device {
     pub unsafe fn write_image<F: FnMut(*mut u8, usize, &ImageWrite) + Send + 'static>(
         &self,
         image: &ObjRef<object::Image>,
+        final_layout: Option<vk::ImageLayout>,
         texel_layout: std::alloc::Layout,
         regions: Vec<ImageWrite>,
         mut fun: F,
     ) -> QueueSubmission {
         let mut write = self.staging_manager.write();
-        write.write_image(image, texel_layout, regions, fun, self);
+        write.write_image(image, final_layout, texel_layout, regions, fun, self);
         write.flush(self).unwrap()
     }
     pub unsafe fn write_multiple<'a>(

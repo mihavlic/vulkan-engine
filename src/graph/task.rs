@@ -126,15 +126,15 @@ unsafe impl<T: Send> Send for SendUnsafeCell<T> {}
 unsafe impl<T: Send> Sync for SendUnsafeCell<T> {}
 
 #[derive(Clone, Copy)]
-pub(crate) struct UnsafeSend<T>(T);
+pub struct UnsafeSend<T>(T);
 
 unsafe impl<T> Send for UnsafeSend<T> {}
 
 impl<T> UnsafeSend<T> {
-    pub(crate) unsafe fn new(val: T) -> Self {
+    pub unsafe fn new(val: T) -> Self {
         Self(val)
     }
-    pub(crate) fn take(s: Self) -> T {
+    pub fn take(s: Self) -> T {
         s.0
     }
 }
@@ -147,6 +147,34 @@ impl<T> Deref for UnsafeSend<T> {
 }
 
 impl<T> DerefMut for UnsafeSend<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct UnsafeSendSync<T>(T);
+
+unsafe impl<T> Send for UnsafeSendSync<T> {}
+unsafe impl<T> Sync for UnsafeSendSync<T> {}
+
+impl<T> UnsafeSendSync<T> {
+    pub unsafe fn new(val: T) -> Self {
+        Self(val)
+    }
+    pub fn take(s: Self) -> T {
+        s.0
+    }
+}
+
+impl<T> Deref for UnsafeSendSync<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for UnsafeSendSync<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }

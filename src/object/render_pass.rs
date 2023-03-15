@@ -74,7 +74,7 @@ impl RenderPassCreateInfo {
             .collect::<SmallVec<[_; 8]>>();
 
         let info = vk::RenderPassCreateInfo {
-            flags: todo!(),
+            flags: vk::RenderPassCreateFlags::empty(),
             attachment_count: self.attachments.len() as u32,
             p_attachments: self.attachments.as_ffi_ptr(),
             subpass_count: subpasses.len() as u32,

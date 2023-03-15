@@ -617,6 +617,7 @@ impl Drop for Device {
 
             self.synchronization_manager.write().destroy(self);
             self.generation_manager.write().destroy(self);
+            self.staging_manager.write().destroy(self);
 
             if self.pipeline_cache != vk::PipelineCache::null() {
                 self.device()

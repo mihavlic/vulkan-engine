@@ -95,9 +95,10 @@ impl FramebufferCreateInfo {
 
         let mut flags = self.flags;
 
-        let attachments = match &self.attachments {
+        let (attachments, attachment_count) = match &self.attachments {
             AttachmentMode::Normal(s) => {
-                &*bump.alloc_slice_fill_iter(s.iter().map(|&(_, view)| view))
+                let attachments = &*bump.alloc_slice_fill_iter(s.iter().map(|&(_, view)| view));
+                (attachments, attachments.len() as u32)
             }
             AttachmentMode::Imageless(s) => {
                 flags |= vk::FramebufferCreateFlags::IMAGELESS_KHR;
@@ -111,7 +112,7 @@ impl FramebufferCreateInfo {
                 });
                 add_pnext!(pnext_head, p);
 
-                &[]
+                (&[][..], s.len() as u32)
             }
         };
 
@@ -119,7 +120,7 @@ impl FramebufferCreateInfo {
             p_next: pnext_head,
             flags,
             render_pass: self.render_pass.get_handle(),
-            attachment_count: attachments.len() as u32,
+            attachment_count,
             p_attachments: attachments.as_ffi_ptr(),
             width: self.width,
             height: self.height,
