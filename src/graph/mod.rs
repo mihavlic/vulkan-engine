@@ -3,7 +3,6 @@ pub mod blackboard;
 pub mod compile;
 pub mod descriptors;
 pub mod execute;
-mod lazy_sorted;
 pub mod record;
 pub mod resource_marker;
 mod reverse_edges;
