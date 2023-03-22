@@ -207,7 +207,7 @@ impl UniformAllocator {
         let uniform = self.allocate_uniform_raw(layout, device);
 
         let SuballocatedMemory {
-            dynamic_offset,
+            buffer_offset,
             buffer,
             memory,
         } = uniform;
@@ -218,7 +218,7 @@ impl UniformAllocator {
         }
 
         UniformResult {
-            dynamic_offset,
+            dynamic_offset: buffer_offset.try_into().unwrap(),
             buffer,
         }
     }
@@ -231,7 +231,7 @@ impl UniformAllocator {
         let uniform = self.allocate_uniform_raw(layout, device);
 
         let SuballocatedMemory {
-            dynamic_offset,
+            buffer_offset,
             buffer,
             memory,
         } = uniform;
@@ -239,7 +239,7 @@ impl UniformAllocator {
         std::ptr::copy_nonoverlapping(value, ptr, 1);
 
         UniformResult {
-            dynamic_offset,
+            dynamic_offset: buffer_offset.try_into().unwrap(),
             buffer,
         }
     }

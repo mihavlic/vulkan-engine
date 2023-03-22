@@ -196,6 +196,9 @@ impl CompilationInput {
     pub(crate) fn get_queue_family(&self, queue: GraphQueue) -> u32 {
         self.queues[queue.index()].family()
     }
+    pub(crate) fn get_queue(&self, queue: GraphQueue) -> submission::Queue {
+        self.queues[queue.index()].inner
+    }
     pub(crate) fn get_queue_families(&self) -> SmallVec<[u32; 4]> {
         let mut vec: SmallVec<[u32; 4]> = SmallVec::new();
         for queue in &self.queues {

@@ -185,6 +185,7 @@ impl Drop for FenceStack {
 }
 
 struct CommandBufferPool {
+    label: Option<Cow<'static, str>>,
     queue_family: u32,
     pool: vk::CommandPool,
     next_index: usize,
@@ -192,7 +193,7 @@ struct CommandBufferPool {
 }
 
 impl CommandBufferPool {
-    unsafe fn new(queue_family: u32, device: &Device) -> Self {
+    unsafe fn new(queue_family: u32, label: Option<Cow<'static, str>>, device: &Device) -> Self {
         let info = vk::CommandPoolCreateInfo {
             flags: vk::CommandPoolCreateFlags::TRANSIENT,
             queue_family_index: queue_family,
@@ -200,6 +201,7 @@ impl CommandBufferPool {
         };
 
         Self {
+            label,
             queue_family,
             pool: device
                 .device()
@@ -227,8 +229,15 @@ impl CommandBufferPool {
                 command_buffer_count: 1,
                 ..Default::default()
             };
-            let allocated = device.device().allocate_command_buffers(&info).unwrap();
-            self.buffers.extend(allocated);
+
+            let buffer = device.device().allocate_command_buffers(&info).unwrap()[0];
+            let name = LazyDisplay(|f| {
+                let label = self.label.as_deref().unwrap_or("CommandBufferPool");
+                write!(f, "{label} buffer #{}", self.next_index)
+            });
+            maybe_attach_debug_label(buffer, &name, device);
+
+            self.buffers.push(buffer);
         }
 
         let buffer = self.buffers[self.next_index];
@@ -238,12 +247,14 @@ impl CommandBufferPool {
 }
 
 pub(crate) struct CommandBufferStack {
+    label: Option<Cow<'static, str>>,
     families: Vec<CommandBufferPool>,
 }
 
 impl CommandBufferStack {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(label: Option<Cow<'static, str>>) -> Self {
         Self {
+            label,
             families: Vec::new(),
         }
     }
@@ -259,7 +270,9 @@ impl CommandBufferStack {
         {
             Ok(ok) => &mut self.families[ok],
             Err(insert) => {
-                let new = CommandBufferPool::new(queue_family, device);
+                let label = self.label.as_deref().unwrap_or("CommandBufferStack");
+                let stack_label = format!("{label} ({queue_family})");
+                let new = CommandBufferPool::new(queue_family, Some(stack_label.into()), device);
                 self.families.insert(insert, new);
                 &mut self.families[insert]
             }
@@ -278,6 +291,8 @@ pub struct GraphExecutor<'a, 'b> {
     pub(crate) graph: &'a CompiledGraph,
     pub(crate) extra_submission_dependencies:
         RefCell<&'b mut std::collections::HashSet<QueueSubmission, DefaultAhashRandomstate>>,
+    pub(crate) current_submission: QueueSubmission,
+    pub(crate) current_queue: submission::Queue,
     pub(crate) blackboard: &'a RefCell<BlackBoard>,
     pub(crate) command_buffer: vk::CommandBuffer,
     pub(crate) swapchain_image_indices: &'a ahash::HashMap<GraphImage, u32>,
@@ -287,9 +302,18 @@ pub struct GraphExecutor<'a, 'b> {
 
 impl<'a, 'b> GraphExecutor<'a, 'b> {
     pub fn add_extra_submission_dependency(&self, dependency: QueueSubmission) {
+        if dependency == self.current_submission {
+            panic!("Attempted to add current submission as dependency to itself");
+        }
         self.extra_submission_dependencies
             .borrow_mut()
             .insert(dependency);
+    }
+    pub fn get_current_submission(&self) -> QueueSubmission {
+        self.current_submission
+    }
+    pub fn get_current_queue(&self) -> submission::Queue {
+        self.current_queue
     }
     pub fn execution_blackboard(&self) -> Ref<BlackBoard> {
         self.blackboard.borrow()
@@ -584,7 +608,7 @@ impl CompiledGraphVulkanState {
 
         Self {
             swapchain_semaphores: RefCell::new(LegacySemaphoreStack::new()),
-            command_pools: RefCell::new(CommandBufferStack::new()),
+            command_pools: RefCell::new(CommandBufferStack::new(Some("Graph".into()))),
             allocations,
             passes: RefCell::new(passes),
             physical_images,
@@ -1318,7 +1342,6 @@ impl CompiledGraph {
                 &bump,
                 &dummy_submissions,
                 &mut submit_infos,
-                // &mut command_pools,
                 &mut raw_memory_barriers,
                 &mut raw_image_barriers,
                 &mut raw_buffer_barriers,
@@ -1336,13 +1359,14 @@ impl CompiledGraph {
                     command_pools.next(self.input.get_queue_family(sub.queue), self.device());
 
                 let Submission {
-                    queue: _,
+                    queue,
                     passes,
                     semaphore_dependencies,
                     memory_barriers,
                     image_barriers,
                     buffer_barriers,
                 } = sub;
+                let queue = self.input.get_queue(*queue);
                 let SubmissionExtra {
                     image_barriers: extra_image_barriers,
                     buffer_barriers: extra_buffer_barriers,
@@ -1419,6 +1443,8 @@ impl CompiledGraph {
                         extra_submission_dependencies: RefCell::new(
                             &mut extra_submission_dependencies,
                         ),
+                        current_submission: submission_finish_semaphores[submission.index()].0,
+                        current_queue: queue,
                     };
                     state.passes.borrow_mut()[pass.index()]
                         .on_created(|p| p.execute(&executor, &state.device))

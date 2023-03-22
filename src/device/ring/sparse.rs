@@ -8,33 +8,6 @@ use pumice::vk;
 use smallvec::SmallVec;
 use std::{collections::VecDeque, hash::Hash, marker::PhantomData, ptr::NonNull, sync::Arc};
 
-// #[derive(Clone)]
-// pub struct AllocationReference(Arc<()>);
-
-// impl PartialEq for AllocationReference {
-//     fn eq(&self, other: &Self) -> bool {
-//         Arc::ptr_eq(&self.0, &other.0)
-//     }
-// }
-// impl Eq for AllocationReference {}
-
-// impl PartialOrd for AllocationReference {
-//     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-//         Arc::as_ptr(&self.0).partial_cmp(&Arc::as_ptr(&other.0))
-//     }
-// }
-// impl Ord for AllocationReference {
-//     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-//         Arc::as_ptr(&self.0).cmp(&Arc::as_ptr(&other.0))
-//     }
-// }
-
-// impl Hash for AllocationReference {
-//     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-//         Arc::as_ptr(&self.0).hash(state)
-//     }
-// }
-
 struct SparseBufferEntry {
     submissions: SmallVec<[QueueSubmission; 4]>,
     entry: BufferEntry,
@@ -60,7 +33,10 @@ impl SparseRing {
                 .retain(|s| !submissions.is_submission_finished(*s));
 
             if b.submissions.is_empty() {
-                self.free_buffers.push(b.entry.clone());
+                let mut buffer = b.entry.clone();
+                buffer.cursor = buffer.start;
+                self.free_buffers.push(buffer);
+
                 false
             } else {
                 true
@@ -70,9 +46,9 @@ impl SparseRing {
     pub(crate) unsafe fn destroy(&mut self, device: &Device) {
         for buffer in self
             .buffers
-            .iter()
-            .map(|b| &b.entry)
-            .chain(&self.free_buffers)
+            .drain(..)
+            .map(|b| b.entry)
+            .chain(self.free_buffers.drain(..))
         {
             device
                 .allocator()
@@ -121,7 +97,7 @@ impl SparseRing {
 
         let mut buffer = self.head_buffer(device);
 
-        let (ptr, dynamic_offset) = match buffer.entry.bump(layout, device) {
+        let (ptr, buffer_offset) = match buffer.entry.bump(layout, device) {
             Some(ok) => ok,
             None => {
                 buffer = self.add_fresh_head(device);
@@ -138,7 +114,7 @@ impl SparseRing {
         }
 
         SuballocatedMemory {
-            dynamic_offset,
+            buffer_offset: buffer_offset,
             buffer: buffer.entry.buffer,
             memory: ptr,
         }

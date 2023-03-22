@@ -14,7 +14,7 @@ use super::{maybe_attach_debug_label, Device};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SuballocatedMemory {
-    pub dynamic_offset: u32,
+    pub buffer_offset: usize,
     pub buffer: vk::Buffer,
     pub memory: NonNull<u8>,
 }
@@ -33,16 +33,21 @@ impl BufferEntry {
         &mut self,
         layout: std::alloc::Layout,
         device: &Device,
-    ) -> Option<(NonNull<u8>, u32)> {
-        let start = self.cursor.as_ptr() as usize;
-        let aligned = round_up_pow2_usize(start, layout.align());
-        let mut offset = aligned - start;
+    ) -> Option<(NonNull<u8>, usize)> {
+        assert!(self.cursor <= self.end);
+
+        // TODO this is sketchy
+        let start_address = self.start.as_ptr() as usize;
+        let cursor_address = self.cursor.as_ptr() as usize;
+        let aligned_cursor_address = round_up_pow2_usize(cursor_address, layout.align());
+        let mut offset = aligned_cursor_address - start_address;
 
         let offset_align = device
             .physical_device_properties
             .limits
             .min_uniform_buffer_offset_alignment;
-        if offset_align > 0 {
+
+        if offset_align > 1 {
             offset = round_up_pow2_usize(offset, offset_align as usize);
         }
 
@@ -55,7 +60,7 @@ impl BufferEntry {
 
         self.cursor = NonNull::new(end_ptr).unwrap();
 
-        Some((NonNull::new(start_ptr).unwrap(), offset.try_into().unwrap()))
+        Some((NonNull::new(start_ptr).unwrap(), offset))
     }
 }
 

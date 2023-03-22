@@ -108,7 +108,7 @@ impl QueueRing {
         };
 
         SuballocatedMemory {
-            dynamic_offset,
+            buffer_offset: dynamic_offset,
             buffer: buffer.buffer,
             memory: ptr,
         }

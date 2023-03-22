@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     cell::{Cell, UnsafeCell},
     collections::VecDeque,
     ffi::c_void,
@@ -29,6 +30,7 @@ use crate::{
 
 use super::{
     debug::debug_label_span,
+    maybe_attach_debug_label,
     ring::{QueueRing, RingConfig},
     submission::{self, QueueSubmission, SubmissionManager, TimelineSemaphore},
     Device, SparseRing,
@@ -41,7 +43,7 @@ struct BufferFlushRange {
 }
 
 const CONFIG: RingConfig = RingConfig {
-    buffer_size: 256 * 1024 * 1024,
+    buffer_size: 64 * 1024 * 1024,
     usage: vk::BufferUsageFlags(
         vk::BufferUsageFlags::TRANSFER_SRC.0 | vk::BufferUsageFlags::TRANSFER_DST.0,
     ),
@@ -79,7 +81,12 @@ impl StagingManager {
         Self {
             queue: transfer_queue,
             ring: SparseRing::new(&CONFIG),
-            command: CommandBufferPool::new(transfer_queue.family, callbacks, device),
+            command: CommandBufferPool::new(
+                transfer_queue.family,
+                callbacks,
+                Some("StagingManager".into()),
+                device,
+            ),
         }
     }
     pub unsafe fn write_buffer<F: FnMut(*mut u8) + Send + 'static>(
@@ -261,7 +268,7 @@ impl StagingManager {
                     staging.buffer,
                     dst_buffer.get_handle(),
                     &[vk::BufferCopy {
-                        src_offset: staging.dynamic_offset as u64,
+                        src_offset: staging.buffer_offset as u64,
                         dst_offset: offset,
                         size: layout.size() as u64,
                     }],
@@ -304,11 +311,80 @@ impl StagingManager {
         final_layout: Option<vk::ImageLayout>,
         texel_layout: std::alloc::Layout,
         regions: Vec<ImageWrite>,
-        mut fun: F,
         device: &Device,
+        mut fun: F,
     ) {
+        let (cmd, submission, _, _) = self.command.get_current_command_buffer(self.queue, device);
+        let queue_family = self.queue.family();
+        let mut dirty_tmp = false;
+
+        let wait = self.write_image_impl(
+            dst_image,
+            final_layout,
+            texel_layout,
+            regions,
+            cmd,
+            queue_family,
+            submission,
+            &mut dirty_tmp,
+            device,
+            &mut fun,
+        );
+
+        let (cmd, submission, wait_submissions, dirty) =
+            self.command.get_current_command_buffer(self.queue, device);
+
+        wait_submissions.extend(wait);
+
+        *dirty |= dirty_tmp;
+    }
+    pub unsafe fn write_image_in_cmd<F: FnMut(*mut u8, usize, &ImageWrite) + Send + 'static>(
+        &mut self,
+        dst_image: &ObjRef<object::Image>,
+        final_layout: Option<vk::ImageLayout>,
+        texel_layout: std::alloc::Layout,
+        regions: Vec<ImageWrite>,
+
+        cmd: vk::CommandBuffer,
+        queue_family: u32,
+        submission: QueueSubmission,
+
+        device: &Device,
+
+        mut fun: F,
+    ) -> SmallVec<[QueueSubmission; 4]> {
+        let mut dirty = false;
+        self.write_image_impl(
+            dst_image,
+            final_layout,
+            texel_layout,
+            regions,
+            cmd,
+            queue_family,
+            submission,
+            &mut dirty,
+            device,
+            &mut fun,
+        )
+    }
+    unsafe fn write_image_impl(
+        &mut self,
+        dst_image: &ObjRef<object::Image>,
+        final_layout: Option<vk::ImageLayout>,
+        texel_layout: std::alloc::Layout,
+        regions: Vec<ImageWrite>,
+
+        cmd: vk::CommandBuffer,
+        queue_family: u32,
+        submission: QueueSubmission,
+        dirty: &mut bool,
+
+        device: &Device,
+
+        fun: &mut (dyn FnMut(*mut u8, usize, &ImageWrite) + Send + 'static),
+    ) -> SmallVec<[QueueSubmission; 4]> {
         if regions.is_empty() {
-            return;
+            return SmallVec::new();
         }
         assert!(
             texel_layout.size() & (texel_layout.align() - 1) == 0,
@@ -319,9 +395,6 @@ impl StagingManager {
         let allocator = device.allocator();
         let allocation = dst_image.get_allocation();
 
-        let (cmd, submission, wait_submissions, dirty) =
-            self.command.get_current_command_buffer(self.queue, device);
-
         // TODO we may be able to skip the transfer image copy
         // if the destination image is host accessible and has linear tiling
         // and manually do the copy through a mapped pointer
@@ -330,13 +403,13 @@ impl StagingManager {
             |d| d.get_mutable_state(),
             |s| {
                 let result = s.synchronization_state().update(
-                    self.queue.family(),
+                    queue_family,
                     TypeSome::new_some(vk::ImageLayout::TRANSFER_DST_OPTIMAL),
                     &[submission],
                     TypeSome::new_some(
                         final_layout.unwrap_or(vk::ImageLayout::TRANSFER_DST_OPTIMAL),
                     ),
-                    self.queue.family(),
+                    queue_family,
                     dst_image.get_create_info().sharing_mode_concurrent,
                 );
 
@@ -345,7 +418,6 @@ impl StagingManager {
         );
 
         *dirty = true;
-        wait_submissions.extend(result.prev_access);
         assert!(result.transition_ownership_from.is_none(), "TODO");
 
         let region_sources = regions.iter().enumerate().map(|(i, region)| {
@@ -373,14 +445,14 @@ impl StagingManager {
 
             fun(staging.memory.as_ptr(), i, region);
 
-            (staging.buffer, staging.dynamic_offset, region)
+            (staging.buffer, staging.buffer_offset, region)
         });
 
         let d = device.device();
 
         let mut converted_regions: SmallVec<[_; 8]> = SmallVec::new();
         let mut last_buffer = None;
-        let mut convert_region = |(buffer, offset, region): (vk::Buffer, u32, &ImageWrite)| {
+        let mut convert_region = |(buffer, offset, region): (vk::Buffer, usize, &ImageWrite)| {
             // if the source buffer changed (due to the last ringbuffer chunk getting filled)
             // we need to split the copy into multiple calls
             if let Some(src_buffer) = last_buffer {
@@ -400,7 +472,7 @@ impl StagingManager {
 
             if buffer != vk::Buffer::null() {
                 converted_regions.push(vk::BufferImageCopy {
-                    buffer_offset: offset.try_into().unwrap(),
+                    buffer_offset: offset as u64,
                     buffer_row_length: region.buffer_row_length,
                     buffer_image_height: region.buffer_image_height,
                     image_subresource: region.image_subresource.clone(),
@@ -469,6 +541,8 @@ impl StagingManager {
                 }
             },
         );
+
+        result.prev_access
     }
     pub(crate) unsafe fn flush(&mut self, device: &Device) -> Option<QueueSubmission> {
         self.command.flush(self.queue, device)
@@ -504,16 +578,36 @@ impl Device {
         mut fun: F,
     ) -> QueueSubmission {
         let mut write = self.staging_manager.write();
-        write.write_image(image, final_layout, texel_layout, regions, fun, self);
+        write.write_image(image, final_layout, texel_layout, regions, self, fun);
         write.flush(self).unwrap()
     }
-    pub unsafe fn write_multiple<'a>(
+    pub unsafe fn write_image_in_cmd<F: FnMut(*mut u8, usize, &ImageWrite) + Send + 'static>(
         &self,
-        fun: impl FnOnce(&mut StagingManager),
-    ) -> Option<QueueSubmission> {
+        image: &ObjRef<object::Image>,
+        final_layout: Option<vk::ImageLayout>,
+        texel_layout: std::alloc::Layout,
+        regions: Vec<ImageWrite>,
+        cmd: vk::CommandBuffer,
+        queue_family: u32,
+        submission: QueueSubmission,
+        mut fun: F,
+    ) -> SmallVec<[QueueSubmission; 4]> {
         let mut write = self.staging_manager.write();
-        fun(&mut write);
-        write.flush(self)
+        write.write_image_in_cmd(
+            image,
+            final_layout,
+            texel_layout,
+            regions,
+            cmd,
+            queue_family,
+            submission,
+            self,
+            fun,
+        )
+    }
+    pub unsafe fn write_multiple<'a, T>(&self, fun: impl FnOnce(&mut StagingManager) -> T) -> T {
+        let mut write = self.staging_manager.write();
+        fun(&mut write)
     }
 }
 
@@ -529,6 +623,9 @@ enum CommandBufferState {
 }
 
 struct CommandBufferPool {
+    label: Option<Cow<'static, str>>,
+    // a monotonic counter used only for labeling command buffers
+    next_buffer_index: u32,
     pool: vk::CommandPool,
     buffers: VecDeque<(QueueSubmission, vk::CommandBuffer)>,
     free_buffers: Vec<(CommandBufferState, vk::CommandBuffer)>,
@@ -538,6 +635,7 @@ impl CommandBufferPool {
     unsafe fn new(
         queue_family: u32,
         callbacks: Option<&vk::AllocationCallbacks>,
+        label: Option<Cow<'static, str>>,
         device: &DeviceWrapper,
     ) -> Self {
         let info = vk::CommandPoolCreateInfo {
@@ -548,6 +646,8 @@ impl CommandBufferPool {
         };
 
         Self {
+            label,
+            next_buffer_index: 0,
             pool: device.create_command_pool(&info, callbacks).unwrap(),
             buffers: VecDeque::new(),
             free_buffers: Vec::new(),
@@ -627,6 +727,9 @@ impl CommandBufferPool {
         (*buffer, *submission, wait_submissions, dirty)
     }
     unsafe fn add_buffer(&mut self, device: &Device) {
+        let index = self.next_buffer_index;
+        self.next_buffer_index += 1;
+
         let info = vk::CommandBufferAllocateInfo {
             command_pool: self.pool,
             level: vk::CommandBufferLevel::PRIMARY,
@@ -634,7 +737,14 @@ impl CommandBufferPool {
             command_buffer_count: 1,
             ..Default::default()
         };
+
         let buffer = device.device().allocate_command_buffers(&info).unwrap()[0];
+        let name = LazyDisplay(|f| {
+            let label = self.label.as_deref().unwrap_or("CommandBufferPool");
+            write!(f, "{label} buffer #{index}")
+        });
+        maybe_attach_debug_label(buffer, &name, device);
+
         self.free_buffers.push((CommandBufferState::Empty, buffer));
     }
     unsafe fn flush(
