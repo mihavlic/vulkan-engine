@@ -130,16 +130,16 @@ pub enum HostAccessKind {
     Synchronized(QueueSubmission),
 }
 
-pub(crate) struct SynchronizationState<T: ResourceMarker> {
-    owning_family: OptionalU32,
-    layout: T::IfImage<vk::ImageLayout>,
+pub struct InnerSynchronizationState<T: ResourceMarker> {
+    pub owning_family: OptionalU32,
+    pub layout: T::IfImage<vk::ImageLayout>,
     // FIXME for now we only allow exclusive access to resources, since when we are reading the state of global resources is already built
     // and it would be complicated to patch in more synchronization to allow Read Read overlap
     // it would be possible to do some compromise when the resource in only ever read in the whole graph
-    access: SmallVec<[QueueSubmission; 4]>,
+    pub access: SmallVec<[QueueSubmission; 4]>,
 }
 
-impl<T: ResourceMarker> SynchronizationState<T> {
+impl<T: ResourceMarker> InnerSynchronizationState<T> {
     pub(crate) fn blank() -> Self {
         Self {
             owning_family: OptionalU32::NONE,
@@ -201,8 +201,6 @@ impl<T: ResourceMarker> SynchronizationState<T> {
 
         result
     }
-    /// performs host access which is finished while the resource lock is held
-    /// the accessor must wait for the submissions returned
     pub(crate) fn update_host_access(
         &mut self,
         update_fn: impl FnOnce(&[QueueSubmission]) -> HostAccessKind,
@@ -220,6 +218,54 @@ impl<T: ResourceMarker> SynchronizationState<T> {
         }
 
         prev_accessors
+    }
+}
+
+pub struct SynchronizationState<T: ResourceMarker>(InnerSynchronizationState<T>);
+
+impl<T: ResourceMarker> SynchronizationState<T> {
+    pub(crate) fn blank() -> Self {
+        Self(InnerSynchronizationState::blank())
+    }
+    pub(crate) fn with_initial_layout(layout: vk::ImageLayout) -> Self {
+        Self(InnerSynchronizationState::with_initial_layout(layout))
+    }
+    pub fn update(
+        &mut self,
+        // the initial state of the resource
+        dst_family: u32,
+        dst_layout: T::IfImage<vk::ImageLayout>,
+        // the state of the resource at the end of the scheduled work
+        final_accessors: &[QueueSubmission],
+        final_layout: T::IfImage<vk::ImageLayout>,
+        final_family: u32,
+        // whether the resource was created with VK_ACCESS_MODE_CONCURRENT and does not need queue ownership transitions
+        resource_concurrent: bool,
+    ) -> SynchronizeResult
+    where
+        T::IfImage<vk::ImageLayout>: Eq + Copy,
+    {
+        self.0.update(
+            dst_family,
+            dst_layout,
+            final_accessors,
+            final_layout,
+            final_family,
+            resource_concurrent,
+        )
+    }
+    /// performs host access which is finished while the resource lock is held
+    /// the accessor must wait for the submissions returned
+    pub fn update_host_access(
+        &mut self,
+        update_fn: impl FnOnce(&[QueueSubmission]) -> HostAccessKind,
+    ) -> SmallVec<[QueueSubmission; 4]> {
+        self.0.update_host_access(update_fn)
+    }
+    /// allows the caller to modify the inner state however they want
+    /// it is up to the caller to leave it in a valid state
+    pub unsafe fn get_unchecked_mut(&mut self) -> &mut InnerSynchronizationState<T> {
+        &mut self.0
     }
 }
 
@@ -269,10 +315,10 @@ impl ImageMutableState {
             synchronization: SynchronizationState::with_initial_layout(layout),
         }
     }
-    pub(crate) fn synchronization_state(&mut self) -> &mut SynchronizationState<ImageMarker> {
+    pub fn synchronization_state(&mut self) -> &mut SynchronizationState<ImageMarker> {
         &mut self.synchronization
     }
-    pub(crate) unsafe fn get_view(
+    pub unsafe fn get_view(
         &mut self,
         self_handle: vk::Image,
         info: &ImageViewCreateInfo,

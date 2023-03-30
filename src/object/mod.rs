@@ -18,16 +18,10 @@ macro_rules! derive_raw_handle {
         }
 
         impl std::ops::Deref for $name {
-            type Target = $crate::object::ObjRef<$name>;
+            type Target = $crate::object::ObjHandle<$name>;
             #[inline(always)]
             fn deref(&self) -> &Self::Target {
-                // sound because ObjRef is repr(transparent)
-                unsafe {
-                    std::mem::transmute::<
-                        &crate::object::ObjHeader<$name>,
-                        &crate::object::ObjRef<$name>,
-                    >(self.0 .0.as_ref())
-                }
+                &self.0
             }
         }
     };
@@ -119,6 +113,11 @@ unsafe impl<T: Object + Send> Send for ObjHandle<T> {}
 unsafe impl<T: Object + Sync> Sync for ObjHandle<T> {}
 
 impl<T: Object> ObjHandle<T> {
+    /// Provides a temporarily unique identity for the vulkan object, at any point there won't be two handles which share this identity
+    /// but it may be reused if the handle is destroyed and a future one is created
+    pub unsafe fn get_pointer_identity(&self) -> usize {
+        self.0.as_ptr() as usize
+    }
     pub unsafe fn get_object_header_ptr(&self) -> *mut ObjHeader<T> {
         self.0.as_ptr()
     }

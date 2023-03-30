@@ -274,7 +274,7 @@ impl SwapchainMutableState {
             .clone()
             .unwrap_or(self.current_extent.clone())
     }
-    pub fn get_swapchain(&self, _image_index: u32) -> vk::SwapchainKHR {
+    pub fn raw(&self) -> vk::SwapchainKHR {
         self.swapchain
     }
     pub fn get_image_data(&self, image_index: u32) -> &SwapchainImage {

@@ -7,7 +7,7 @@ use super::{
     RawHandle,
 };
 
-pub(crate) trait TypeOption<T>: From<T> {
+pub trait TypeOption<T>: From<T> {
     fn new_some(val: T) -> Self;
     fn new_none() -> Self;
     fn get(&self) -> &T;
@@ -21,7 +21,7 @@ pub(crate) trait TypeOption<T>: From<T> {
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct TypeSome<T>(T);
+pub struct TypeSome<T>(T);
 impl<T> TypeOption<T> for TypeSome<T> {
     #[inline(always)]
     fn new_some(val: T) -> Self {
@@ -78,7 +78,7 @@ impl<T> From<T> for TypeSome<T> {
     }
 }
 
-pub(crate) struct TypeNone<T>(std::marker::PhantomData<fn() -> T>);
+pub struct TypeNone<T>(std::marker::PhantomData<fn() -> T>);
 impl<T> TypeOption<T> for TypeNone<T> {
     #[inline(always)]
     fn new_some(_val: T) -> Self {
@@ -152,7 +152,7 @@ impl<T> Ord for TypeNone<T> {
     }
 }
 
-pub(crate) trait ResourceData {
+pub trait ResourceData {
     fn access(&self) -> vk::AccessFlags2KHR;
     fn stages(&self) -> vk::PipelineStageFlags2KHR;
     fn start_layout(&self) -> vk::ImageLayout;
@@ -225,7 +225,7 @@ impl ResourceData for PassBufferData {
     }
 }
 
-pub(crate) trait ResourceMarker {
+pub trait ResourceMarker {
     const IS_IMAGE: bool;
     const IS_BUFFER: bool = !Self::IS_IMAGE;
 
@@ -259,7 +259,7 @@ pub(crate) trait ResourceMarker {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct ImageMarker;
+pub struct ImageMarker;
 impl ResourceMarker for ImageMarker {
     const IS_IMAGE: bool = true;
 
@@ -320,7 +320,7 @@ impl ResourceMarker for ImageMarker {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct BufferMarker;
+pub struct BufferMarker;
 impl ResourceMarker for BufferMarker {
     const IS_IMAGE: bool = false;
 
@@ -381,22 +381,22 @@ impl ResourceMarker for BufferMarker {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct TypeEither<T: ResourceMarker + ?Sized, Image, Buffer>(
+pub struct TypeEither<T: ResourceMarker + ?Sized, Image, Buffer>(
     T::IfImage<Image>,
     T::IfBuffer<Buffer>,
 );
 
 impl<T: ResourceMarker, IfImage, IfBuffer> TypeEither<T, IfImage, IfBuffer> {
     #[inline(always)]
-    pub(crate) fn new(value: T::EitherOut<IfImage, IfBuffer>) -> Self {
+    pub fn new(value: T::EitherOut<IfImage, IfBuffer>) -> Self {
         T::new_either(value)
     }
     #[inline(always)]
-    pub(crate) fn decompose(self) -> T::EitherOut<IfImage, IfBuffer> {
+    pub fn decompose(self) -> T::EitherOut<IfImage, IfBuffer> {
         T::select(self.0, self.1)
     }
     #[inline(always)]
-    pub(crate) fn map<TI, TB, FImage: FnOnce(IfImage) -> TI, FBuffer: FnOnce(IfBuffer) -> TB>(
+    pub fn map<TI, TB, FImage: FnOnce(IfImage) -> TI, FBuffer: FnOnce(IfBuffer) -> TB>(
         self,
         map_image: FImage,
         map_buffer: FBuffer,

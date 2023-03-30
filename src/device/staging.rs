@@ -183,6 +183,7 @@ impl StagingManager {
         };
 
         assert!(result.transition_ownership_from.is_none(), "TODO");
+        assert!(result.transition_layout_from.is_none(), "unreachable");
 
         *dirty = true;
         wait_submissions.extend(result.prev_access);
@@ -245,24 +246,6 @@ impl StagingManager {
                 }
             },
             || {
-                if let Some(from) = result.transition_layout_from {
-                    let barrier = vk::ImageMemoryBarrier2KHR {
-                        dst_stage_mask: vk::PipelineStageFlags2KHR::COPY,
-                        dst_access_mask: vk::AccessFlags2KHR::TRANSFER_WRITE,
-                        old_layout: from,
-                        new_layout: todo!(),
-                        image: todo!(),
-                        subresource_range: todo!(),
-                        ..Default::default()
-                    };
-                    let dependency_info = vk::DependencyInfoKHR {
-                        image_memory_barrier_count: 1,
-                        p_image_memory_barriers: &barrier,
-                        ..Default::default()
-                    };
-                    d.cmd_pipeline_barrier_2_khr(cmd, &dependency_info);
-                }
-
                 d.cmd_copy_buffer(
                     cmd,
                     staging.buffer,

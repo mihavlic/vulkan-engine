@@ -430,6 +430,13 @@ impl Device {
             .read()
             .is_submission_finished(submission)
     }
+    pub fn retain_active_submissions<A: smallvec::Array<Item = QueueSubmission>>(
+        &self,
+        submissions: &mut SmallVec<A>,
+    ) {
+        let manager = self.synchronization_manager.read();
+        submissions.retain(|s| !manager.is_submission_finished(*s));
+    }
     pub fn get_submission_data(&self, submission: QueueSubmission) -> Option<TimelineSemaphore> {
         self.synchronization_manager
             .read()

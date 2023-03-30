@@ -1040,7 +1040,7 @@ impl CompiledGraph {
 
                             submission_swapchains.entry(accessors[0]).or_default().push(
                                 SwapchainPresent {
-                                    vkhandle: mutable.get_swapchain(index),
+                                    swapchain: mutable.raw(),
                                     image_index: index,
                                     image_acquire: acquire_semaphore
                                         .unwrap_or(vk::Semaphore::null()),
@@ -1567,7 +1567,7 @@ impl CompiledGraph {
                         .collect::<Vec<_>>();
                     let swapchains = swapchain_presents
                         .iter()
-                        .map(|s| s.vkhandle)
+                        .map(|s| s.swapchain)
                         .collect::<Vec<_>>();
 
                     let mut results = vec![std::mem::zeroed(); swapchains.len()];
@@ -1746,7 +1746,7 @@ pub(crate) struct SubmissionExtra {
 }
 
 pub(crate) struct SwapchainPresent {
-    pub(crate) vkhandle: vk::SwapchainKHR,
+    pub(crate) swapchain: vk::SwapchainKHR,
     pub(crate) image_index: u32,
     pub(crate) image_acquire: vk::Semaphore,
     pub(crate) image_release: vk::Semaphore,

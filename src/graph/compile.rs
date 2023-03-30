@@ -259,7 +259,7 @@ pub(crate) enum GraphResource {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct CombinedResourceHandle(PackedUint<CombinedResourceConfig, u32>);
+pub struct CombinedResourceHandle(PackedUint<CombinedResourceConfig, u32>);
 
 impl CombinedResourceHandle {
     pub(crate) fn new_image(image: GraphImage) -> Self {
