@@ -138,7 +138,7 @@ impl DescriptorSetAllocator {
 }
 
 pub struct UniformAllocator {
-    buffers: QueueRing,
+    ring: QueueRing,
 }
 
 pub struct UniformSetAllocator {
@@ -183,14 +183,14 @@ impl UniformAllocator {
         };
 
         Self {
-            buffers: QueueRing::new(&CONFIG),
+            ring: QueueRing::new(&CONFIG),
         }
     }
     pub(crate) unsafe fn reset(&mut self) {
-        self.buffers.reset_all();
+        self.ring.reset_all();
     }
     pub(crate) unsafe fn destroy(&mut self, device: &Device) {
-        self.buffers.destroy(device);
+        self.ring.destroy(device);
     }
     pub unsafe fn allocate_uniform_iter<T, I: IntoIterator<Item = T>>(
         &mut self,
@@ -219,6 +219,7 @@ impl UniformAllocator {
 
         UniformResult {
             dynamic_offset: buffer_offset.try_into().unwrap(),
+            allocated_size: layout.size().try_into().unwrap(),
             buffer,
         }
     }
@@ -240,6 +241,7 @@ impl UniformAllocator {
 
         UniformResult {
             dynamic_offset: buffer_offset.try_into().unwrap(),
+            allocated_size: layout.size().try_into().unwrap(),
             buffer,
         }
     }
@@ -248,14 +250,36 @@ impl UniformAllocator {
         layout: std::alloc::Layout,
         device: &Device,
     ) -> SuballocatedMemory {
-        self.buffers.allocate(layout, device)
+        self.ring.allocate(layout, device)
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct UniformResult {
     pub dynamic_offset: u32,
+    pub allocated_size: u32,
     pub buffer: vk::Buffer,
+}
+
+impl UniformResult {
+    pub fn as_desc(self) -> DescBuffer {
+        DescBuffer {
+            buffer: self.buffer,
+            offset: 0,
+            range: vk::WHOLE_SIZE,
+            dynamic_offset: None,
+            ..Default::default()
+        }
+    }
+    pub fn as_desc_dynamic(self) -> DescBuffer {
+        DescBuffer {
+            buffer: self.buffer,
+            offset: 0,
+            range: self.allocated_size as u64,
+            dynamic_offset: Some(self.dynamic_offset),
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Default, Clone, PartialEq, Eq)]
@@ -417,17 +441,7 @@ impl<'a> DescSetBuilder<'a> {
         array_offset: u32,
         result: UniformResult,
     ) -> &mut Self {
-        self.update_buffer_binding(
-            binding,
-            array_offset,
-            &DescBuffer {
-                buffer: result.buffer,
-                offset: 0,
-                range: vk::WHOLE_SIZE,
-                dynamic_offset: Some(result.dynamic_offset),
-                ..Default::default()
-            },
-        );
+        self.update_buffer_binding(binding, array_offset, &result.as_desc_dynamic());
         self
     }
     pub fn update_image_bindings_arr(
@@ -600,14 +614,14 @@ unsafe fn write_descriptors(device: &Device, sets: &[&DescSetBuilder]) {
                     assert_eq!(slice.len(), write.count as usize);
 
                     buffer_views.clear();
-                    let image_infos = bump.alloc_slice_fill_iter(slice.iter().map(|img| {
-                        if img.view != vk::BufferView::null() {
-                            buffer_views.push(img.view);
+                    let image_infos = bump.alloc_slice_fill_iter(slice.iter().map(|buf| {
+                        if buf.view != vk::BufferView::null() {
+                            buffer_views.push(buf.view);
                         }
                         vk::DescriptorBufferInfo {
-                            buffer: img.buffer,
-                            offset: img.offset,
-                            range: img.range,
+                            buffer: buf.buffer,
+                            offset: buf.offset,
+                            range: buf.range,
                         }
                     }));
                     let buffer_views = bump.alloc_slice_copy(&buffer_views);

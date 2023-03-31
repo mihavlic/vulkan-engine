@@ -206,23 +206,13 @@ impl RenderPass for SimpleShaderPass {
         let res = executor.allocate_uniform_element(&color);
 
         let mut set = DescSetBuilder::new(&self.info.set_layout);
-        set.update_buffer_binding(
-            0,
-            0,
-            &DescBuffer {
-                buffer: res.buffer,
-                offset: 0,
-                range: vk::WHOLE_SIZE,
-                dynamic_offset: Some(res.dynamic_offset),
-                ..Default::default()
-            },
-        )
-        .finish(executor)
-        .bind(
-            vk::PipelineBindPoint::GRAPHICS,
-            &self.info.pipeline_layout,
-            executor,
-        );
+        set.update_buffer_binding(0, 0, &res.as_desc_dynamic())
+            .finish(executor)
+            .bind(
+                vk::PipelineBindPoint::GRAPHICS,
+                &self.info.pipeline_layout,
+                executor,
+            );
 
         d.cmd_draw(cmd, 3, 1, 0, 0);
 

@@ -1676,30 +1676,30 @@ impl CompiledGraph {
             info.to_vk(raw_buffers[info.buffer.index()].unwrap())
         });
 
-        // #[rustfmt::skip]
-        // if /* full_barriers */ true {
-        //     if raw_memory_barriers.is_empty() {
-        //         raw_memory_barriers.push(vk::MemoryBarrier2KHR::default());
-        //     }
-        //     for b in raw_memory_barriers.iter_mut() {
-        //         b.src_access_mask = vk::AccessFlags2KHR::MEMORY_READ | vk::AccessFlags2KHR::MEMORY_WRITE;
-        //         b.dst_access_mask = vk::AccessFlags2KHR::MEMORY_READ | vk::AccessFlags2KHR::MEMORY_WRITE;
-        //         b.src_stage_mask = vk::PipelineStageFlags2KHR::ALL_COMMANDS;
-        //         b.dst_stage_mask = vk::PipelineStageFlags2KHR::ALL_COMMANDS;
-        //     }
-        //     for b in raw_image_barriers.iter_mut() {
-        //         b.src_access_mask = vk::AccessFlags2KHR::MEMORY_READ | vk::AccessFlags2KHR::MEMORY_WRITE;
-        //         b.dst_access_mask = vk::AccessFlags2KHR::MEMORY_READ | vk::AccessFlags2KHR::MEMORY_WRITE;
-        //         b.src_stage_mask = vk::PipelineStageFlags2KHR::ALL_COMMANDS;
-        //         b.dst_stage_mask = vk::PipelineStageFlags2KHR::ALL_COMMANDS;
-        //     }
-        //     for b in raw_buffer_barriers.iter_mut() {
-        //         b.src_access_mask = vk::AccessFlags2KHR::MEMORY_READ | vk::AccessFlags2KHR::MEMORY_WRITE;
-        //         b.dst_access_mask = vk::AccessFlags2KHR::MEMORY_READ | vk::AccessFlags2KHR::MEMORY_WRITE;
-        //         b.src_stage_mask = vk::PipelineStageFlags2KHR::ALL_COMMANDS;
-        //         b.dst_stage_mask = vk::PipelineStageFlags2KHR::ALL_COMMANDS;
-        //     }
-        // };
+        #[rustfmt::skip]
+        if /* full_barriers */ true {
+            if raw_memory_barriers.is_empty() {
+                raw_memory_barriers.push(vk::MemoryBarrier2KHR::default());
+            }
+            for b in raw_memory_barriers.iter_mut() {
+                b.src_access_mask = vk::AccessFlags2KHR::MEMORY_READ | vk::AccessFlags2KHR::MEMORY_WRITE;
+                b.dst_access_mask = vk::AccessFlags2KHR::MEMORY_READ | vk::AccessFlags2KHR::MEMORY_WRITE;
+                b.src_stage_mask = vk::PipelineStageFlags2KHR::ALL_COMMANDS;
+                b.dst_stage_mask = vk::PipelineStageFlags2KHR::ALL_COMMANDS;
+            }
+            for b in raw_image_barriers.iter_mut() {
+                b.src_access_mask = vk::AccessFlags2KHR::MEMORY_READ | vk::AccessFlags2KHR::MEMORY_WRITE;
+                b.dst_access_mask = vk::AccessFlags2KHR::MEMORY_READ | vk::AccessFlags2KHR::MEMORY_WRITE;
+                b.src_stage_mask = vk::PipelineStageFlags2KHR::ALL_COMMANDS;
+                b.dst_stage_mask = vk::PipelineStageFlags2KHR::ALL_COMMANDS;
+            }
+            for b in raw_buffer_barriers.iter_mut() {
+                b.src_access_mask = vk::AccessFlags2KHR::MEMORY_READ | vk::AccessFlags2KHR::MEMORY_WRITE;
+                b.dst_access_mask = vk::AccessFlags2KHR::MEMORY_READ | vk::AccessFlags2KHR::MEMORY_WRITE;
+                b.src_stage_mask = vk::PipelineStageFlags2KHR::ALL_COMMANDS;
+                b.dst_stage_mask = vk::PipelineStageFlags2KHR::ALL_COMMANDS;
+            }
+        };
 
         if !(raw_memory_barriers.is_empty()
             && raw_image_barriers.is_empty()
