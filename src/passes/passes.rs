@@ -83,7 +83,7 @@ impl CreatePass for SimpleShader {
                 vk::ImageUsageFlags::COLOR_ATTACHMENT,
                 vk::PipelineStageFlags2KHR::COLOR_ATTACHMENT_OUTPUT,
                 vk::AccessFlags2KHR::COLOR_ATTACHMENT_WRITE,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::ATTACHMENT_OPTIMAL_KHR,
                 None,
             );
         }
@@ -136,7 +136,7 @@ impl RenderPass for SimpleShaderPass {
             .iter()
             .map(|&image| vk::RenderingAttachmentInfoKHR {
                 image_view: executor.get_default_image_view(image),
-                image_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                image_layout: vk::ImageLayout::ATTACHMENT_OPTIMAL_KHR,
                 resolve_mode: vk::ResolveModeFlagsKHR::NONE,
                 load_op: vk::AttachmentLoadOp::LOAD,
                 store_op: vk::AttachmentStoreOp::STORE,

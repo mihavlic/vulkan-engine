@@ -51,7 +51,7 @@ impl BufferEntry {
             offset = round_up_pow2_usize(offset, offset_align as usize);
         }
 
-        let start_ptr = self.cursor.as_ptr().add(offset);
+        let start_ptr = self.start.as_ptr().add(offset);
         let end_ptr = start_ptr.add(layout.size());
 
         if end_ptr > self.end.as_ptr() {
