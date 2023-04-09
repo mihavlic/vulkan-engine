@@ -153,6 +153,9 @@ impl<T: ResourceMarker> InnerSynchronizationState<T> {
             ..Self::blank()
         }
     }
+    pub(crate) fn retain_active_submissions(&mut self, device: &Device) {
+        device.retain_active_submissions(&mut self.access)
+    }
     pub(crate) fn update(
         &mut self,
         // the initial state of the resource
@@ -229,6 +232,9 @@ impl<T: ResourceMarker> SynchronizationState<T> {
     }
     pub(crate) fn with_initial_layout(layout: vk::ImageLayout) -> Self {
         Self(InnerSynchronizationState::with_initial_layout(layout))
+    }
+    pub fn retain_active_submissions(&mut self, device: &Device) {
+        self.0.retain_active_submissions(device)
     }
     pub fn update(
         &mut self,

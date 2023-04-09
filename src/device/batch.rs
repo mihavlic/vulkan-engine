@@ -15,9 +15,9 @@ use crate::{
     storage::{constant_ahash_hashset, constant_ahash_randomstate},
 };
 
-use super::submission::{QueueSubmission, WaitResult};
+use super::submission::{QueueSubmission, SubmissionManager, WaitResult};
 
-#[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct GenerationId(u32);
 
 impl GenerationId {
@@ -147,6 +147,26 @@ impl GenerationManager {
         timeout_ns: u64,
         device: &Device,
     ) -> VulkanResult<WaitResult> {
+        self.inner_wait_for_generation_dyn(
+            index,
+            timeout_ns,
+            &mut |submissions: &HashSet<QueueSubmission>, timeout: u64, wait_any: bool| {
+                device.wait_for_submissions(submissions.iter().cloned(), timeout_ns, wait_any)
+            },
+            device,
+        )
+    }
+    fn inner_wait_for_generation_dyn(
+        &mut self,
+        index: usize,
+        timeout_ns: u64,
+        wait_submissions: &mut dyn FnMut(
+            &HashSet<QueueSubmission>,
+            u64,
+            bool,
+        ) -> VulkanResult<WaitResult>,
+        device: &Device,
+    ) -> VulkanResult<WaitResult> {
         let next = &mut self.batches[index];
 
         let closed = match next {
@@ -156,11 +176,12 @@ impl GenerationManager {
                 }
 
                 if arc.mutex.try_lock_for(Duration::from_nanos(timeout_ns)) {
-                    debug_assert!(Arc::strong_count(arc) == 1);
+                    assert!(Arc::strong_count(arc) == 1);
                 } else {
                     return VulkanResult::Ok(WaitResult::Timeout);
                 }
 
+                // we're doing a ptr::read, be careful to avoid double free
                 let inner = unsafe { std::ptr::read(arc) };
                 let OpenGenerationEntry {
                     id,
@@ -172,6 +193,7 @@ impl GenerationManager {
                     .expect("Locking the mutex implies the OpenGeneration being dropped");
 
                 unsafe {
+                    // prevent the destructor from running to avoid double free of the `inner` Arc
                     std::ptr::write(
                         next,
                         GenerationEntry::Closed(Generation {
@@ -191,8 +213,7 @@ impl GenerationManager {
             GenerationEntry::Closed(gen) => gen,
         };
 
-        let res =
-            device.wait_for_submissions(closed.submissions.iter().cloned(), timeout_ns, false)?;
+        let res = wait_submissions(&closed.submissions, timeout_ns, false)?;
 
         match res {
             WaitResult::Timeout => VulkanResult::Ok(WaitResult::Timeout),
@@ -257,6 +278,34 @@ impl GenerationManager {
         }
 
         VulkanResult::Ok(WaitResult::AllFinished)
+    }
+    pub fn collect(&mut self, manager: &SubmissionManager, device: &Device) {
+        let mut i = 0;
+        while i < self.batches.len() {
+            let res = self
+                .inner_wait_for_generation_dyn(
+                    i,
+                    0,
+                    &mut |submissions: &HashSet<QueueSubmission>, timeout: u64, wait_any: bool| {
+                        manager.wait_for_submissions(
+                            submissions.iter().cloned(),
+                            timeout,
+                            wait_any,
+                            device,
+                        )
+                    },
+                    device,
+                )
+                .unwrap();
+
+            match res {
+                WaitResult::Timeout => i += 1,
+                WaitResult::AllFinished => {
+                    self.batches.remove(i);
+                }
+                WaitResult::AnyFinished => unreachable!(),
+            }
+        }
     }
     pub(crate) unsafe fn clear(&mut self) {
         self.batches.clear();

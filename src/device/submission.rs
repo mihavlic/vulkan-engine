@@ -149,7 +149,6 @@ unsafe impl<T: Send> Send for AtomicOption<T> {}
 
 struct SubmissionEntry {
     finalizer: AtomicOption<Option<Box<dyn FnOnce(&Device) + Send>>>,
-    // queue_family: u32,
     semaphore: SemaphoreEntry,
 }
 
@@ -167,6 +166,7 @@ impl SubmissionEntry {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WaitResult {
     Timeout,
     AllFinished,
@@ -316,7 +316,14 @@ impl SubmissionManager {
             .get(submission.0)
             .map(SubmissionEntry::to_public)
     }
-    fn collect(&mut self) {
+    fn collect(&mut self, device: &Device) {
+        for (k, s) in self.submissions.iter().rev() {
+            if !s.is_finished() {
+                self.wait_for_submissions(std::iter::once(QueueSubmission(k)), 0, false, device)
+                    .unwrap();
+            }
+        }
+
         let drain = self
             .submissions
             .drain_filter(|s| s.semaphore.value.is_head() && s.is_finished())
@@ -332,7 +339,7 @@ impl SubmissionManager {
     }
     /// This waits on all currently active semaphores, essentially a vkDeviceWaitIdle that doesn't bother validation layers
     pub(crate) fn wait_all(&mut self, device: &Device) -> VulkanResult<()> {
-        for (k, s) in self.submissions.iter() {
+        for (k, s) in self.submissions.iter().rev() {
             if s.semaphore.value.is_head() {
                 self.wait_for_submissions(
                     std::iter::once(QueueSubmission(k)),
@@ -474,8 +481,9 @@ impl Device {
     }
     pub fn idle_cleanup_poll(&self) {
         let mut submission = self.synchronization_manager.write();
-        submission.collect();
+        submission.collect(self);
         let submission = RwLockWriteGuard::downgrade(submission);
+        self.generation_manager.write().collect(&submission, self);
         self.staging_manager.write().collect(&submission);
     }
     pub fn wait_idle(&self) {

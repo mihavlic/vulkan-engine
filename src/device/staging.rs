@@ -3,8 +3,9 @@ use std::{
     cell::{Cell, UnsafeCell},
     collections::VecDeque,
     ffi::c_void,
+    future::Future,
     mem::ManuallyDrop,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use ahash::{AHashSet, HashSet};
@@ -20,7 +21,7 @@ use crate::{
             do_dummy_submissions, handle_imported_sync_generic, DummySubmission, SubmissionExtra,
         },
         resource_marker::{TypeNone, TypeOption, TypeSome},
-        task::UnsafeSend,
+        task::{SendSyncUnsafeCell, UnsafeSend, UnsafeSendSync},
         GraphBuffer, GraphImage,
     },
     object::{self, HostAccessKind, ObjRef},
@@ -62,12 +63,26 @@ pub struct StagingManager {
     command: CommandBufferPool,
 }
 
-pub struct ImageWrite {
+pub struct ImageRegion {
     pub buffer_row_length: u32,
     pub buffer_image_height: u32,
     pub image_subresource: vk::ImageSubresourceLayers,
     pub image_offset: vk::Offset3D,
     pub image_extent: vk::Extent3D,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ResourceAccessStatus {
+    /// Some shortcircuiting behaviour caused no access to occur, something probably had a size of zero
+    #[default]
+    None,
+    /// The resource is host accessible and had no active accessors, the access was performed immediatelly
+    Immediate,
+    /// The resource is host accessible but has currently active accessors, a generation was opened to track
+    /// its availability. The access will be performed as the generations finalizer
+    HostDelayed,
+    /// The resource is not host accessible, a device operation was recorded into a command buffer
+    Recorded,
 }
 
 unsafe impl Send for StagingManager {}
@@ -89,32 +104,52 @@ impl StagingManager {
             ),
         }
     }
-    pub unsafe fn write_buffer<F: FnMut(*mut u8) + Send + 'static>(
+    /// If ResourceAccessStatus::Recorded is returned, the tuple contains a Some of the passed in callback
+    unsafe fn read_buffer_impl(
         &mut self,
-        dst_buffer: &ObjRef<object::Buffer>,
-        offset: u64,
+        buffer: &ObjRef<object::Buffer>,
+        offset: usize,
         layout: std::alloc::Layout,
-        mut fun: F,
+
+        cmd: vk::CommandBuffer,
+        queue_family: u32,
+        submission: QueueSubmission,
+
+        check_availability: bool,
         device: &Device,
+
+        fun: Box<dyn FnOnce(*const u8) + Send + 'static>,
+    ) -> (
+        ResourceAccessStatus,
+        Option<(Box<dyn FnOnce(*const u8) + Send + 'static>, *const u8)>,
+        SmallVec<[QueueSubmission; 4]>,
     ) {
         if layout.size() == 0 {
-            return;
+            return (ResourceAccessStatus::None, None, SmallVec::new());
         }
 
         let allocator = device.allocator();
-        let allocation = dst_buffer.get_allocation();
+        let allocation = buffer.get_allocation();
+        let info = allocator.get_allocation_info(allocation);
+        let mems = allocator.get_memory_properties();
 
         let allocation_info = allocator.get_allocation_info(allocation);
 
-        let (cmd, submission, wait_submissions, dirty) =
-            self.command.get_current_command_buffer(self.queue, device);
-
+        let mut submissions = SmallVec::new();
+        let mut status = ResourceAccessStatus::Recorded;
         let mut fun = Some(fun);
-        let synchronization_result = dst_buffer.access_mutable(
+
+        let synchronization_result = buffer.access_mutable(
             |d| d.get_mutable_state(),
             |s| {
-                // if the destination buffer is mapped, we'll write to it directly
-                if let Ok(ptr) = allocator.map_memory(allocation) {
+                // if the destination buffer is mappable, we'll write to it directly
+                if mems.memory_types[info.memory_type as usize]
+                    .property_flags
+                    .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+                {
+                    let ptr = allocator.map_memory(allocation).unwrap();
+                    let ptr = ptr.add(offset);
+
                     assert!(
                         (ptr as usize & (layout.align() - 1)) == 0,
                         "Buffer allocation is not properly aligned"
@@ -123,13 +158,191 @@ impl StagingManager {
                     let mapped_size = layout.size();
                     let mut fun = fun.take().unwrap();
 
-                    s.synchronization_state().update_host_access(|prev_access| {
+                    let synchronization_state = &mut s.synchronization_state();
+
+                    if check_availability {
+                        synchronization_state.retain_active_submissions(device);
+                    }
+
+                    synchronization_state.update_host_access(|prev_access| {
+                        if prev_access.is_empty() {
+                            allocator.invalidate_allocation(
+                                allocation,
+                                offset as u64,
+                                mapped_size as u64,
+                            );
+
+                            fun(ptr);
+
+                            allocator.unmap_memory(allocation);
+
+                            status = ResourceAccessStatus::Immediate;
+                            HostAccessKind::Immediate
+                        } else {
+                            let (submission, semaphore) = device.make_submission(None);
+                            let ptr = unsafe { UnsafeSend::new(ptr) };
+                            let group = device.open_generation_finalized(move |device| {
+                                device.allocator().invalidate_allocation(
+                                    allocation,
+                                    offset as u64,
+                                    mapped_size as u64,
+                                );
+
+                                fun(*ptr);
+
+                                device.allocator().unmap_memory(allocation);
+
+                                let signal_info = vk::SemaphoreSignalInfoKHR {
+                                    semaphore: semaphore.raw,
+                                    value: semaphore.value,
+                                    ..Default::default()
+                                };
+                                device.device().signal_semaphore_khr(&signal_info).unwrap();
+                            });
+
+                            group.add_submissions(prev_access.iter().copied());
+
+                            submissions.push(submission);
+
+                            status = ResourceAccessStatus::HostDelayed;
+                            HostAccessKind::Synchronized(submission)
+                        }
+                    });
+
+                    None
+                }
+                // otherwise schedule a transfer operation
+                else {
+                    let result = s.synchronization_state().update(
+                        queue_family,
+                        TypeNone::new_none(),
+                        &[submission],
+                        TypeNone::new_none(),
+                        queue_family,
+                        buffer.get_create_info().sharing_mode_concurrent,
+                    );
+
+                    status = ResourceAccessStatus::Recorded;
+                    Some(result)
+                }
+            },
+        );
+
+        let result = match status {
+            ResourceAccessStatus::None => unreachable!(),
+            ResourceAccessStatus::Immediate | ResourceAccessStatus::HostDelayed => {
+                return (status, None, submissions);
+            }
+            ResourceAccessStatus::Recorded => {
+                assert!(submissions.is_empty());
+                synchronization_result.unwrap()
+            }
+        };
+
+        assert!(result.transition_ownership_from.is_none(), "TODO");
+        assert!(result.transition_layout_from.is_none(), "unreachable");
+
+        let mut fun = fun.take().unwrap();
+
+        let staging = self.ring.allocate(layout, submission, device);
+
+        let d = device.device();
+        debug_label_span(
+            cmd,
+            device,
+            |f| {
+                if let Some(label) = buffer.get_create_info().label.as_ref() {
+                    write!(f, "Read '{label}'")
+                } else {
+                    write!(f, "Read buffer {:p}", buffer.get_handle())
+                }
+            },
+            || {
+                d.cmd_copy_buffer(
+                    cmd,
+                    buffer.get_handle(),
+                    staging.buffer,
+                    &[vk::BufferCopy {
+                        src_offset: offset as u64,
+                        dst_offset: staging.buffer_offset as u64,
+                        size: layout.size() as u64,
+                    }],
+                );
+            },
+        );
+
+        (
+            status,
+            Some((fun, staging.memory.as_ptr())),
+            result.prev_access,
+        )
+    }
+    unsafe fn write_buffer_impl(
+        &mut self,
+        buffer: &ObjRef<object::Buffer>,
+        offset: usize,
+        layout: std::alloc::Layout,
+
+        cmd: vk::CommandBuffer,
+        queue_family: u32,
+        submission: QueueSubmission,
+
+        check_availability: bool,
+        device: &Device,
+
+        fun: Box<dyn FnOnce(*mut u8) + Send + 'static>,
+    ) -> (
+        ResourceAccessStatus,
+        Option<(Box<dyn FnOnce(*mut u8) + Send + 'static>, *mut u8)>,
+        SmallVec<[QueueSubmission; 4]>,
+    ) {
+        if layout.size() == 0 {
+            return (ResourceAccessStatus::None, None, SmallVec::new());
+        }
+
+        let allocator = device.allocator();
+        let allocation = buffer.get_allocation();
+
+        let allocation_info = allocator.get_allocation_info(allocation);
+
+        let mut submissions = SmallVec::new();
+        let mut status = ResourceAccessStatus::Recorded;
+        let mut fun = Some(fun);
+
+        let synchronization_result = buffer.access_mutable(
+            |d| d.get_mutable_state(),
+            |s| {
+                // if the destination buffer is mapped, we'll write to it directly
+                if let Ok(ptr) = allocator.map_memory(allocation) {
+                    let ptr = ptr.add(offset);
+
+                    assert!(
+                        (ptr as usize & (layout.align() - 1)) == 0,
+                        "Buffer allocation is not properly aligned"
+                    );
+
+                    let mapped_size = layout.size();
+                    let mut fun = fun.take().unwrap();
+
+                    let synchronization_state = &mut s.synchronization_state();
+
+                    if check_availability {
+                        synchronization_state.retain_active_submissions(device);
+                    }
+
+                    synchronization_state.update_host_access(|prev_access| {
                         if prev_access.is_empty() {
                             fun(ptr);
 
-                            allocator.flush_allocation(allocation, offset, mapped_size as u64);
+                            allocator.flush_allocation(
+                                allocation,
+                                offset as u64,
+                                mapped_size as u64,
+                            );
+
                             allocator.unmap_memory(allocation);
 
+                            status = ResourceAccessStatus::Immediate;
                             HostAccessKind::Immediate
                         } else {
                             let (submission, semaphore) = device.make_submission(None);
@@ -139,9 +352,10 @@ impl StagingManager {
 
                                 device.allocator().flush_allocation(
                                     allocation,
-                                    offset,
+                                    offset as u64,
                                     mapped_size as u64,
                                 );
+
                                 device.allocator().unmap_memory(allocation);
 
                                 let signal_info = vk::SemaphoreSignalInfoKHR {
@@ -155,7 +369,9 @@ impl StagingManager {
                             group.add_submissions(prev_access.iter().copied());
                             group.finish();
 
-                            wait_submissions.insert(submission);
+                            submissions.push(submission);
+
+                            status = ResourceAccessStatus::HostDelayed;
                             HostAccessKind::Synchronized(submission)
                         }
                     });
@@ -165,227 +381,109 @@ impl StagingManager {
                 // otherwise schedule a transfer operation
                 else {
                     let result = s.synchronization_state().update(
-                        self.queue.family(),
+                        queue_family,
                         TypeNone::new_none(),
                         &[submission],
                         TypeNone::new_none(),
-                        self.queue.family(),
-                        dst_buffer.get_create_info().sharing_mode_concurrent,
+                        queue_family,
+                        buffer.get_create_info().sharing_mode_concurrent,
                     );
 
+                    status = ResourceAccessStatus::Recorded;
                     Some(result)
                 }
             },
         );
 
-        let Some(result) = synchronization_result else {
-            return;
+        let result = match status {
+            ResourceAccessStatus::None => unreachable!(),
+            ResourceAccessStatus::Immediate | ResourceAccessStatus::HostDelayed => {
+                return (status, None, submissions);
+            }
+            ResourceAccessStatus::Recorded => {
+                assert!(submissions.is_empty());
+                synchronization_result.unwrap()
+            }
         };
 
         assert!(result.transition_ownership_from.is_none(), "TODO");
         assert!(result.transition_layout_from.is_none(), "unreachable");
 
-        *dirty = true;
-        wait_submissions.extend(result.prev_access);
         let mut fun = fun.take().unwrap();
 
         let staging = self.ring.allocate(layout, submission, device);
-        fun(staging.memory.as_ptr());
-
-        // struct A(u32);
-        // impl ResourceFirstAccessInterface for A {
-        //     type Accessor = ();
-        //     fn accessors(&self) -> &[Self::Accessor] {
-        //         &[()]
-        //     }
-        //     fn layout(&self) -> vk::ImageLayout {
-        //         vk::ImageLayout::UNDEFINED
-        //     }
-        //     fn stages(&self) -> vk::PipelineStageFlags2KHR {
-        //         vk::PipelineStageFlags2KHR::COPY_KHR
-        //     }
-        //     fn access(&self) -> vk::AccessFlags2KHR {
-        //         vk::AccessFlags2KHR::TRANSFER_WRITE_KHR
-        //     }
-        //     fn queue_family(&self) -> u32 {
-        //         self.0
-        //     }
-        // }
-
-        // let mut extra = SubmissionExtra {
-        //     image_barriers: Vec::new(),
-        //     buffer_barriers: Vec::new(),
-        //     dependencies: constant_ahash_hashset(),
-        // };
-
-        // let mut dummy_submissions = Vec::new();
-
-        // handle_imported_sync_generic(
-        //     CombinedResourceHandle::new_buffer(GraphBuffer::new(0)),
-        //     sharing_mode_concurrent,
-        //     &A(self.queue.family()),
-        //     &[submission],
-        //     TypeNone::new_none(),
-        //     self.queue.family(),
-        //     s.synchronization_state(),
-        //     &mut extra,
-        //     |d| dummy_submissions.push(d),
-        //     |_, m| m,
-        //     device,
-        // )
 
         let d = device.device();
         debug_label_span(
             cmd,
             device,
             |f| {
-                if let Some(label) = dst_buffer.get_create_info().label.as_ref() {
+                if let Some(label) = buffer.get_create_info().label.as_ref() {
                     write!(f, "Copy to '{label}'")
                 } else {
-                    write!(f, "Copy to buffer {:p}", dst_buffer.get_handle())
+                    write!(f, "Copy to buffer {:p}", buffer.get_handle())
                 }
             },
             || {
                 d.cmd_copy_buffer(
                     cmd,
                     staging.buffer,
-                    dst_buffer.get_handle(),
+                    buffer.get_handle(),
                     &[vk::BufferCopy {
-                        src_offset: staging.buffer_offset as u64,
-                        dst_offset: offset,
+                        dst_offset: staging.buffer_offset as u64,
+                        src_offset: offset as u64,
                         size: layout.size() as u64,
                     }],
                 );
             },
         );
 
-        // assert!(extra.image_barriers.is_empty());
-
-        // let bump = Bump::new();
-        // let mut submit_infos = Vec::<vk::SubmitInfo2>::new();
-        // let mut raw_memory_barriers = Vec::<vk::MemoryBarrier2>::new();
-        // let mut raw_image_barriers = Vec::<vk::ImageMemoryBarrier2>::new();
-        // let mut raw_buffer_barriers = Vec::<vk::BufferMemoryBarrier2>::new();
-
-        // do_dummy_submissions(
-        //     &bump,
-        //     &dummy_submissions,
-        //     &mut submit_infos,
-        //     &mut raw_memory_barriers,
-        //     &mut raw_image_barriers,
-        //     &mut raw_buffer_barriers,
-        //     &[],
-        //     &[Some(dst_buffer.get_handle())],
-        //     device,
-        //     |_| unreachable!(),
-        //     |_, _| unreachable!(),
-        //     |queue_family, device| todo!(),
-        // );
-
-        // let buffer_barriers = extra
-        //     .buffer_barriers
-        //     .iter()
-        //     .map(|b| b.to_vk(dst_buffer.get_handle()));
-        // let memory_barriers = extra.dependencies.iter().map(|s| s.s)
-    }
-    pub unsafe fn write_image<F: FnMut(*mut u8, usize, &ImageWrite) + Send + 'static>(
-        &mut self,
-        dst_image: &ObjRef<object::Image>,
-        final_layout: Option<vk::ImageLayout>,
-        texel_layout: std::alloc::Layout,
-        regions: Vec<ImageWrite>,
-        device: &Device,
-        mut fun: F,
-    ) {
-        let (cmd, submission, _, _) = self.command.get_current_command_buffer(self.queue, device);
-        let queue_family = self.queue.family();
-        let mut dirty_tmp = false;
-
-        let wait = self.write_image_impl(
-            dst_image,
-            final_layout,
-            texel_layout,
-            regions,
-            cmd,
-            queue_family,
-            submission,
-            &mut dirty_tmp,
-            device,
-            &mut fun,
-        );
-
-        let (cmd, submission, wait_submissions, dirty) =
-            self.command.get_current_command_buffer(self.queue, device);
-
-        wait_submissions.extend(wait);
-
-        *dirty |= dirty_tmp;
-    }
-    pub unsafe fn write_image_in_cmd<F: FnMut(*mut u8, usize, &ImageWrite) + Send + 'static>(
-        &mut self,
-        dst_image: &ObjRef<object::Image>,
-        final_layout: Option<vk::ImageLayout>,
-        texel_layout: std::alloc::Layout,
-        regions: Vec<ImageWrite>,
-
-        cmd: vk::CommandBuffer,
-        queue_family: u32,
-        submission: QueueSubmission,
-
-        device: &Device,
-
-        mut fun: F,
-    ) -> SmallVec<[QueueSubmission; 4]> {
-        let mut dirty = false;
-        self.write_image_impl(
-            dst_image,
-            final_layout,
-            texel_layout,
-            regions,
-            cmd,
-            queue_family,
-            submission,
-            &mut dirty,
-            device,
-            &mut fun,
+        (
+            status,
+            Some((fun, staging.memory.as_ptr())),
+            result.prev_access,
         )
     }
-    unsafe fn write_image_impl(
+    unsafe fn read_image_impl(
         &mut self,
-        dst_image: &ObjRef<object::Image>,
+        image: &ObjRef<object::Image>,
         final_layout: Option<vk::ImageLayout>,
         texel_layout: std::alloc::Layout,
-        regions: Vec<ImageWrite>,
+        regions: &[ImageRegion],
 
         cmd: vk::CommandBuffer,
         queue_family: u32,
         submission: QueueSubmission,
-        dirty: &mut bool,
+
+        check_availability: bool,
 
         device: &Device,
-
-        fun: &mut (dyn FnMut(*mut u8, usize, &ImageWrite) + Send + 'static),
-    ) -> SmallVec<[QueueSubmission; 4]> {
+    ) -> (
+        ResourceAccessStatus,
+        SmallVec<[QueueSubmission; 4]>,
+        SmallVec<[*const u8; 2]>,
+    ) {
         if regions.is_empty() {
-            return SmallVec::new();
+            return (ResourceAccessStatus::None, SmallVec::new(), SmallVec::new());
         }
         assert!(
             texel_layout.size() & (texel_layout.align() - 1) == 0,
             "Size is not a multiple of alignment"
         );
 
-        let raw_image = dst_image.get_handle();
+        let raw_image = image.get_handle();
         let allocator = device.allocator();
-        let allocation = dst_image.get_allocation();
+        let allocation = image.get_allocation();
 
-        // TODO we may be able to skip the transfer image copy
-        // if the destination image is host accessible and has linear tiling
-        // and manually do the copy through a mapped pointer
-        // for now we don't do that since such images will be very rare
-        let result = dst_image.access_mutable(
+        let result = image.access_mutable(
             |d| d.get_mutable_state(),
             |s| {
-                let result = s.synchronization_state().update(
+                let synchronization_state = s.synchronization_state();
+                if check_availability {
+                    synchronization_state.retain_active_submissions(device);
+                }
+
+                let result = synchronization_state.update(
                     queue_family,
                     TypeSome::new_some(vk::ImageLayout::TRANSFER_DST_OPTIMAL),
                     &[submission],
@@ -393,16 +491,213 @@ impl StagingManager {
                         final_layout.unwrap_or(vk::ImageLayout::TRANSFER_DST_OPTIMAL),
                     ),
                     queue_family,
-                    dst_image.get_create_info().sharing_mode_concurrent,
+                    image.get_create_info().sharing_mode_concurrent,
                 );
 
                 result
             },
         );
 
-        *dirty = true;
         assert!(result.transition_ownership_from.is_none(), "TODO");
+        let d = device.device();
 
+        let mut region_pointers = SmallVec::new();
+
+        debug_label_span(
+            cmd,
+            device,
+            |f| {
+                if let Some(label) = image.get_create_info().label.as_ref() {
+                    write!(f, "Copy to '{label}'")
+                } else {
+                    write!(f, "Copy to image {:p}", image.get_handle())
+                }
+            },
+            || {
+                if let Some(from) = result.transition_layout_from {
+                    let barrier = vk::ImageMemoryBarrier2KHR {
+                        dst_stage_mask: vk::PipelineStageFlags2KHR::COPY,
+                        dst_access_mask: vk::AccessFlags2KHR::TRANSFER_WRITE,
+                        old_layout: from,
+                        new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        image: raw_image,
+                        // we synchronize resources like a mutex
+                        // no partial overlapping access is allowed
+                        subresource_range: image.get_whole_subresource_range(),
+                        ..Default::default()
+                    };
+                    let dependency_info = vk::DependencyInfoKHR {
+                        image_memory_barrier_count: 1,
+                        p_image_memory_barriers: &barrier,
+                        ..Default::default()
+                    };
+                    d.cmd_pipeline_barrier_2_khr(cmd, &dependency_info);
+                }
+
+                self.emit_image_transfers(
+                    texel_layout,
+                    &regions,
+                    submission,
+                    device,
+                    &mut |ptr, _, _| {
+                        region_pointers.push(ptr as *const u8);
+                    },
+                    &mut |buffer, copies| {
+                        d.cmd_copy_image_to_buffer(
+                            cmd,
+                            raw_image,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            buffer,
+                            copies,
+                        )
+                    },
+                );
+            },
+        );
+
+        (
+            ResourceAccessStatus::Recorded,
+            result.prev_access,
+            region_pointers,
+        )
+    }
+    unsafe fn write_image_impl(
+        &mut self,
+        image: &ObjRef<object::Image>,
+        final_layout: Option<vk::ImageLayout>,
+        do_transition: bool,
+        texel_layout: std::alloc::Layout,
+        regions: &[ImageRegion],
+
+        cmd: vk::CommandBuffer,
+        queue_family: u32,
+        submission: QueueSubmission,
+
+        check_availability: bool,
+
+        device: &Device,
+
+        fun: &mut dyn FnMut(*mut u8, usize, &ImageRegion),
+    ) -> (ResourceAccessStatus, SmallVec<[QueueSubmission; 4]>) {
+        if regions.is_empty() {
+            return (ResourceAccessStatus::None, SmallVec::new());
+        }
+        assert!(
+            texel_layout.size() & (texel_layout.align() - 1) == 0,
+            "Size is not a multiple of alignment"
+        );
+
+        let raw_image = image.get_handle();
+        let allocator = device.allocator();
+        let allocation = image.get_allocation();
+
+        let result = image.access_mutable(
+            |d| d.get_mutable_state(),
+            |s| {
+                let synchronization_state = s.synchronization_state();
+                if check_availability {
+                    synchronization_state.retain_active_submissions(device);
+                }
+
+                let result = synchronization_state.update(
+                    queue_family,
+                    TypeSome::new_some(vk::ImageLayout::TRANSFER_DST_OPTIMAL),
+                    &[submission],
+                    TypeSome::new_some(
+                        final_layout.unwrap_or(vk::ImageLayout::TRANSFER_DST_OPTIMAL),
+                    ),
+                    queue_family,
+                    image.get_create_info().sharing_mode_concurrent,
+                );
+
+                result
+            },
+        );
+
+        assert!(result.transition_ownership_from.is_none(), "TODO");
+        let d = device.device();
+
+        debug_label_span(
+            cmd,
+            device,
+            |f| {
+                if let Some(label) = image.get_create_info().label.as_ref() {
+                    write!(f, "Copy to '{label}'")
+                } else {
+                    write!(f, "Copy to image {:p}", image.get_handle())
+                }
+            },
+            || {
+                if let Some(from) = result.transition_layout_from {
+                    let barrier = vk::ImageMemoryBarrier2KHR {
+                        dst_stage_mask: vk::PipelineStageFlags2KHR::COPY,
+                        dst_access_mask: vk::AccessFlags2KHR::TRANSFER_WRITE,
+                        old_layout: from,
+                        new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        image: raw_image,
+                        // we synchronize resources like a mutex
+                        // no partial overlapping access is allowed
+                        subresource_range: image.get_whole_subresource_range(),
+                        ..Default::default()
+                    };
+                    let dependency_info = vk::DependencyInfoKHR {
+                        image_memory_barrier_count: 1,
+                        p_image_memory_barriers: &barrier,
+                        ..Default::default()
+                    };
+                    d.cmd_pipeline_barrier_2_khr(cmd, &dependency_info);
+                }
+
+                self.emit_image_transfers(
+                    texel_layout,
+                    &regions,
+                    submission,
+                    device,
+                    fun,
+                    &mut |buffer, copies| {
+                        d.cmd_copy_buffer_to_image(
+                            cmd,
+                            buffer,
+                            raw_image,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            copies,
+                        )
+                    },
+                );
+
+                if let Some(to) = final_layout {
+                    if do_transition && to != vk::ImageLayout::TRANSFER_DST_OPTIMAL {
+                        let barrier = vk::ImageMemoryBarrier2KHR {
+                            src_stage_mask: vk::PipelineStageFlags2KHR::COPY,
+                            src_access_mask: vk::AccessFlags2KHR::TRANSFER_WRITE,
+                            old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            new_layout: to,
+                            image: raw_image,
+                            subresource_range: image.get_whole_subresource_range(),
+                            ..Default::default()
+                        };
+                        let dependency_info = vk::DependencyInfoKHR {
+                            image_memory_barrier_count: 1,
+                            p_image_memory_barriers: &barrier,
+                            ..Default::default()
+                        };
+                        d.cmd_pipeline_barrier_2_khr(cmd, &dependency_info);
+                    }
+                }
+            },
+        );
+
+        (ResourceAccessStatus::Recorded, result.prev_access)
+    }
+    unsafe fn emit_image_transfers(
+        &mut self,
+        texel_layout: std::alloc::Layout,
+        regions: &[ImageRegion],
+        submission: QueueSubmission,
+        device: &Device,
+        new_memory_fun: &mut dyn FnMut(*mut u8, usize, &ImageRegion),
+        cmd_fun: &mut dyn FnMut(vk::Buffer, &[vk::BufferImageCopy]),
+    ) {
         let region_sources = regions.iter().enumerate().map(|(i, region)| {
             let mut width = region.buffer_row_length;
             if width == 0 {
@@ -415,7 +710,6 @@ impl StagingManager {
             }
 
             let depth = region.image_extent.depth;
-
             let texels = width * height * depth;
             assert!(texels > 0);
 
@@ -424,31 +718,23 @@ impl StagingManager {
                 texel_layout.align(),
             )
             .unwrap();
-            let staging = self.ring.allocate(layout, submission, device);
 
-            fun(staging.memory.as_ptr(), i, region);
+            let staging = self.ring.allocate(layout, submission, device);
+            new_memory_fun(staging.memory.as_ptr(), i, region);
 
             (staging.buffer, staging.buffer_offset, region)
         });
 
-        let d = device.device();
-
-        let mut converted_regions: SmallVec<[_; 8]> = SmallVec::new();
+        let mut converted_regions: SmallVec<[vk::BufferImageCopy; 16]> = SmallVec::new();
         let mut last_buffer = None;
-        let mut convert_region = |(buffer, offset, region): (vk::Buffer, usize, &ImageWrite)| {
+        let mut handle_region = |(buffer, offset, region): (vk::Buffer, usize, &ImageRegion)| {
             // if the source buffer changed (due to the last ringbuffer chunk getting filled)
             // we need to split the copy into multiple calls
-            if let Some(src_buffer) = last_buffer {
-                debug_assert!(src_buffer != vk::Buffer::null());
-                if src_buffer != buffer {
+            if let Some(last_buffer) = last_buffer {
+                debug_assert!(last_buffer != vk::Buffer::null());
+                if last_buffer != buffer {
                     debug_assert!(!converted_regions.is_empty());
-                    d.cmd_copy_buffer_to_image(
-                        cmd,
-                        src_buffer,
-                        raw_image,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        &converted_regions,
-                    );
+                    cmd_fun(last_buffer, &converted_regions);
                     converted_regions.clear();
                 }
             }
@@ -466,68 +752,13 @@ impl StagingManager {
             last_buffer = Some(buffer);
         };
 
-        debug_label_span(
-            cmd,
-            device,
-            |f| {
-                if let Some(label) = dst_image.get_create_info().label.as_ref() {
-                    write!(f, "Copy to '{label}'")
-                } else {
-                    write!(f, "Copy to image {:p}", dst_image.get_handle())
-                }
-            },
-            || {
-                if let Some(from) = result.transition_layout_from {
-                    let barrier = vk::ImageMemoryBarrier2KHR {
-                        dst_stage_mask: vk::PipelineStageFlags2KHR::COPY,
-                        dst_access_mask: vk::AccessFlags2KHR::TRANSFER_WRITE,
-                        old_layout: from,
-                        new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        image: raw_image,
-                        // we synchronize resources like a mutex
-                        // no partial overlapping access is allowed
-                        subresource_range: dst_image.get_whole_subresource_range(),
-                        ..Default::default()
-                    };
-                    let dependency_info = vk::DependencyInfoKHR {
-                        image_memory_barrier_count: 1,
-                        p_image_memory_barriers: &barrier,
-                        ..Default::default()
-                    };
-                    d.cmd_pipeline_barrier_2_khr(cmd, &dependency_info);
-                }
-
-                for r in region_sources {
-                    convert_region(r);
-                }
-                // flush the last buffer with a null buffer (specially handled)
-                convert_region((vk::Buffer::null(), 0, regions.first().unwrap()));
-
-                if let Some(to) = final_layout {
-                    if to != vk::ImageLayout::TRANSFER_DST_OPTIMAL {
-                        let barrier = vk::ImageMemoryBarrier2KHR {
-                            src_stage_mask: vk::PipelineStageFlags2KHR::COPY,
-                            src_access_mask: vk::AccessFlags2KHR::TRANSFER_WRITE,
-                            old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                            new_layout: to,
-                            image: raw_image,
-                            subresource_range: dst_image.get_whole_subresource_range(),
-                            ..Default::default()
-                        };
-                        let dependency_info = vk::DependencyInfoKHR {
-                            image_memory_barrier_count: 1,
-                            p_image_memory_barriers: &barrier,
-                            ..Default::default()
-                        };
-                        d.cmd_pipeline_barrier_2_khr(cmd, &dependency_info);
-                    }
-                }
-            },
-        );
-
-        result.prev_access
+        for r in region_sources {
+            handle_region(r);
+        }
+        // flush the last buffer with a null buffer (specially handled)
+        handle_region((vk::Buffer::null(), 0, regions.first().unwrap()));
     }
-    pub(crate) unsafe fn flush(&mut self, device: &Device) -> Option<QueueSubmission> {
+    pub unsafe fn flush(&mut self, device: &Device) -> Option<QueueSubmission> {
         self.command.flush(self.queue, device)
     }
     pub(crate) fn collect(&mut self, submission_manager: &SubmissionManager) {
@@ -540,6 +771,288 @@ impl StagingManager {
     }
 }
 
+impl StagingManager {
+    pub unsafe fn write_image<F: FnMut(*mut u8, usize, &ImageRegion) + Send + 'static>(
+        &mut self,
+        image: &ObjRef<object::Image>,
+        final_layout: Option<vk::ImageLayout>,
+        texel_layout: std::alloc::Layout,
+        regions: Vec<ImageRegion>,
+        device: &Device,
+        mut fun: F,
+    ) {
+        let &mut OpenCommandBuffer {
+            submission, buffer, ..
+        } = self
+            .command
+            .get_current_command_buffer(self.queue, true, device);
+
+        let queue_family = self.queue.family();
+
+        let (status, wait) = self.write_image_impl(
+            image,
+            final_layout,
+            true,
+            texel_layout,
+            &regions,
+            buffer,
+            queue_family,
+            submission,
+            true,
+            device,
+            &mut fun,
+        );
+
+        let OpenCommandBuffer {
+            buffer,
+            submission,
+            wait_submissions,
+            dirty,
+            ..
+        } = self
+            .command
+            .get_current_command_buffer(self.queue, true, device);
+
+        wait_submissions.extend(wait);
+        if status == ResourceAccessStatus::Recorded {
+            *dirty = true;
+        }
+    }
+    /// The caller must do the transition to final_layout and further synchronization on their own
+    pub unsafe fn write_image_in_cmd<F: FnMut(*mut u8, usize, &ImageRegion) + Send + 'static>(
+        &mut self,
+        image: &ObjRef<object::Image>,
+        final_layout: Option<vk::ImageLayout>,
+        texel_layout: std::alloc::Layout,
+        regions: Vec<ImageRegion>,
+
+        cmd: vk::CommandBuffer,
+        queue_family: u32,
+        submission: QueueSubmission,
+
+        device: &Device,
+
+        mut fun: F,
+    ) -> SmallVec<[QueueSubmission; 4]> {
+        self.write_image_impl(
+            image,
+            final_layout,
+            false,
+            texel_layout,
+            &regions,
+            cmd,
+            queue_family,
+            submission,
+            true,
+            device,
+            &mut fun,
+        )
+        .1
+    }
+    pub unsafe fn read_image(
+        &mut self,
+        image: &ObjRef<object::Image>,
+        final_layout: Option<vk::ImageLayout>,
+        texel_layout: std::alloc::Layout,
+        regions: Vec<ImageRegion>,
+        device: &Device,
+        mut fun: impl FnMut(*const u8, usize, &ImageRegion) + Send + 'static,
+    ) {
+        let &mut OpenCommandBuffer {
+            submission, buffer, ..
+        } = self
+            .command
+            .get_current_command_buffer(self.queue, true, device);
+
+        let queue_family = self.queue.family();
+
+        let (status, wait, region_pointers) = self.read_image_impl(
+            image,
+            final_layout,
+            texel_layout,
+            &regions,
+            buffer,
+            queue_family,
+            submission,
+            true,
+            device,
+        );
+
+        assert_eq!(status, ResourceAccessStatus::Recorded);
+        assert_eq!(regions.len(), region_pointers.len());
+
+        let OpenCommandBuffer {
+            buffer,
+            submission,
+            wait_submissions,
+            finalizers,
+            dirty,
+            ..
+        } = self
+            .command
+            .get_current_command_buffer(self.queue, true, device);
+
+        wait_submissions.extend(wait);
+        if status == ResourceAccessStatus::Recorded {
+            *dirty = true;
+        }
+
+        // override the vector to be Send, there will be no aliasing of the pointers
+        let region_pointers = UnsafeSend::new(region_pointers);
+        let finalizer = move |_: &Device| {
+            for (i, (region, ptr)) in regions
+                .iter()
+                .zip(UnsafeSend::take(region_pointers))
+                .enumerate()
+            {
+                fun(ptr, i, region);
+            }
+        };
+
+        (*(finalizers.as_mut().unwrap().get())).push(Box::new(finalizer));
+    }
+    pub unsafe fn read_image_in_cmd(
+        &mut self,
+        image: &ObjRef<object::Image>,
+        final_layout: Option<vk::ImageLayout>,
+        texel_layout: std::alloc::Layout,
+        regions: &[ImageRegion],
+
+        cmd: vk::CommandBuffer,
+        queue_family: u32,
+        submission: QueueSubmission,
+
+        device: &Device,
+    ) -> (SmallVec<[QueueSubmission; 4]>, SmallVec<[*const u8; 2]>) {
+        let (status, wait, region_pointers) = self.read_image_impl(
+            image,
+            final_layout,
+            texel_layout,
+            &regions,
+            cmd,
+            queue_family,
+            submission,
+            true,
+            device,
+        );
+
+        assert_eq!(status, ResourceAccessStatus::Recorded);
+        assert_eq!(regions.len(), region_pointers.len());
+
+        (wait, region_pointers)
+    }
+    pub unsafe fn write_buffer(
+        &mut self,
+        buffer: &ObjRef<object::Buffer>,
+        offset: usize,
+        layout: std::alloc::Layout,
+        immediate_fun: impl FnMut(*mut u8) + Send + 'static,
+
+        device: &Device,
+    ) {
+        let &mut OpenCommandBuffer {
+            submission,
+            buffer: cmd,
+            ..
+        } = self
+            .command
+            .get_current_command_buffer(self.queue, true, device);
+
+        let queue_family = self.queue.family();
+
+        let (status, fun, wait) = self.write_buffer_impl(
+            buffer,
+            offset,
+            layout,
+            cmd,
+            queue_family,
+            submission,
+            true,
+            device,
+            Box::new(immediate_fun),
+        );
+
+        let OpenCommandBuffer {
+            buffer,
+            submission,
+            wait_submissions,
+            dirty,
+            finalizers,
+            ..
+        } = self
+            .command
+            .get_current_command_buffer(self.queue, true, device);
+
+        wait_submissions.extend(wait);
+        if status == ResourceAccessStatus::Recorded {
+            *dirty = true;
+        }
+
+        if let Some((fun, ptr)) = fun {
+            let ptr = UnsafeSend::new(ptr);
+            let finalizer = move |_: &Device| fun(*ptr);
+
+            // FIXME double allocation
+            (*(finalizers.as_mut().unwrap().get())).push(Box::new(finalizer));
+        }
+    }
+    pub unsafe fn read_buffer(
+        &mut self,
+        buffer: &ObjRef<object::Buffer>,
+        offset: usize,
+        layout: std::alloc::Layout,
+        fun: impl FnMut(*const u8) + Send + 'static,
+
+        device: &Device,
+    ) {
+        let &mut OpenCommandBuffer {
+            submission,
+            buffer: cmd,
+            ..
+        } = self
+            .command
+            .get_current_command_buffer(self.queue, true, device);
+
+        let queue_family = self.queue.family();
+
+        let (status, fun, wait) = self.read_buffer_impl(
+            buffer,
+            offset,
+            layout,
+            cmd,
+            queue_family,
+            submission,
+            true,
+            device,
+            Box::new(fun),
+        );
+
+        let OpenCommandBuffer {
+            buffer,
+            submission,
+            wait_submissions,
+            dirty,
+            finalizers,
+            ..
+        } = self
+            .command
+            .get_current_command_buffer(self.queue, true, device);
+
+        wait_submissions.extend(wait);
+        if status == ResourceAccessStatus::Recorded {
+            *dirty = true;
+        }
+
+        if let Some((fun, ptr)) = fun {
+            let ptr = UnsafeSend::new(ptr);
+            let finalizer = move |_: &Device| fun(*ptr);
+
+            // FIXME at this point the callback is contained in two boxes
+            (*(finalizers.as_mut().unwrap().get())).push(Box::new(finalizer));
+        }
+    }
+}
+
 impl Device {
     pub unsafe fn write_buffer<F: FnMut(*mut u8) + Send + 'static>(
         &self,
@@ -548,28 +1061,29 @@ impl Device {
         layout: std::alloc::Layout,
         mut fun: F,
     ) -> QueueSubmission {
-        let mut write = self.staging_manager.write();
-        write.write_buffer(buffer, offset, layout, fun, self);
-        write.flush(self).unwrap()
+        todo!()
+        // let mut write = self.staging_manager.write();
+        // write.write_buffer(buffer, offset, layout, fun, self);
+        // write.flush(None, self).unwrap()
     }
-    pub unsafe fn write_image<F: FnMut(*mut u8, usize, &ImageWrite) + Send + 'static>(
+    pub unsafe fn write_image<F: FnMut(*mut u8, usize, &ImageRegion) + Send + 'static>(
         &self,
         image: &ObjRef<object::Image>,
         final_layout: Option<vk::ImageLayout>,
         texel_layout: std::alloc::Layout,
-        regions: Vec<ImageWrite>,
+        regions: Vec<ImageRegion>,
         mut fun: F,
     ) -> QueueSubmission {
         let mut write = self.staging_manager.write();
         write.write_image(image, final_layout, texel_layout, regions, self, fun);
         write.flush(self).unwrap()
     }
-    pub unsafe fn write_image_in_cmd<F: FnMut(*mut u8, usize, &ImageWrite) + Send + 'static>(
+    pub unsafe fn write_image_in_cmd<F: FnMut(*mut u8, usize, &ImageRegion) + Send + 'static>(
         &self,
         image: &ObjRef<object::Image>,
         final_layout: Option<vk::ImageLayout>,
         texel_layout: std::alloc::Layout,
-        regions: Vec<ImageWrite>,
+        regions: Vec<ImageRegion>,
         cmd: vk::CommandBuffer,
         queue_family: u32,
         submission: QueueSubmission,
@@ -588,30 +1102,37 @@ impl Device {
             fun,
         )
     }
-    pub unsafe fn write_multiple<'a, T>(&self, fun: impl FnOnce(&mut StagingManager) -> T) -> T {
+    pub unsafe fn write_multiple<'a, R>(&self, fun: impl FnOnce(&mut StagingManager) -> R) -> R {
         let mut write = self.staging_manager.write();
         fun(&mut write)
     }
 }
 
-#[derive(Clone)]
+pub(crate) struct OpenCommandBuffer {
+    wait_submissions: ahash::HashSet<QueueSubmission>,
+    /// a list of callbacks to run when the command buffer execution finishes
+    /// while not submitted, it may only be accessed by a mutable borrow of StagingManager
+    /// after completion, the submission finalizer will mutably access it uncontended
+    finalizers: Option<UnsafeSendSync<Arc<UnsafeCell<Vec<Box<dyn FnOnce(&Device) + Send>>>>>>,
+    submission: QueueSubmission,
+    semaphore: TimelineSemaphore,
+    buffer: vk::CommandBuffer,
+    dirty: bool,
+}
+
 enum CommandBufferState {
     Empty,
-    Dirty {
-        wait_submissions: ahash::HashSet<QueueSubmission>,
-        submission: QueueSubmission,
-        semaphore: TimelineSemaphore,
-        dirty: bool,
-    },
+    Dirty(OpenCommandBuffer),
 }
 
 struct CommandBufferPool {
     label: Option<Cow<'static, str>>,
+    pool: vk::CommandPool,
+    free_buffers: Vec<vk::CommandBuffer>,
+    current_buffer: Option<OpenCommandBuffer>,
+    pending_buffers: VecDeque<(QueueSubmission, vk::CommandBuffer)>,
     // a monotonic counter used only for labeling command buffers
     next_buffer_index: u32,
-    pool: vk::CommandPool,
-    buffers: VecDeque<(QueueSubmission, vk::CommandBuffer)>,
-    free_buffers: Vec<(CommandBufferState, vk::CommandBuffer)>,
 }
 
 impl CommandBufferPool {
@@ -632,15 +1153,16 @@ impl CommandBufferPool {
             label,
             next_buffer_index: 0,
             pool: device.create_command_pool(&info, callbacks).unwrap(),
-            buffers: VecDeque::new(),
             free_buffers: Vec::new(),
+            current_buffer: None,
+            pending_buffers: VecDeque::new(),
         }
     }
     pub(crate) fn collect(&mut self, submission_manager: &SubmissionManager) {
-        while let Some(&(submission, buffer)) = self.buffers.front() {
+        while let Some(&(submission, buffer)) = self.pending_buffers.front() {
             if submission_manager.is_submission_finished(submission) {
-                self.buffers.pop_front();
-                self.free_buffers.push((CommandBufferState::Empty, buffer));
+                self.pending_buffers.pop_front();
+                self.free_buffers.push(buffer);
             } else {
                 break;
             }
@@ -649,67 +1171,61 @@ impl CommandBufferPool {
     unsafe fn get_current_command_buffer(
         &mut self,
         queue: submission::Queue,
+        with_finalizers: bool,
         device: &Device,
-    ) -> (
-        vk::CommandBuffer,
-        QueueSubmission,
-        &mut ahash::HashSet<QueueSubmission>,
-        &mut bool,
-    ) {
-        if self.free_buffers.is_empty() {
-            self.add_buffer(device);
-        }
+    ) -> &mut OpenCommandBuffer {
+        let mut current_buffer = self.current_buffer.take();
+        current_buffer.get_or_insert_with(|| {
+            let mut finalizers = None;
+            let mut glue_finalizer: Option<Box<dyn FnOnce(&Device) + Send>> = None;
 
-        let (state, buffer) = self.free_buffers.last_mut().unwrap();
-        if let CommandBufferState::Empty = state {
-            // let finalizers: UnsafeSend<
-            //     Arc<UnsafeCell<SmallVec<[Box<dyn FnOnce(&Device) + Send>; 2]>>>,
-            // > = unsafe { UnsafeSend::new(Arc::new(UnsafeCell::new(SmallVec::new()))) };
-            // let finalizer_finalizer = {
-            //     let finalizers_copy = finalizers.clone();
-            //     move |device: &Device| {
-            //         let arc = UnsafeSend::take(finalizers_copy);
-            //         let unsafe_cell = Arc::try_unwrap(arc).ok().unwrap();
-            //         for finalizer in UnsafeCell::into_inner(unsafe_cell) {
-            //             finalizer(device);
-            //         }
-            //     }
-            // };
+            if with_finalizers {
+                // see OpenCommandBuffer.finalizers for safety regarding the UnsafeCell
+                let arc: UnsafeSendSync<Arc<UnsafeCell<Vec<Box<dyn FnOnce(&Device) + Send>>>>> =
+                    UnsafeSendSync::new(Arc::new(UnsafeCell::new(Vec::new())));
 
-            let (submission, semaphore) =
-                device.make_submission(None /* Some(Box::new(finalizer_finalizer)) */);
+                let arc_copy = arc.clone();
+                let finalizer = move |d: &Device| {
+                    for finalizer in (*UnsafeCell::get(&arc_copy)).drain(..) {
+                        finalizer(d);
+                    }
+                };
 
-            *state = CommandBufferState::Dirty {
-                submission,
-                semaphore,
-                dirty: false,
-                wait_submissions: constant_ahash_hashset(),
+                finalizers = Some(arc);
+                glue_finalizer = Some(Box::new(finalizer));
+            }
+
+            let (submission, semaphore) = device.make_submission(glue_finalizer);
+            let buffer = match self.free_buffers.pop() {
+                Some(b) => b,
+                None => self.new_buffer(device),
             };
 
             device
                 .device()
                 .begin_command_buffer(
-                    *buffer,
+                    buffer,
                     &vk::CommandBufferBeginInfo {
                         flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
                         ..Default::default()
                     },
                 )
                 .unwrap();
-        }
 
-        let CommandBufferState::Dirty {
-            submission,
-            dirty,
-            wait_submissions,
-            ..
-        } = state else {
-            unreachable!()
-        };
+            OpenCommandBuffer {
+                wait_submissions: constant_ahash_hashset(),
+                finalizers,
+                submission,
+                semaphore,
+                buffer,
+                dirty: false,
+            }
+        });
 
-        (*buffer, *submission, wait_submissions, dirty)
+        self.current_buffer = current_buffer;
+        self.current_buffer.as_mut().unwrap()
     }
-    unsafe fn add_buffer(&mut self, device: &Device) {
+    unsafe fn new_buffer(&mut self, device: &Device) -> vk::CommandBuffer {
         let index = self.next_buffer_index;
         self.next_buffer_index += 1;
 
@@ -728,27 +1244,31 @@ impl CommandBufferPool {
         });
         maybe_attach_debug_label(buffer, &name, device);
 
-        self.free_buffers.push((CommandBufferState::Empty, buffer));
+        buffer
     }
     unsafe fn flush(
         &mut self,
         queue: submission::Queue,
         device: &Device,
     ) -> Option<QueueSubmission> {
-        if let Some((CommandBufferState::Dirty { dirty: true, .. }, _)) = self.free_buffers.last() {
-            let Some((CommandBufferState::Dirty { submission, semaphore, dirty, wait_submissions }, buffer)) = self.free_buffers.pop() else {
-                unreachable!()
-            };
+        if let Some(OpenCommandBuffer {
+            wait_submissions,
+            finalizers,
+            submission,
+            semaphore,
+            buffer,
+            dirty,
+        }) = self.current_buffer.take()
+        {
+            self.pending_buffers.push_back((submission, buffer));
 
-            self.buffers.push_back((submission, buffer));
-
-            let waits: SmallVec<[_; 8]> = {
+            let waits: SmallVec<[_; 16]> = {
                 assert!(
                     !wait_submissions.contains(&submission),
                     "Cyclic dependency when submitting staging work"
                 );
 
-                let mut active: SmallVec<[_; 8]> = SmallVec::new();
+                let mut active: SmallVec<[_; 16]> = SmallVec::new();
                 device.collect_active_submission_datas(wait_submissions, &mut active);
 
                 active

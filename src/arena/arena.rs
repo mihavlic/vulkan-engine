@@ -283,6 +283,21 @@ impl<'a, K: Key, T> Iterator for Iter<'a, K, T> {
     }
 }
 
+impl<'a, K: Key, T> DoubleEndedIterator for Iter<'a, K, T> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        while let Some((i, next)) = self.entries.next_back() {
+            if next.occupied() {
+                return Some((
+                    K::new(K::StoredIndex::from_usize(i), next.generation),
+                    // sound since they've been checked with occupied()
+                    unsafe { &*next.value.value },
+                ));
+            }
+        }
+        return None;
+    }
+}
+
 pub struct IterMut<'a, K: Key, T> {
     entries: std::iter::Enumerate<std::slice::IterMut<'a, Entry<K, T>>>,
 }
@@ -304,6 +319,21 @@ impl<'a, K: Key, T> Iterator for IterMut<'a, K, T> {
     }
 }
 
+impl<'a, K: Key, T> DoubleEndedIterator for IterMut<'a, K, T> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        while let Some((i, next)) = self.entries.next_back() {
+            if next.occupied() {
+                return Some((
+                    K::new(K::StoredIndex::from_usize(i), next.generation),
+                    // sound since they've been checked with occupied()
+                    unsafe { &mut *next.value.value },
+                ));
+            }
+        }
+        return None;
+    }
+}
+
 pub struct IntoIter<K: Key, T> {
     entries: std::vec::IntoIter<Entry<K, T>>,
 }
@@ -313,6 +343,18 @@ impl<K: Key, T> Iterator for IntoIter<K, T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(next) = self.entries.next() {
+            let entry = next.take();
+            if entry.is_some() {
+                return entry;
+            }
+        }
+        return None;
+    }
+}
+
+impl<K: Key, T> DoubleEndedIterator for IntoIter<K, T> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        while let Some(next) = self.entries.next_back() {
             let entry = next.take();
             if entry.is_some() {
                 return entry;
