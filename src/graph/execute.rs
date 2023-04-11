@@ -750,7 +750,7 @@ pub struct GraphRunConfig {
     /// nvidia drivers may let vkAcquireNextImageKHR pass with a timeout
     /// and then block until the image is actually read on vkQueuePresentKHR
     /// which on wayland, if the window is hidden, is indefinite
-    ///   https://github.com/KhronosGroup/Vulkan-Docs/issues/1158#issuecomment-573874821
+    ///   <https://github.com/KhronosGroup/Vulkan-Docs/issues/1158#issuecomment-573874821>
     /// it seems that the workaround is either to select some present mode like MAILBOX
     /// or ensure the timeout through fences
     ///
