@@ -5,7 +5,7 @@ use std::{
     ffi::c_void,
     future::Future,
     mem::ManuallyDrop,
-    sync::{Arc, OnceLock},
+    sync::Arc,
 };
 
 use ahash::{AHashSet, HashSet};
